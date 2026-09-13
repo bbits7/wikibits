@@ -21,7 +21,9 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 - `[[folder/page]]` links to a page by its path from the wiki root, without `.md`,
   and displays that page's title. `[[folder/page|label]]` shows your own text.
 - Ordinary Markdown links to `.md` files work too; `http(s)` links open in the browser.
-- The first page shown is `index.md`, `home.md` or `readme.md` at the root.
+- A folder's `index.md` stands for the folder: the folder takes its title in the tree,
+  opening the folder shows it, and `[[/projects]]` links to it. The root `index.md` is the
+  wiki's home page (`[[/]]`).
 
 ## Keys
 

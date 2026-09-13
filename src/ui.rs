@@ -86,14 +86,20 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
         .take(inner.height as usize)
         .map(|(i, row)| {
             let indent = "  ".repeat(row.depth);
+            let current = |id: &str| app.current.as_deref() == Some(id);
             let (marker, label_style) = match &row.kind {
-                TreeKind::Folder { expanded: true, .. } => {
-                    ("▾ ", Style::new().add_modifier(Modifier::BOLD))
-                }
                 TreeKind::Folder {
-                    expanded: false, ..
-                } => ("▸ ", Style::new().add_modifier(Modifier::BOLD)),
-                TreeKind::Page { id } if app.current.as_deref() == Some(id) => {
+                    expanded, index, ..
+                } => {
+                    let marker = if *expanded { "▾ " } else { "▸ " };
+                    let style = if index.as_deref().is_some_and(current) {
+                        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::new().add_modifier(Modifier::BOLD)
+                    };
+                    (marker, style)
+                }
+                TreeKind::Page { id } if current(id) => {
                     ("  ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
                 }
                 TreeKind::Page { .. } => ("  ", Style::new()),

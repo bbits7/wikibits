@@ -33,6 +33,8 @@ pub enum TreeNode {
     Folder {
         name: String,
         path: String,
+        /// The folder's `index` page, which stands for the folder itself.
+        index: Option<String>,
         children: Vec<TreeNode>,
     },
     Page {
@@ -168,17 +170,8 @@ impl Wiki {
             normalize(&format!("{from_dir}/{target}")),
         ];
         for candidate in &candidates {
-            if self.pages.contains_key(candidate) {
-                return LinkTarget::Page(candidate.clone());
-            }
-        }
-        for candidate in &candidates {
-            if let Some(id) = self
-                .pages
-                .keys()
-                .find(|id| id.eq_ignore_ascii_case(candidate))
-            {
-                return LinkTarget::Page(id.clone());
+            if let Some(id) = self.find_page(candidate) {
+                return LinkTarget::Page(id);
             }
         }
         let name = target.rsplit('/').next().unwrap_or(target);
@@ -194,14 +187,70 @@ impl Wiki {
         LinkTarget::Missing(raw.to_string())
     }
 
-    /// Folder/page tree, folders first, both sorted by their displayed name.
+    /// The page with this exact id, or the `index` page of the folder with this path
+    /// (`""` is the root), either matched exactly or ignoring case.
+    fn find_page(&self, candidate: &str) -> Option<String> {
+        let index = index_id(candidate);
+        if self.pages.contains_key(candidate) {
+            return Some(candidate.to_string());
+        }
+        if self.pages.contains_key(&index) {
+            return Some(index);
+        }
+        self.pages
+            .keys()
+            .find(|id| id.eq_ignore_ascii_case(candidate) || id.eq_ignore_ascii_case(&index))
+            .cloned()
+    }
+
+    /// The `index` page of a folder (`""` for the root), if it exists.
+    pub fn folder_index(&self, folder: &str) -> Option<String> {
+        let index = index_id(folder);
+        self.pages.contains_key(&index).then_some(index)
+    }
+
+    /// Folder/page tree, folders first, both sorted by their displayed name. A folder with an
+    /// `index` page takes that page's title, and the page is not listed among its children.
     pub fn tree(&self) -> Vec<TreeNode> {
         let mut root = Vec::new();
         for page in self.pages.values() {
             insert_into_tree(&mut root, "", &page.id, page);
         }
+        fold_indexes(&mut root);
         sort_tree(&mut root);
         root
+    }
+}
+
+/// Id of the `index` page of a folder (`""` for the root).
+fn index_id(folder: &str) -> String {
+    if folder.is_empty() {
+        "index".to_string()
+    } else {
+        format!("{folder}/index")
+    }
+}
+
+fn fold_indexes(nodes: &mut [TreeNode]) {
+    for node in nodes {
+        if let TreeNode::Folder {
+            name,
+            path,
+            index,
+            children,
+        } = node
+        {
+            let wanted = index_id(path);
+            if let Some(pos) = children
+                .iter()
+                .position(|c| matches!(c, TreeNode::Page { id, .. } if *id == wanted))
+                && let TreeNode::Page { id, title } = children.remove(pos)
+            {
+                *name = title;
+                *index = Some(id);
+            }
+            fold_indexes(children);
+        }
     }
 }
 
@@ -231,6 +280,7 @@ fn insert_into_tree(nodes: &mut Vec<TreeNode>, prefix: &str, rest: &str, page: &
                     nodes.push(TreeNode::Folder {
                         name: prettify(folder),
                         path,
+                        index: None,
                         children,
                     });
                 }
@@ -239,10 +289,12 @@ fn insert_into_tree(nodes: &mut Vec<TreeNode>, prefix: &str, rest: &str, page: &
     }
 }
 
+/// Folders first, then pages, each by displayed name; the root `index` page leads the tree.
 fn sort_tree(nodes: &mut [TreeNode]) {
     nodes.sort_by_cached_key(|n| match n {
-        TreeNode::Folder { name, .. } => (0, name.to_lowercase()),
-        TreeNode::Page { title, .. } => (1, title.to_lowercase()),
+        TreeNode::Page { id, .. } if id == "index" => (0, String::new()),
+        TreeNode::Folder { name, .. } => (1, name.to_lowercase()),
+        TreeNode::Page { title, .. } => (2, title.to_lowercase()),
     });
     for node in nodes {
         if let TreeNode::Folder { children, .. } = node {
@@ -354,6 +406,53 @@ mod tests {
     fn links_are_collected_once() {
         let links = extract_links("[[a/b]] and [[a/b|again]] then [c](c.md) <https://x.y>");
         assert_eq!(links, vec!["a/b", "c.md", "https://x.y"]);
+    }
+
+    #[test]
+    fn folder_links_open_the_folder_index() {
+        let dir = std::env::temp_dir().join(format!("wikibits-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("projects")).unwrap();
+        fs::write(dir.join("index.md"), "# Home\n[[/projects]] [[/]]").unwrap();
+        fs::write(dir.join("projects/index.md"), "# Projects\n[[calc]]").unwrap();
+        fs::write(dir.join("projects/calc.md"), "# Calc").unwrap();
+        let wiki = Wiki::load(&dir).unwrap();
+
+        assert_eq!(
+            wiki.resolve("index", "/projects"),
+            LinkTarget::Page("projects/index".into())
+        );
+        assert_eq!(
+            wiki.resolve("projects/calc", "/"),
+            LinkTarget::Page("index".into())
+        );
+        assert_eq!(
+            wiki.resolve("projects/calc", "Projects/"),
+            LinkTarget::Page("projects/index".into())
+        );
+        assert_eq!(
+            wiki.resolve("projects/index", "calc"),
+            LinkTarget::Page("projects/calc".into())
+        );
+        assert_eq!(wiki.folder_index(""), Some("index".into()));
+        assert_eq!(wiki.folder_index("nope"), None);
+        assert_eq!(wiki.backlinks_of("projects/index"), ["index"]);
+
+        let tree = wiki.tree();
+        assert!(matches!(&tree[0], TreeNode::Page { id, .. } if id == "index"));
+        let TreeNode::Folder {
+            name,
+            index,
+            children,
+            ..
+        } = &tree[1]
+        else {
+            panic!("expected the folder after the home page");
+        };
+        assert_eq!(name, "Projects");
+        assert_eq!(index.as_deref(), Some("projects/index"));
+        assert_eq!(children.len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

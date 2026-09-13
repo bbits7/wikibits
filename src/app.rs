@@ -34,8 +34,15 @@ pub struct TreeRow {
 }
 
 pub enum TreeKind {
-    Folder { path: String, expanded: bool },
-    Page { id: String },
+    Folder {
+        path: String,
+        expanded: bool,
+        /// The folder's `index` page, opened by activating the folder.
+        index: Option<String>,
+    },
+    Page {
+        id: String,
+    },
 }
 
 pub enum RelatedRow {
@@ -432,6 +439,7 @@ impl App {
                     TreeNode::Folder {
                         name,
                         path,
+                        index,
                         children,
                     } => {
                         let open = expanded.contains(path);
@@ -441,6 +449,7 @@ impl App {
                             kind: TreeKind::Folder {
                                 path: path.clone(),
                                 expanded: open,
+                                index: index.clone(),
                             },
                         });
                         if open {
@@ -472,11 +481,10 @@ impl App {
             self.expanded.insert(folder.clone());
         }
         self.rebuild_tree();
-        if let Some(i) = self
-            .tree
-            .iter()
-            .position(|r| matches!(&r.kind, TreeKind::Page { id: p } if p == id))
-        {
+        if let Some(i) = self.tree.iter().position(|r| match &r.kind {
+            TreeKind::Page { id: p } => p == id,
+            TreeKind::Folder { index, .. } => index.as_deref() == Some(id),
+        }) {
             self.tree_sel = i;
         }
     }
@@ -529,6 +537,15 @@ impl App {
                 let id = id.clone();
                 self.open(&id, true);
             }
+            Some(TreeKind::Folder {
+                index: Some(id),
+                path,
+                ..
+            }) => {
+                let (id, path) = (id.clone(), path.clone());
+                self.expanded.insert(path);
+                self.open(&id, true);
+            }
             Some(TreeKind::Folder { .. }) => self.tree_toggle(),
             None => {}
         }
@@ -539,6 +556,7 @@ impl App {
             Some(TreeKind::Folder {
                 path,
                 expanded: false,
+                ..
             }) => {
                 self.expanded.insert(path.clone());
                 self.rebuild_tree();
@@ -557,6 +575,7 @@ impl App {
         if let TreeKind::Folder {
             path,
             expanded: true,
+            ..
         } = &row.kind
         {
             self.expanded.remove(path);
@@ -640,6 +659,8 @@ impl App {
         self.follow(&target);
     }
 
+    /// One crumb per folder above the current page, each named after the folder's `index`
+    /// page when it has one. A folder index page is its folder's crumb, not an extra one.
     fn rebuild_crumbs(&mut self) {
         let root_name = self
             .wiki
@@ -647,40 +668,50 @@ impl App {
             .file_name()
             .map(|n| crate::wiki::prettify(&n.to_string_lossy()))
             .unwrap_or_else(|| "Wiki".into());
+        let folder_label = |folder: &str, fallback: String| match self.wiki.folder_index(folder) {
+            Some(index) => self.wiki.title(&index),
+            None => fallback,
+        };
         let mut crumbs = vec![Crumb {
-            label: root_name,
+            label: folder_label("", root_name),
             folder: Some(String::new()),
         }];
         if let Some(id) = &self.current {
-            let mut folder = String::new();
             let parts: Vec<&str> = id.split('/').collect();
-            for part in &parts[..parts.len() - 1] {
+            let (folders, page) = parts.split_at(parts.len() - 1);
+            let mut folder = String::new();
+            for part in folders {
                 if !folder.is_empty() {
                     folder.push('/');
                 }
                 folder.push_str(part);
                 crumbs.push(Crumb {
-                    label: crate::wiki::prettify(part),
+                    label: folder_label(&folder, crate::wiki::prettify(part)),
                     folder: Some(folder.clone()),
                 });
             }
-            crumbs.push(Crumb {
-                label: self.wiki.title(id),
-                folder: None,
-            });
+            if page != ["index"] {
+                crumbs.push(Crumb {
+                    label: self.wiki.title(id),
+                    folder: None,
+                });
+            }
         }
         self.crumbs = crumbs;
     }
 
     fn crumb_activate(&mut self, index: usize) {
-        match self.crumbs.get(index).and_then(|c| c.folder.clone()) {
-            Some(folder) if folder.is_empty() => {
+        let Some(folder) = self.crumbs.get(index).and_then(|c| c.folder.clone()) else {
+            return;
+        };
+        match self.wiki.folder_index(&folder) {
+            Some(page) => self.open(&page, true),
+            None if folder.is_empty() => {
                 if let Some(home) = self.wiki.landing_page() {
                     self.open(&home, true);
                 }
             }
-            Some(folder) => self.reveal_folder(&folder),
-            None => {}
+            None => self.reveal_folder(&folder),
         }
     }
 
