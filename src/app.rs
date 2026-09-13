@@ -957,6 +957,18 @@ impl App {
         }
     }
 
+    /// Move the selection `n` selectable rows down (or up when negative), stopping at the ends.
+    fn related_move_by(&mut self, n: isize) {
+        let step = n.signum();
+        for _ in 0..n.abs() {
+            let before = self.related_sel;
+            self.related_move(step);
+            if self.related_sel == before {
+                break;
+            }
+        }
+    }
+
     fn related_activate(&mut self) {
         let target = match self.related.get(self.related_sel) {
             Some(RelatedRow::Page(id)) => LinkTarget::Page(id.clone()),
@@ -1108,9 +1120,9 @@ impl App {
                 }
             }
             _ => match self.focus {
-                Focus::Tree => self.tree_key(key),
+                Focus::Tree => self.tree_key(key, ctrl),
                 Focus::Content => self.content_key(key, ctrl),
-                Focus::Related => self.related_key(key),
+                Focus::Related => self.related_key(key, ctrl),
             },
         }
     }
@@ -1121,14 +1133,18 @@ impl App {
         self.focus = ORDER[(i + delta).rem_euclid(3) as usize];
     }
 
-    fn tree_key(&mut self, key: KeyEvent) {
+    fn tree_key(&mut self, key: KeyEvent, ctrl: bool) {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.tree_move(1),
             KeyCode::Char('k') | KeyCode::Up => self.tree_move(-1),
             KeyCode::Char('g') | KeyCode::Home => self.tree_sel = 0,
             KeyCode::Char('G') | KeyCode::End => self.tree_sel = self.tree.len().saturating_sub(1),
-            KeyCode::PageDown => self.tree_move(10),
-            KeyCode::PageUp => self.tree_move(-10),
+            KeyCode::PageDown | KeyCode::Char('d') if key.code != KeyCode::Char('d') || ctrl => {
+                self.tree_move(self.rects.tree.height.max(1) as isize)
+            }
+            KeyCode::PageUp | KeyCode::Char('u') if key.code != KeyCode::Char('u') || ctrl => {
+                self.tree_move(-(self.rects.tree.height.max(1) as isize))
+            }
             KeyCode::Enter => self.tree_activate(),
             KeyCode::Char(' ') => self.tree_toggle(),
             KeyCode::Char('l') | KeyCode::Right => self.tree_expand(),
@@ -1156,10 +1172,20 @@ impl App {
         }
     }
 
-    fn related_key(&mut self, key: KeyEvent) {
+    fn related_key(&mut self, key: KeyEvent, ctrl: bool) {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.related_move(1),
             KeyCode::Char('k') | KeyCode::Up => self.related_move(-1),
+            KeyCode::PageDown | KeyCode::Char('d') if key.code != KeyCode::Char('d') || ctrl => {
+                self.related_move_by(self.rects.related.height.max(1) as isize)
+            }
+            KeyCode::PageUp | KeyCode::Char('u') if key.code != KeyCode::Char('u') || ctrl => {
+                self.related_move_by(-(self.rects.related.height.max(1) as isize))
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.related_move_by(-(self.related.len() as isize))
+            }
+            KeyCode::Char('G') | KeyCode::End => self.related_move_by(self.related.len() as isize),
             KeyCode::Enter => self.related_activate(),
             KeyCode::Char('l') | KeyCode::Right => self.toc_fold(Some(true)),
             KeyCode::Char('h') | KeyCode::Left => self.toc_fold(Some(false)),
