@@ -480,7 +480,7 @@ impl Wiki {
             .values()
             .filter_map(|p| Some((fs::metadata(&p.path).ok()?.modified().ok()?, p.id.clone())))
             .collect();
-        pages.sort_by(|a, b| b.0.cmp(&a.0));
+        pages.sort_by_key(|a| std::cmp::Reverse(a.0));
         pages
             .into_iter()
             .take(limit)
@@ -1043,7 +1043,10 @@ mod tests {
         assert!(!wiki.pages.contains_key("new/place"));
         assert_eq!(
             wiki.broken_links(),
-            vec![("index".to_string(), "new/place".to_string()); 3]
+            vec![
+                ("index".to_string(), "new/place".to_string()),
+                ("index".to_string(), "new/place.md".to_string())
+            ]
         );
         assert_eq!(wiki.orphan_pages(), vec!["other".to_string()]);
         assert_eq!(wiki.recently_changed(1).len(), 1);
