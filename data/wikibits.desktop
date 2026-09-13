@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=wikiBits
+GenericName=Wiki
+Comment=Terminal wiki over the Markdown files in ~/Wiki
+Exec=omarchy-launch-tui --app-id=wikibits @BINDIR@/wikibits
+Icon=wikibits
+Terminal=false
+Categories=Office;
+Keywords=wiki;notes;markdown;knowledge;
+StartupWMClass=wikibits

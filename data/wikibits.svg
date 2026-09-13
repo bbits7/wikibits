@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#1b2a24"/>
+  <!-- page -->
+  <path d="M18 12h20l10 10v30a2 2 0 0 1-2 2H18a2 2 0 0 1-2-2V14a2 2 0 0 1 2-2z" fill="#e8f0ea"/>
+  <path d="M38 12v10h10z" fill="#9fb8aa"/>
+  <!-- text lines -->
+  <rect x="22" y="28" width="20" height="3" rx="1.5" fill="#1b2a24"/>
+  <rect x="22" y="35" width="20" height="3" rx="1.5" fill="#1b2a24"/>
+  <rect x="22" y="42" width="12" height="3" rx="1.5" fill="#1b2a24"/>
+  <!-- [[ ]] wiki-link brackets -->
+  <path d="M8 24h4v2h-2v14h2v2H8z M13 24h4v2h-2v14h2v2h-4z" fill="#5fd3a8"/>
+  <path d="M56 24h-4v2h2v14h-2v2h4z M51 24h-4v2h2v14h-2v2h4z" fill="#5fd3a8"/>
+</svg>
