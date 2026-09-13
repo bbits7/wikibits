@@ -51,6 +51,18 @@ pub struct Find {
     pub current: usize,
 }
 
+/// The image picker (Ctrl-I in the editor): images under the wiki root, filtered by typing.
+pub struct ImagePick {
+    pub query: String,
+    /// Image paths relative to the wiki root.
+    pub all: Vec<String>,
+    pub hits: Vec<String>,
+    pub sel: usize,
+}
+
+/// Image file extensions the page renderer can show.
+const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
 /// Page suggestions for a `[[` being typed in the editor.
 pub struct Complete {
     /// Position right after the `[[`.
@@ -198,6 +210,7 @@ pub struct App {
     pub search: Option<Search>,
     pub editor: Option<Editor>,
     pub complete: Option<Complete>,
+    pub image_pick: Option<ImagePick>,
     /// `[[` context the user dismissed with Esc; do not reopen until it changes.
     complete_dismissed: Option<Pos>,
     /// Page id waiting for the create-page confirmation.
@@ -246,6 +259,7 @@ impl App {
             search: None,
             editor: None,
             complete: None,
+            image_pick: None,
             complete_dismissed: None,
             pending_create: None,
             new_page: String::new(),
@@ -1203,7 +1217,184 @@ impl App {
     fn close_edit(&mut self) {
         self.editor = None;
         self.complete = None;
+        self.image_pick = None;
         self.repaint = true;
+    }
+
+    // ----- images in the editor --------------------------------------------------------
+
+    /// Ctrl-V in the editor: an image on the clipboard is saved into the wiki and linked;
+    /// text is inserted as it is.
+    fn paste_into_editor(&mut self) {
+        let types = Command::new("wl-paste")
+            .arg("--list-types")
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let image_type = types
+            .lines()
+            .find(|t| t.starts_with("image/png") || t.starts_with("image/jpeg"))
+            .map(str::to_string);
+        if let Some(mime) = image_type {
+            let bytes = Command::new("wl-paste")
+                .args(["--type", &mime])
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success() && !o.stdout.is_empty())
+                .map(|o| o.stdout);
+            if let Some(bytes) = bytes {
+                let ext = if mime.starts_with("image/jpeg") {
+                    "jpg"
+                } else {
+                    "png"
+                };
+                match self.save_pasted_image(&bytes, ext) {
+                    Ok(rel) => {
+                        self.insert_image_link(&rel);
+                        self.status = format!("Saved the pasted image as {rel}");
+                    }
+                    Err(err) => self.status = format!("Could not save the image: {err:#}"),
+                }
+                return;
+            }
+        }
+        let text = Command::new("wl-paste")
+            .arg("--no-newline")
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if let Some(editor) = &mut self.editor {
+            if text.is_empty() {
+                editor.paste_internal();
+            } else {
+                editor.paste(&text);
+            }
+        }
+        self.update_complete();
+    }
+
+    /// Write clipboard image bytes to `assets/<page>-<n>.<ext>` under the wiki root and
+    /// return that path relative to the root.
+    fn save_pasted_image(&self, bytes: &[u8], ext: &str) -> anyhow::Result<String> {
+        let page = self
+            .current
+            .as_deref()
+            .and_then(|id| id.rsplit('/').next())
+            .unwrap_or("image");
+        let dir = self.wiki.root.join("assets");
+        fs::create_dir_all(&dir)?;
+        let name = (1..)
+            .map(|n| format!("{page}-{n}.{ext}"))
+            .find(|name| !dir.join(name).exists())
+            .unwrap();
+        fs::write(dir.join(&name), bytes)?;
+        Ok(format!("assets/{name}"))
+    }
+
+    /// Insert `![name](path)` for an image given relative to the wiki root, with the path
+    /// written relative to the current page's folder.
+    fn insert_image_link(&mut self, image: &str) {
+        let page_dir = self
+            .current
+            .as_deref()
+            .and_then(|id| id.rsplit_once('/'))
+            .map(|(dir, _)| dir)
+            .unwrap_or("");
+        let path = relative_path(page_dir, image);
+        let name = image
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.rsplit_once('.'))
+            .map(|(stem, _)| stem)
+            .unwrap_or("image");
+        if let Some(editor) = &mut self.editor {
+            editor.paste(&format!("![{name}]({path})"));
+        }
+    }
+
+    fn open_image_pick(&mut self) {
+        let root = self.wiki.root.clone();
+        let mut all: Vec<String> = walkdir::WalkDir::new(&root)
+            .into_iter()
+            .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|x| IMAGE_EXTENSIONS.contains(&x.to_lowercase().as_str()))
+            })
+            .filter_map(|e| {
+                e.path()
+                    .strip_prefix(&root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+            })
+            .collect();
+        all.sort_by_key(|p| p.to_lowercase());
+        self.complete = None;
+        self.image_pick = Some(ImagePick {
+            query: String::new(),
+            hits: all.clone(),
+            all,
+            sel: 0,
+        });
+    }
+
+    fn refilter_images(&mut self) {
+        let Some(pick) = &mut self.image_pick else {
+            return;
+        };
+        let needle = wiki::lower_chars(&pick.query);
+        pick.hits = pick
+            .all
+            .iter()
+            .filter(|p| {
+                wiki::contains(&wiki::lower_chars(p), &needle).is_some() || needle.is_empty()
+            })
+            .cloned()
+            .collect();
+        pick.sel = pick.sel.min(pick.hits.len().saturating_sub(1));
+    }
+
+    /// Keys the image picker takes; true if consumed.
+    fn image_pick_key(&mut self, key: KeyEvent) -> bool {
+        let Some(pick) = &mut self.image_pick else {
+            return false;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let count = pick.hits.len().max(1);
+        match key.code {
+            KeyCode::Esc => self.image_pick = None,
+            KeyCode::Down => pick.sel = (pick.sel + 1) % count,
+            KeyCode::Up => pick.sel = (pick.sel + count - 1) % count,
+            KeyCode::Char('n') if ctrl => pick.sel = (pick.sel + 1) % count,
+            KeyCode::Char('p') if ctrl => pick.sel = (pick.sel + count - 1) % count,
+            KeyCode::Enter | KeyCode::Tab => {
+                if let Some(image) = pick.hits.get(pick.sel).cloned() {
+                    self.image_pick = None;
+                    self.insert_image_link(&image);
+                }
+            }
+            KeyCode::Backspace => {
+                pick.query.pop();
+                self.refilter_images();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                pick.query.push(c);
+                self.refilter_images();
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Update the `[[` suggestions after the editor changed.
@@ -1607,13 +1798,15 @@ impl App {
             return;
         }
         if self.editor.is_some() {
-            if self.complete_key(key) {
+            if self.image_pick_key(key) || self.complete_key(key) {
                 return;
             }
             let action = self.editor.as_mut().unwrap().handle_key(key);
             match action {
                 Action::Save => self.save_edit(),
                 Action::Discard => self.close_edit(),
+                Action::Paste => self.paste_into_editor(),
+                Action::PickImage => self.open_image_pick(),
                 Action::None => self.update_complete(),
             }
             return;
@@ -1837,6 +2030,17 @@ impl App {
     }
 }
 
+/// `target` (relative to the wiki root) written relative to the folder `from` (also root
+/// relative, `""` for the root): `../assets/x.png` from `projects`.
+fn relative_path(from: &str, target: &str) -> String {
+    let from: Vec<&str> = from.split('/').filter(|p| !p.is_empty()).collect();
+    let target: Vec<&str> = target.split('/').filter(|p| !p.is_empty()).collect();
+    let common = from.iter().zip(&target).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<&str> = vec![".."; from.len() - common];
+    parts.extend(&target[common..]);
+    parts.join("/")
+}
+
 /// Display width of a run of characters.
 fn width_of(chars: &[char]) -> u16 {
     use unicode_width::UnicodeWidthChar;
@@ -1910,5 +2114,21 @@ impl markdown::Context for RenderCtx<'_> {
         let proto = self.images.get(&key)?.as_ref()?;
         let size = proto.size();
         Some((size.width, size.height))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_path;
+
+    #[test]
+    fn image_paths_are_relative_to_the_page_folder() {
+        assert_eq!(relative_path("", "assets/a.png"), "assets/a.png");
+        assert_eq!(relative_path("projects", "assets/a.png"), "../assets/a.png");
+        assert_eq!(
+            relative_path("projects/dotfiles", "projects/shot.png"),
+            "../shot.png"
+        );
+        assert_eq!(relative_path("notes", "notes/pics/b.jpg"), "pics/b.jpg");
     }
 }

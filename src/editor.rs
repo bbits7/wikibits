@@ -30,6 +30,10 @@ pub enum Action {
     Save,
     /// Leave the editor without saving.
     Discard,
+    /// Ctrl-V: the app reads the clipboard (text or an image) and inserts it.
+    Paste,
+    /// Ctrl-P: the app opens the image picker (Ctrl-I would be Tab in a terminal).
+    PickImage,
 }
 
 /// One screen row of a soft-wrapped line: characters `start..end` of `line`.
@@ -383,15 +387,9 @@ impl Editor {
         self.delete_selection();
     }
 
-    fn paste_clipboard(&mut self) {
-        let system = Command::new("wl-paste")
-            .arg("--no-newline")
-            .stderr(Stdio::null())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-        let text = system.unwrap_or_else(|| self.clipboard.clone());
+    /// Insert what was last copied or cut here, when the system clipboard has nothing.
+    pub fn paste_internal(&mut self) {
+        let text = self.clipboard.clone();
         if !text.is_empty() {
             self.paste(&text);
         }
@@ -552,7 +550,8 @@ impl Editor {
             }
             KeyCode::Char('c') if ctrl => self.copy(),
             KeyCode::Char('x') if ctrl => self.cut(),
-            KeyCode::Char('v') if ctrl => self.paste_clipboard(),
+            KeyCode::Char('v') if ctrl => return Action::Paste,
+            KeyCode::Char('p') if ctrl => return Action::PickImage,
             KeyCode::Left if ctrl => self.word_left(shift),
             KeyCode::Right if ctrl => self.word_right(shift),
             KeyCode::Left => self.left(shift),

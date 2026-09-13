@@ -34,6 +34,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.complete.is_some() {
         draw_complete(f, app, area);
     }
+    if app.image_pick.is_some() {
+        draw_image_pick(f, app, area);
+    }
     if app.popup.is_some() {
         draw_popup(f, app, area);
     }
@@ -437,6 +440,72 @@ fn highlight_columns(line: &mut Line<'static>, start: u16, end: u16, style: Styl
     line.spans = out;
 }
 
+/// The image picker: images under the wiki root, filtered by what is typed.
+fn draw_image_pick(f: &mut Frame, app: &App, area: Rect) {
+    let (Some(pick), Some(editor)) = (&app.image_pick, &app.editor) else {
+        return;
+    };
+    let width = pick
+        .all
+        .iter()
+        .map(|p| unicode_width::UnicodeWidthStr::width(p.as_str()) as u16 + 4)
+        .max()
+        .unwrap_or(30)
+        .clamp(34, 70);
+    let shown = pick.hits.len().clamp(1, 10) as u16;
+    let height = shown + 3;
+    let at = editor.cursor_screen;
+    let x = at.x.min(area.x + area.width.saturating_sub(width));
+    let y = if at.y + 1 + height <= area.y + area.height {
+        at.y + 1
+    } else {
+        at.y.saturating_sub(height)
+    };
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let block = pane("Insert image", true);
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" Filter: ", Style::new().fg(Color::Yellow)),
+        Span::raw(pick.query.clone()),
+        Span::styled("▏", Style::new().fg(ACCENT)),
+    ])];
+    if pick.hits.is_empty() {
+        let msg = if pick.all.is_empty() {
+            " no images in the wiki folder"
+        } else {
+            " no image matches"
+        };
+        lines.push(Line::styled(msg, Style::new().add_modifier(Modifier::DIM)));
+    }
+    let first = pick.sel.saturating_sub(shown as usize - 1);
+    for (i, path) in pick
+        .hits
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(shown as usize)
+    {
+        let style = if i == pick.sel {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new()
+        };
+        let mut text = format!(" {path}");
+        let pad = (inner.width as usize)
+            .saturating_sub(unicode_width::UnicodeWidthStr::width(text.as_str()));
+        text.push_str(&" ".repeat(pad));
+        lines.push(Line::styled(text, style));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// Page suggestions for a `[[` link, anchored under (or above) the editor's cursor.
 fn draw_complete(f: &mut Frame, app: &App, area: Rect) {
     let (Some(complete), Some(editor)) = (&app.complete, &app.editor) else {
@@ -593,7 +662,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             ])
         } else {
             Line::styled(
-                "Ctrl-S save  Esc back  Shift+arrows select  Ctrl-C/X/V copy/cut/paste  Ctrl-Z/Y undo/redo",
+                "Ctrl-S save  Esc back  Shift+arrows select  Ctrl-C/X/V copy/cut/paste  Ctrl-Z/Y undo/redo  Ctrl-P image",
                 Style::new().add_modifier(Modifier::DIM),
             )
         };
@@ -768,6 +837,14 @@ fn draw_help(f: &mut Frame, area: Rect) {
         (
             "[[",
             "suggests pages as you type; Enter / Tab inserts the link",
+        ),
+        (
+            "Ctrl-I",
+            "insert an image from the wiki folder (type to filter)",
+        ),
+        (
+            "Ctrl-V with an image",
+            "saves it to assets/ and inserts the link",
         ),
         (
             "Enter",
