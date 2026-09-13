@@ -209,7 +209,7 @@ impl Wiki {
         self.pages.contains_key(&index).then_some(index)
     }
 
-    /// Folder/page tree, folders first, both sorted by their displayed name. A folder with an
+    /// Folder/page tree, sorted by displayed name ignoring case. A folder with an
     /// `index` page takes that page's title, and the page is not listed among its children.
     pub fn tree(&self) -> Vec<TreeNode> {
         let mut root = Vec::new();
@@ -289,12 +289,12 @@ fn insert_into_tree(nodes: &mut Vec<TreeNode>, prefix: &str, rest: &str, page: &
     }
 }
 
-/// Folders first, then pages, each by displayed name; the root `index` page leads the tree.
+/// Folders and pages together, by displayed name ignoring case; the root `index` page leads.
 fn sort_tree(nodes: &mut [TreeNode]) {
     nodes.sort_by_cached_key(|n| match n {
         TreeNode::Page { id, .. } if id == "index" => (0, String::new()),
         TreeNode::Folder { name, .. } => (1, name.to_lowercase()),
-        TreeNode::Page { title, .. } => (2, title.to_lowercase()),
+        TreeNode::Page { title, .. } => (1, title.to_lowercase()),
     });
     for node in nodes {
         if let TreeNode::Folder { children, .. } = node {

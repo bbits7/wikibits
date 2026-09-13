@@ -633,10 +633,16 @@ impl App {
         if backlinks.is_empty() {
             rows.push(RelatedRow::None);
         }
-        rows.extend(backlinks.iter().map(|b| RelatedRow::Page(b.clone())));
+        let mut section: Vec<RelatedRow> = backlinks
+            .iter()
+            .map(|b| RelatedRow::Page(b.clone()))
+            .collect();
+        self.sort_related(&mut section);
+        rows.extend(section);
 
         rows.push(RelatedRow::Blank);
         rows.push(RelatedRow::Header("Links on this page"));
+        let mut section = Vec::new();
         let mut seen: Vec<LinkTarget> = Vec::new();
         if let Some(page) = self.wiki.pages.get(id) {
             for raw in &page.links {
@@ -644,7 +650,7 @@ impl App {
                 if seen.contains(&target) || matches!(&target, LinkTarget::Page(p) if p == id) {
                     continue;
                 }
-                rows.push(match &target {
+                section.push(match &target {
                     LinkTarget::Page(p) => RelatedRow::Page(p.clone()),
                     LinkTarget::Missing(r) => RelatedRow::Missing(r.clone()),
                     LinkTarget::External(u) => RelatedRow::External(u.clone()),
@@ -655,12 +661,27 @@ impl App {
         if seen.is_empty() {
             rows.push(RelatedRow::None);
         }
+        self.sort_related(&mut section);
+        rows.extend(section);
         self.related = rows;
         self.related_sel = self
             .related
             .iter()
             .position(RelatedRow::selectable)
             .unwrap_or(0);
+    }
+
+    /// Alphabetical by what the column shows, ignoring case.
+    fn sort_related(&self, rows: &mut [RelatedRow]) {
+        rows.sort_by_cached_key(|row| {
+            match row {
+                RelatedRow::Page(id) => self.wiki.title(id),
+                RelatedRow::Missing(raw) => raw.clone(),
+                RelatedRow::External(url) => url.clone(),
+                _ => String::new(),
+            }
+            .to_lowercase()
+        });
     }
 
     fn related_move(&mut self, delta: isize) {
