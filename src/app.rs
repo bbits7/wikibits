@@ -15,6 +15,7 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FontSize, Resize};
 
+use crate::editor::{Action, Editor, Pos};
 use crate::markdown::{self, ImageSlot, Item, Rendered};
 use crate::wiki::{self, LinkTarget, SearchHit, TreeNode, Wiki};
 
@@ -26,6 +27,10 @@ pub enum Prompt {
     FindPage,
     /// `s`: search every page of the wiki.
     SearchWiki,
+    /// A link to a missing page was followed: create it? (`pending_create` holds the id).
+    CreatePage,
+    /// `N`: type the path of a page to create.
+    NewPage,
 }
 
 /// A match of the find-in-page query: line and column range.
@@ -40,6 +45,14 @@ pub struct Find {
     pub query: String,
     pub matches: Vec<FindMatch>,
     pub current: usize,
+}
+
+/// Page suggestions for a `[[` being typed in the editor.
+pub struct Complete {
+    /// Position right after the `[[`.
+    pub start: Pos,
+    pub hits: Vec<(String, String)>,
+    pub sel: usize,
 }
 
 pub struct Search {
@@ -179,6 +192,16 @@ pub struct App {
     pub prompt: Prompt,
     pub find: Option<Find>,
     pub search: Option<Search>,
+    pub editor: Option<Editor>,
+    pub complete: Option<Complete>,
+    /// `[[` context the user dismissed with Esc; do not reopen until it changes.
+    complete_dismissed: Option<Pos>,
+    /// Page id waiting for the create-page confirmation.
+    pub pending_create: Option<String>,
+    /// Path typed at the new-page prompt.
+    pub new_page: String,
+    /// Clear the terminal before the next draw (an image may be left on screen).
+    pub repaint: bool,
 }
 
 impl App {
@@ -217,6 +240,12 @@ impl App {
             prompt: Prompt::None,
             find: None,
             search: None,
+            editor: None,
+            complete: None,
+            complete_dismissed: None,
+            pending_create: None,
+            new_page: String::new(),
+            repaint: false,
         };
         app.expand_all();
         app.rebuild_tree();
@@ -307,9 +336,13 @@ impl App {
                 let id = id.clone();
                 self.open(&id, true);
             }
-            LinkTarget::Missing(raw) => {
-                self.status = format!("No page '{raw}' (yet)");
-            }
+            LinkTarget::Missing(raw) => match self.new_page_id(raw) {
+                Some(id) => {
+                    self.pending_create = Some(id);
+                    self.prompt = Prompt::CreatePage;
+                }
+                None => self.status = format!("No page '{raw}', and that is not a page path"),
+            },
             LinkTarget::External(url) => {
                 let ok = Command::new("xdg-open")
                     .arg(url)
@@ -1123,6 +1156,195 @@ impl App {
 
     // ----- input -----------------------------------------------------------------------
 
+    // ----- editing and creating pages --------------------------------------------------
+
+    /// Open the current page's source in the editor.
+    pub fn start_edit(&mut self) {
+        let Some(page) = self.current.as_ref().and_then(|id| self.wiki.pages.get(id)) else {
+            return;
+        };
+        let text = fs::read_to_string(&page.path).unwrap_or_default();
+        self.editor = Some(Editor::new(&text));
+        self.prompt = Prompt::None;
+        self.find = None;
+        self.search = None;
+        self.popup = None;
+        self.focus = Focus::Content;
+        self.repaint = true;
+    }
+
+    fn save_edit(&mut self) {
+        let Some(editor) = self.editor.take() else {
+            return;
+        };
+        let Some(page) = self.current.as_ref().and_then(|id| self.wiki.pages.get(id)) else {
+            return;
+        };
+        let (path, id) = (page.path.clone(), page.id.clone());
+        match fs::write(&path, editor.text()) {
+            Ok(()) => {
+                self.reload();
+                self.status = format!("Saved {id}");
+            }
+            Err(err) => {
+                // Keep the text so nothing is lost.
+                self.status = format!("Could not save {}: {err}", path.display());
+                self.editor = Some(editor);
+                return;
+            }
+        }
+        self.repaint = true;
+    }
+
+    fn close_edit(&mut self) {
+        self.editor = None;
+        self.complete = None;
+        self.repaint = true;
+    }
+
+    /// Update the `[[` suggestions after the editor changed.
+    fn update_complete(&mut self) {
+        let context = self.editor.as_ref().and_then(Editor::link_context);
+        let Some((start, typed)) = context else {
+            self.complete = None;
+            self.complete_dismissed = None;
+            return;
+        };
+        if self.complete_dismissed == Some(start) {
+            return;
+        }
+        let needle = wiki::lower_chars(&typed);
+        let mut hits: Vec<(usize, String, String)> = self
+            .wiki
+            .pages
+            .values()
+            .filter_map(|p| {
+                let id = wiki::lower_chars(&p.id);
+                let title = wiki::lower_chars(&p.title);
+                let rank = if title.starts_with(&needle[..]) || id.starts_with(&needle[..]) {
+                    0
+                } else if wiki::contains(&title, &needle).is_some()
+                    || wiki::contains(&id, &needle).is_some()
+                {
+                    1
+                } else {
+                    return None;
+                };
+                Some((rank, p.title.clone(), p.id.clone()))
+            })
+            .collect();
+        hits.sort_by_cached_key(|(rank, title, id)| (*rank, title.to_lowercase(), id.clone()));
+        hits.truncate(8);
+        let hits: Vec<(String, String)> = hits.into_iter().map(|(_, t, i)| (i, t)).collect();
+        let sel = match &self.complete {
+            Some(c) if c.start == start => c.sel.min(hits.len().saturating_sub(1)),
+            _ => 0,
+        };
+        self.complete = Some(Complete { start, hits, sel });
+    }
+
+    /// Keys the suggestion list takes before the editor sees them; true if consumed.
+    fn complete_key(&mut self, key: KeyEvent) -> bool {
+        let Some(complete) = &mut self.complete else {
+            return false;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.complete_dismissed = Some(complete.start);
+                self.complete = None;
+            }
+            KeyCode::Down => complete.sel = (complete.sel + 1) % complete.hits.len().max(1),
+            KeyCode::Up => {
+                complete.sel =
+                    (complete.sel + complete.hits.len().max(1) - 1) % complete.hits.len().max(1)
+            }
+            KeyCode::Char('n') if ctrl => {
+                complete.sel = (complete.sel + 1) % complete.hits.len().max(1)
+            }
+            KeyCode::Char('p') if ctrl => {
+                complete.sel =
+                    (complete.sel + complete.hits.len().max(1) - 1) % complete.hits.len().max(1)
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                let start = complete.start;
+                let Some((id, _)) = complete.hits.get(complete.sel).cloned() else {
+                    return false;
+                };
+                if let Some(editor) = &mut self.editor {
+                    editor.complete_link(start, &id);
+                }
+                self.complete = None;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// A page id for a link target that does not exist yet, or `None` if it cannot be a page.
+    fn new_page_id(&self, raw: &str) -> Option<String> {
+        let target = raw.split('#').next().unwrap_or("").trim();
+        let target = target.strip_suffix(".md").unwrap_or(target);
+        let id: String = target
+            .split('/')
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && *p != ".")
+            .collect::<Vec<_>>()
+            .join("/");
+        let ok = !id.is_empty()
+            && !id.contains("..")
+            && !id.contains("://")
+            && id
+                .chars()
+                .all(|c| c.is_alphanumeric() || "-_./ ".contains(c));
+        ok.then_some(id)
+    }
+
+    /// Create `id.md` with a title heading, open it, and start editing.
+    fn create_page(&mut self, id: &str) {
+        let path = self.wiki.root.join(format!("{id}.md"));
+        if path.exists() {
+            self.open(id, true);
+            self.start_edit();
+            return;
+        }
+        let title = wiki::prettify(id);
+        let result = path
+            .parent()
+            .map(fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            // Title, a blank line, and an empty line for the cursor to start on.
+            .and_then(|_| fs::write(&path, format!("# {title}\n\n\n")));
+        if let Err(err) = result {
+            self.status = format!("Could not create {}: {err}", path.display());
+            return;
+        }
+        if let Err(err) = self.wiki.reload() {
+            self.status = format!("Reload failed: {err}");
+            return;
+        }
+        self.rebuild_tree();
+        self.open(id, true);
+        self.start_edit();
+        if let Some(editor) = &mut self.editor {
+            editor.cursor_to_end();
+        }
+        self.status = format!("Created {id}");
+    }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        if let Some(editor) = &mut self.editor {
+            editor.paste(text);
+            self.update_complete();
+        } else if let Some(search) = &mut self.search {
+            search.query.push_str(text.trim());
+            self.research();
+        } else if let Some(find) = &mut self.find {
+            find.query.push_str(text.trim());
+            self.refind(true);
+        }
+    }
+
     // ----- find in page and wiki search ------------------------------------------------
 
     /// Recompute the matches for the find query; `keep` tries to stay on the current match.
@@ -1236,7 +1458,30 @@ impl App {
                 self.prompt = Prompt::None;
                 self.find = None;
                 self.search = None;
+                self.pending_create = None;
             }
+            (Prompt::CreatePage, KeyCode::Char('y' | 'Y') | KeyCode::Enter) => {
+                self.prompt = Prompt::None;
+                if let Some(id) = self.pending_create.take() {
+                    self.create_page(&id);
+                }
+            }
+            (Prompt::CreatePage, _) => {
+                self.prompt = Prompt::None;
+                self.pending_create = None;
+            }
+            (Prompt::NewPage, KeyCode::Enter) => {
+                self.prompt = Prompt::None;
+                let typed = std::mem::take(&mut self.new_page);
+                match self.new_page_id(&typed) {
+                    Some(id) => self.create_page(&id),
+                    None => self.status = "That is not a page path (folder/name)".into(),
+                }
+            }
+            (Prompt::NewPage, KeyCode::Backspace) => {
+                self.new_page.pop();
+            }
+            (Prompt::NewPage, KeyCode::Char(c)) if !ctrl => self.new_page.push(c),
             (Prompt::FindPage, KeyCode::Enter | KeyCode::Down) => self.find_step(1),
             (Prompt::FindPage, KeyCode::Up) => self.find_step(-1),
             (Prompt::FindPage, KeyCode::Char('n')) if ctrl => self.find_step(1),
@@ -1287,6 +1532,18 @@ impl App {
             self.popup_key(key);
             return;
         }
+        if self.editor.is_some() {
+            if self.complete_key(key) {
+                return;
+            }
+            let action = self.editor.as_mut().unwrap().handle_key(key);
+            match action {
+                Action::Save => self.save_edit(),
+                Action::Discard => self.close_edit(),
+                Action::None => self.update_complete(),
+            }
+            return;
+        }
         if self.prompt != Prompt::None {
             self.prompt_key(key);
             return;
@@ -1294,6 +1551,11 @@ impl App {
         self.status.clear();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Char('e') => self.start_edit(),
+            KeyCode::Char('N') => {
+                self.prompt = Prompt::NewPage;
+                self.new_page.clear();
+            }
             KeyCode::Char('/') => self.start_find(""),
             KeyCode::Char('s') => {
                 self.prompt = Prompt::SearchWiki;
@@ -1410,6 +1672,11 @@ impl App {
         }
         if self.popup.is_some() {
             self.popup_mouse(mouse);
+            return;
+        }
+        if let Some(editor) = &mut self.editor {
+            editor.handle_mouse(mouse);
+            self.update_complete();
             return;
         }
         if let Some(search) = &self.search {

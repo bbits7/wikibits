@@ -37,6 +37,7 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `v` | toggle between the rendered page and its Markdown source |
 | `/` | find in the page: matches highlight as you type, `Enter`/`Up` step through them |
 | `s` | search the wiki: live list of matching pages, `Enter` opens one at the match |
+| `e` | edit the page in place; `N` creates a new page by path; `Enter` on a missing link offers to create it |
 | `h` / `l` | collapse / expand a folder |
 | `b`, `Backspace` / `f` | back / forward |
 | `H` | home page |
@@ -45,6 +46,17 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `q` | quit |
 
 The mouse works too: click to open, wheel to scroll, right-click to go back.
+
+## Editing
+
+`e` opens the page's Markdown in the middle pane as a plain editor: type to insert, arrows,
+`Home`/`End`, `PgUp`/`PgDn`, `Ctrl+Left/Right` by word, `Shift`+arrows to select, `Ctrl-A`
+select all, `Ctrl-C`/`Ctrl-X`/`Ctrl-V` with the system clipboard (`wl-copy`/`wl-paste`; the
+terminal's own paste works too), `Ctrl-Z`/`Ctrl-Y` undo and redo, `Tab` two spaces, and long
+lines soft-wrap. Typing `[[` pops up matching pages as you type; `Enter` or `Tab` inserts the
+chosen page and closes the link with `]]`. `Ctrl-S` saves and returns to the rendered page; `Esc` returns, asking first
+if there are unsaved changes. `N` creates a page from a `folder/name` path, and following a
+link to a page that does not exist offers to create it.
 
 ## Images
 

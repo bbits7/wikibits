@@ -1,6 +1,7 @@
 //! wikiBits: a terminal wiki built on a folder of plain Markdown files.
 
 mod app;
+mod editor;
 mod markdown;
 mod ui;
 mod wiki;
@@ -14,7 +15,8 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use notify::{EventKind, RecursiveMode, Watcher};
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui_image::picker::Picker;
@@ -55,16 +57,16 @@ fn main() -> Result<()> {
 
     let mut terminal = ratatui::init();
     let picker = query_image_support();
-    let _ = execute!(stdout(), EnableMouseCapture);
+    let _ = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste);
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(stdout(), DisableMouseCapture);
+        let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
         hook(info);
     }));
 
     let result = run(&mut terminal, wiki, picker, cli.page);
 
-    let _ = execute!(stdout(), DisableMouseCapture);
+    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -169,6 +171,7 @@ fn run(
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => app.handle_key(key),
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
+                Event::Paste(text) => app.handle_paste(&text),
                 _ => {}
             }
             wait = Duration::ZERO;
@@ -176,7 +179,9 @@ fn run(
         // An overlay that covered an inline image leaves its pixels behind: the cells under an
         // image are never rewritten, so the terminal keeps showing what was drawn there last.
         // Repaint everything when an overlay goes away.
-        if had_overlay && app.popup.is_none() && !app.show_help && app.search.is_none() {
+        if (had_overlay && app.popup.is_none() && !app.show_help && app.search.is_none())
+            || std::mem::take(&mut app.repaint)
+        {
             terminal.clear()?;
         }
         app.refresh_font_size();

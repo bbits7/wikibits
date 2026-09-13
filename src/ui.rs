@@ -31,6 +31,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.search.is_some() {
         draw_search(f, app, main);
     }
+    if app.complete.is_some() {
+        draw_complete(f, app, area);
+    }
     if app.popup.is_some() {
         draw_popup(f, app, area);
     }
@@ -196,6 +199,11 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
     app.content_height = body.height as usize;
     app.set_size(body.width, body.height);
 
+    if let Some(editor) = &mut app.editor {
+        editor.render(f, body);
+        return;
+    }
+
     let Some(rendered) = &app.rendered else {
         let msg = Paragraph::new(app.status.clone()).dim();
         f.render_widget(msg, body);
@@ -294,7 +302,14 @@ fn crumbs_title(app: &mut App, area: Rect, focused: bool) -> Line<'static> {
         columns.push((col, col + width));
         col += width;
     }
-    if app.raw {
+    if let Some(editor) = &app.editor {
+        let mark = if editor.modified() {
+            " (editing •)"
+        } else {
+            " (editing)"
+        };
+        spans.push(Span::styled(mark, Style::new().fg(Color::Yellow)));
+    } else if app.raw {
         spans.push(Span::styled(
             " (source)",
             Style::new().add_modifier(Modifier::DIM),
@@ -422,6 +437,72 @@ fn highlight_columns(line: &mut Line<'static>, start: u16, end: u16, style: Styl
     line.spans = out;
 }
 
+/// Page suggestions for a `[[` link, anchored under (or above) the editor's cursor.
+fn draw_complete(f: &mut Frame, app: &App, area: Rect) {
+    let (Some(complete), Some(editor)) = (&app.complete, &app.editor) else {
+        return;
+    };
+    let rows: Vec<String> = complete
+        .hits
+        .iter()
+        .map(|(id, title)| format!(" {title}  {id} "))
+        .collect();
+    let width = rows
+        .iter()
+        .map(|r| unicode_width::UnicodeWidthStr::width(r.as_str()) as u16)
+        .max()
+        .unwrap_or(20)
+        .clamp(20, 60)
+        + 2;
+    let height = rows.len().max(1) as u16 + 2;
+    let at = editor.cursor_screen;
+    let x = at.x.min(area.x + area.width.saturating_sub(width));
+    let y = if at.y + 1 + height <= area.y + area.height {
+        at.y + 1
+    } else {
+        at.y.saturating_sub(height)
+    };
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let block = pane("", true);
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    let lines: Vec<Line> = if rows.is_empty() {
+        vec![Line::styled(
+            " no matching page",
+            Style::new().add_modifier(Modifier::DIM),
+        )]
+    } else {
+        complete
+            .hits
+            .iter()
+            .enumerate()
+            .map(|(i, (id, title))| {
+                let style = if i == complete.sel {
+                    Style::new().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::new()
+                };
+                let mut text = format!(" {title}  ");
+                let pad = (inner.width as usize).saturating_sub(
+                    unicode_width::UnicodeWidthStr::width(text.as_str()) + id.len() + 1,
+                );
+                text.push_str(&" ".repeat(pad));
+                Line::from(vec![
+                    Span::styled(text, style.add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{id} "), style.add_modifier(Modifier::DIM)),
+                ])
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// The wiki search results, two lines per page, under the prompt in the status bar.
 fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(search) = &mut app.search else {
@@ -504,6 +585,46 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+    if let Some(editor) = &app.editor {
+        let line = if editor.confirm {
+            Line::from(vec![
+                Span::styled("Save changes? ", Style::new().fg(Color::Yellow)),
+                Span::raw("y = save   n = discard   Esc = keep editing"),
+            ])
+        } else {
+            Line::styled(
+                "Ctrl-S save  Esc back  Shift+arrows select  Ctrl-C/X/V copy/cut/paste  Ctrl-Z/Y undo/redo",
+                Style::new().add_modifier(Modifier::DIM),
+            )
+        };
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if app.prompt == Prompt::CreatePage {
+        let id = app.pending_create.clone().unwrap_or_default();
+        let line = Line::from(vec![
+            Span::styled(
+                format!("Create page '{id}'? "),
+                Style::new().fg(Color::Yellow),
+            ),
+            Span::raw("y = create and edit   n = no"),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if app.prompt == Prompt::NewPage {
+        let line = Line::from(vec![
+            Span::styled("New page (folder/name): ", Style::new().fg(Color::Yellow)),
+            Span::raw(app.new_page.clone()),
+            Span::styled("▏", Style::new().fg(ACCENT)),
+            Span::styled(
+                "   Enter create  Esc cancel",
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     if app.prompt != Prompt::None {
         let (label, query, extra) = match app.prompt {
             Prompt::FindPage => {
@@ -601,6 +722,26 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("v", "toggle Markdown source / rendered page"),
         ("/", "find in this page (Enter / Up step, Esc closes)"),
         ("s", "search the wiki (Enter opens the page at the match)"),
+        ("e", "edit this page"),
+        ("N", "new page (type folder/name)"),
+        ("Enter on a red link", "offers to create that page"),
+        ("", ""),
+        ("Editor", ""),
+        ("Ctrl-S  Esc", "save and return / return (asks if changed)"),
+        ("Shift+arrows  Ctrl-A", "select / select all"),
+        (
+            "Ctrl-C  Ctrl-X  Ctrl-V",
+            "copy / cut / paste (system clipboard)",
+        ),
+        ("Ctrl-Z  Ctrl-Y", "undo / redo"),
+        (
+            "Ctrl+Left/Right",
+            "word left / right;  Tab inserts two spaces",
+        ),
+        (
+            "[[",
+            "suggests pages as you type; Enter / Tab inserts the link",
+        ),
         (
             "Enter",
             "follow the selected link / open the image full size",
