@@ -18,6 +18,18 @@ pub struct Page {
     pub title: String,
     /// Raw link targets as written in the file, in document order, without duplicates.
     pub links: Vec<String>,
+    /// The file's Markdown source.
+    pub text: String,
+}
+
+/// A page matching a wiki search.
+pub struct SearchHit {
+    pub id: String,
+    pub title: String,
+    /// Whether the title itself matched.
+    pub in_title: bool,
+    /// The first matching line, trimmed around the match; empty if only the title matched.
+    pub snippet: String,
 }
 
 /// Where a link points once resolved against the index.
@@ -87,6 +99,7 @@ impl Wiki {
                     links: extract_links(&text),
                     id,
                     path: path.to_path_buf(),
+                    text,
                 },
             );
         }
@@ -209,6 +222,33 @@ impl Wiki {
         self.pages.contains_key(&index).then_some(index)
     }
 
+    /// Pages whose title or text contains `query`, ignoring case: title matches first, then
+    /// by title.
+    pub fn search(&self, query: &str) -> Vec<SearchHit> {
+        let needle: Vec<char> = lower_chars(query.trim());
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut hits: Vec<SearchHit> = self
+            .pages
+            .values()
+            .filter_map(|page| {
+                let in_title = contains(&lower_chars(&page.title), &needle).is_some();
+                let snippet = page.text.lines().find_map(|line| {
+                    contains(&lower_chars(line), &needle).map(|at| snippet(line, at, needle.len()))
+                });
+                (in_title || snippet.is_some()).then(|| SearchHit {
+                    id: page.id.clone(),
+                    title: page.title.clone(),
+                    in_title,
+                    snippet: snippet.unwrap_or_default(),
+                })
+            })
+            .collect();
+        hits.sort_by_cached_key(|h| (!h.in_title, h.title.to_lowercase()));
+        hits
+    }
+
     /// Folder/page tree, sorted by displayed name ignoring case. A folder with an
     /// `index` page takes that page's title, and the page is not listed among its children.
     pub fn tree(&self) -> Vec<TreeNode> {
@@ -320,6 +360,37 @@ fn normalize(path: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// Lower-cased characters, one per input character, so positions line up with the original.
+pub fn lower_chars(text: &str) -> Vec<char> {
+    text.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect()
+}
+
+/// Character index where `needle` first occurs in `haystack`.
+pub fn contains(haystack: &[char], needle: &[char]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| haystack[i..i + needle.len()] == *needle)
+}
+
+/// `line` cut down to about 70 characters around the match at character `at`.
+fn snippet(line: &str, at: usize, len: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let start = at.saturating_sub(25);
+    let end = (at + len + 45).min(chars.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(&chars[start..end]);
+    if end < chars.len() {
+        out.push('…');
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Turn a slug like `my-wiki-page` into `My wiki page`.
@@ -452,6 +523,43 @@ mod tests {
         assert_eq!(name, "Projects");
         assert_eq!(index.as_deref(), Some("projects/index"));
         assert_eq!(children.len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn search_matches_titles_and_text() {
+        let dir = std::env::temp_dir().join(format!("wikibits-search-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("index.md"), "# Home\n\nNothing here.").unwrap();
+        fs::write(dir.join("apples.md"), "# Apples\n\nGreen ones.").unwrap();
+        fs::write(
+            dir.join("pie.md"),
+            "# Pie\n\nBest made with Apples and cinnamon, baked slowly.",
+        )
+        .unwrap();
+        let wiki = Wiki::load(&dir).unwrap();
+        let hits = wiki.search("apple");
+        let got: Vec<(&str, bool, &str)> = hits
+            .iter()
+            .map(|h| (h.id.as_str(), h.in_title, h.snippet.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("apples", true, "# Apples"),
+                (
+                    "pie",
+                    false,
+                    "Best made with Apples and cinnamon, baked slowly."
+                ),
+            ]
+        );
+        assert!(wiki.search("   ").is_empty());
+        assert_eq!(
+            contains(&lower_chars("Éclair"), &lower_chars("éCL")),
+            Some(0)
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

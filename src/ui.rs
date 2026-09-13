@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui_image::Image;
 use ratatui_image::sliced::SlicedImage;
 
-use crate::app::{App, Focus, RelatedRow, TreeKind};
+use crate::app::{App, Focus, Prompt, RelatedRow, TreeKind};
 use crate::markdown::{EXTERNAL_LINK, Item, MISSING_LINK, PAGE_LINK};
 
 const ACCENT: Color = Color::Cyan;
@@ -28,6 +28,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_content(f, app, content);
     draw_related(f, app, related);
     draw_status(f, app, status);
+    if app.search.is_some() {
+        draw_search(f, app, main);
+    }
     if app.popup.is_some() {
         draw_popup(f, app, area);
     }
@@ -233,6 +236,20 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
         }
         None => {}
     }
+    if let Some(find) = &app.find {
+        for (i, m) in find.matches.iter().enumerate() {
+            if m.line >= scroll
+                && let Some(line) = lines.get_mut(m.line - scroll)
+            {
+                let style = if i == find.current {
+                    Style::new().fg(Color::Black).bg(Color::Yellow)
+                } else {
+                    Style::new().fg(Color::Black).bg(Color::DarkGray)
+                };
+                highlight_columns(line, m.start, m.end, style);
+            }
+        }
+    }
     f.render_widget(Paragraph::new(Text::from(lines)), body);
 
     for slot in &rendered.images {
@@ -371,7 +388,160 @@ fn draw_related(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Restyle the cells of `line` in columns `start..end`, splitting spans as needed.
+fn highlight_columns(line: &mut Line<'static>, start: u16, end: u16, style: Style) {
+    use unicode_width::UnicodeWidthChar;
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut col = 0u16;
+    for span in line.spans.drain(..) {
+        let mut run = String::new();
+        let mut run_hit = false;
+        for c in span.content.chars() {
+            let hit = col >= start && col < end;
+            if hit != run_hit && !run.is_empty() {
+                let s = if run_hit {
+                    span.style.patch(style)
+                } else {
+                    span.style
+                };
+                out.push(Span::styled(std::mem::take(&mut run), s));
+            }
+            run_hit = hit;
+            run.push(c);
+            col += c.width().unwrap_or(0) as u16;
+        }
+        if !run.is_empty() {
+            let s = if run_hit {
+                span.style.patch(style)
+            } else {
+                span.style
+            };
+            out.push(Span::styled(run, s));
+        }
+    }
+    line.spans = out;
+}
+
+/// The wiki search results, two lines per page, under the prompt in the status bar.
+fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(search) = &mut app.search else {
+        return;
+    };
+    let width = (area.width * 2 / 3).clamp(30, 100).min(area.width);
+    let rows = search.hits.len().clamp(1, 12) as u16 * 2;
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + 2,
+        width,
+        height: (rows + 2).min(area.height),
+    };
+    let title = if search.query.trim().is_empty() {
+        " Search the wiki ".to_string()
+    } else {
+        format!(
+            " {} page{} for \"{}\" ",
+            search.hits.len(),
+            if search.hits.len() == 1 { "" } else { "s" },
+            search.query
+        )
+    };
+    let block = pane(&title, true);
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    search.view = inner;
+    let visible = (inner.height / 2) as usize;
+    if search.sel < search.scroll {
+        search.scroll = search.sel;
+    } else if visible > 0 && search.sel >= search.scroll + visible {
+        search.scroll = search.sel + 1 - visible;
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    if search.hits.is_empty() {
+        let msg = if search.query.trim().is_empty() {
+            "Type to search page titles and text."
+        } else {
+            "No page matches."
+        };
+        lines.push(Line::styled(msg, Style::new().add_modifier(Modifier::DIM)));
+    }
+    for (i, hit) in search
+        .hits
+        .iter()
+        .enumerate()
+        .skip(search.scroll)
+        .take(visible)
+    {
+        let selected = i == search.sel;
+        let title_style = if selected {
+            Style::new()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+        };
+        let mut head = format!(" {}", hit.title);
+        let pad = (inner.width as usize)
+            .saturating_sub(unicode_width::UnicodeWidthStr::width(head.as_str()));
+        head.push_str(&" ".repeat(pad));
+        lines.push(Line::from(vec![Span::styled(head, title_style)]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("   {}", hit.id),
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                if hit.snippet.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", hit.snippet)
+                },
+                Style::new(),
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+    if app.prompt != Prompt::None {
+        let (label, query, extra) = match app.prompt {
+            Prompt::FindPage => {
+                let find = app.find.as_ref();
+                let query = find.map(|f| f.query.as_str()).unwrap_or("");
+                let extra = match find {
+                    Some(f) if !f.query.is_empty() && f.matches.is_empty() => {
+                        "  no match".to_string()
+                    }
+                    Some(f) if !f.matches.is_empty() => {
+                        format!("  {}/{}", f.current + 1, f.matches.len())
+                    }
+                    _ => String::new(),
+                };
+                ("Find in page: ", query.to_string(), extra)
+            }
+            _ => (
+                "Search wiki: ",
+                app.search
+                    .as_ref()
+                    .map(|s| s.query.clone())
+                    .unwrap_or_default(),
+                String::new(),
+            ),
+        };
+        let line = Line::from(vec![
+            Span::styled(label, Style::new().fg(Color::Yellow)),
+            Span::raw(query),
+            Span::styled("▏", Style::new().fg(ACCENT)),
+            Span::styled(extra, Style::new().add_modifier(Modifier::DIM)),
+            Span::styled(
+                "   Enter next  Up previous  Esc close",
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let hints = match app.focus {
         _ if app.popup.is_some() => "h/j/k/l scroll  PgUp/PgDn  g/G  Esc close",
         Focus::Tree => "j/k move  Enter open  h/l fold  Tab pane  b back  ? help  q quit",
@@ -429,6 +599,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("g / G", "top / bottom"),
         ("n / p", "next / previous link or image"),
         ("v", "toggle Markdown source / rendered page"),
+        ("/", "find in this page (Enter / Up step, Esc closes)"),
+        ("s", "search the wiki (Enter opens the page at the match)"),
         (
             "Enter",
             "follow the selected link / open the image full size",

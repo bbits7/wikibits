@@ -16,7 +16,40 @@ use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FontSize, Resize};
 
 use crate::markdown::{self, ImageSlot, Item, Rendered};
-use crate::wiki::{LinkTarget, TreeNode, Wiki};
+use crate::wiki::{self, LinkTarget, SearchHit, TreeNode, Wiki};
+
+/// What the status bar is asking for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Prompt {
+    None,
+    /// `/`: find text in the current page.
+    FindPage,
+    /// `s`: search every page of the wiki.
+    SearchWiki,
+}
+
+/// A match of the find-in-page query: line and column range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FindMatch {
+    pub line: usize,
+    pub start: u16,
+    pub end: u16,
+}
+
+pub struct Find {
+    pub query: String,
+    pub matches: Vec<FindMatch>,
+    pub current: usize,
+}
+
+pub struct Search {
+    pub query: String,
+    pub hits: Vec<SearchHit>,
+    pub sel: usize,
+    pub scroll: usize,
+    /// List area from the last draw, for mouse clicks.
+    pub view: Rect,
+}
 
 /// `(view size, scroll offset)` a pop-up image was encoded for.
 type PopupKey = ((u16, u16), (u16, u16));
@@ -143,6 +176,9 @@ pub struct App {
     /// Breadcrumbs of the current page, with their column ranges from the last draw.
     pub crumbs: Vec<Crumb>,
     pub crumb_columns: Vec<(u16, u16)>,
+    pub prompt: Prompt,
+    pub find: Option<Find>,
+    pub search: Option<Search>,
 }
 
 impl App {
@@ -178,6 +214,9 @@ impl App {
             rects: Rects::default(),
             crumbs: Vec::new(),
             crumb_columns: Vec::new(),
+            prompt: Prompt::None,
+            find: None,
+            search: None,
         };
         app.expand_all();
         app.rebuild_tree();
@@ -229,6 +268,10 @@ impl App {
         self.related_sel = 0;
         self.related_scroll = 0;
         self.toc_fresh = true;
+        if self.prompt == Prompt::FindPage {
+            self.prompt = Prompt::None;
+        }
+        self.find = None;
         self.status.clear();
         self.render_current();
         self.rebuild_related();
@@ -1080,6 +1123,161 @@ impl App {
 
     // ----- input -----------------------------------------------------------------------
 
+    // ----- find in page and wiki search ------------------------------------------------
+
+    /// Recompute the matches for the find query; `keep` tries to stay on the current match.
+    fn refind(&mut self, keep: bool) {
+        let Some(find) = &mut self.find else { return };
+        let needle = wiki::lower_chars(&find.query);
+        let mut matches = Vec::new();
+        if !needle.is_empty()
+            && let Some(rendered) = &self.rendered
+        {
+            for (line_no, line) in rendered.lines.iter().enumerate() {
+                let text = line.to_string();
+                let chars: Vec<char> = text.chars().collect();
+                let lower = wiki::lower_chars(&text);
+                let mut from = 0;
+                while let Some(at) = wiki::contains(&lower[from..], &needle) {
+                    let at = from + at;
+                    let start = width_of(&chars[..at]);
+                    let end = start + width_of(&chars[at..at + needle.len()]);
+                    matches.push(FindMatch {
+                        line: line_no,
+                        start,
+                        end,
+                    });
+                    from = at + needle.len().max(1);
+                }
+            }
+        }
+        let previous = find.matches.get(find.current).copied();
+        find.matches = matches;
+        find.current = match previous.filter(|_| keep) {
+            Some(p) => find.matches.iter().position(|m| *m == p).unwrap_or(0),
+            None => find
+                .matches
+                .iter()
+                .position(|m| m.line >= self.scroll)
+                .unwrap_or(0),
+        };
+        self.show_current_match();
+    }
+
+    fn show_current_match(&mut self) {
+        let Some(find) = &self.find else { return };
+        let Some(m) = find.matches.get(find.current) else {
+            return;
+        };
+        let line = m.line;
+        if line < self.scroll || line >= self.scroll + self.content_height {
+            let target = line.saturating_sub(self.content_height / 3);
+            self.scroll = target.min(self.max_scroll());
+        }
+    }
+
+    fn find_step(&mut self, delta: isize) {
+        let Some(find) = &mut self.find else { return };
+        let count = find.matches.len();
+        if count == 0 {
+            return;
+        }
+        find.current = (find.current as isize + delta).rem_euclid(count as isize) as usize;
+        self.show_current_match();
+    }
+
+    /// Start finding `query` in the current page (empty: just open the prompt).
+    pub fn start_find(&mut self, query: &str) {
+        self.prompt = Prompt::FindPage;
+        self.search = None;
+        self.find = Some(Find {
+            query: query.to_string(),
+            matches: Vec::new(),
+            current: 0,
+        });
+        self.refind(false);
+    }
+
+    fn research(&mut self) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        search.hits = self.wiki.search(&search.query);
+        search.sel = 0;
+        search.scroll = 0;
+    }
+
+    fn search_move(&mut self, delta: isize) {
+        if let Some(search) = &mut self.search
+            && !search.hits.is_empty()
+        {
+            let max = search.hits.len() as isize - 1;
+            search.sel = (search.sel as isize + delta).clamp(0, max) as usize;
+        }
+    }
+
+    /// Open the selected search result and find the query in it.
+    fn search_open(&mut self) {
+        let Some(search) = &self.search else { return };
+        let Some(hit) = search.hits.get(search.sel) else {
+            return;
+        };
+        let (id, query) = (hit.id.clone(), search.query.clone());
+        self.search = None;
+        self.prompt = Prompt::None;
+        self.open(&id, true);
+        self.start_find(&query);
+    }
+
+    fn prompt_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match (self.prompt, key.code) {
+            (_, KeyCode::Esc) => {
+                self.prompt = Prompt::None;
+                self.find = None;
+                self.search = None;
+            }
+            (Prompt::FindPage, KeyCode::Enter | KeyCode::Down) => self.find_step(1),
+            (Prompt::FindPage, KeyCode::Up) => self.find_step(-1),
+            (Prompt::FindPage, KeyCode::Char('n')) if ctrl => self.find_step(1),
+            (Prompt::FindPage, KeyCode::Char('p')) if ctrl => self.find_step(-1),
+            (Prompt::FindPage, KeyCode::Backspace) => {
+                if let Some(find) = &mut self.find {
+                    find.query.pop();
+                }
+                self.refind(true);
+            }
+            (Prompt::FindPage, KeyCode::Char(c)) if !ctrl => {
+                if let Some(find) = &mut self.find {
+                    find.query.push(c);
+                }
+                self.refind(true);
+            }
+            (Prompt::SearchWiki, KeyCode::Enter) => self.search_open(),
+            (Prompt::SearchWiki, KeyCode::Down) => self.search_move(1),
+            (Prompt::SearchWiki, KeyCode::Up) => self.search_move(-1),
+            (Prompt::SearchWiki, KeyCode::Char('j' | 'n')) if ctrl => self.search_move(1),
+            (Prompt::SearchWiki, KeyCode::Char('k' | 'p')) if ctrl => self.search_move(-1),
+            (Prompt::SearchWiki, KeyCode::PageDown) => self.search_move(10),
+            (Prompt::SearchWiki, KeyCode::PageUp) => self.search_move(-10),
+            (Prompt::SearchWiki, KeyCode::Backspace) => {
+                if let Some(search) = &mut self.search {
+                    search.query.pop();
+                }
+                self.research();
+            }
+            (Prompt::SearchWiki, KeyCode::Char(c)) if !ctrl => {
+                if let Some(search) = &mut self.search {
+                    search.query.push(c);
+                }
+                self.research();
+            }
+            _ => {}
+        }
+    }
+
+    // ----- input -----------------------------------------------------------------------
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         if self.show_help {
             self.show_help = false;
@@ -1089,9 +1287,25 @@ impl App {
             self.popup_key(key);
             return;
         }
+        if self.prompt != Prompt::None {
+            self.prompt_key(key);
+            return;
+        }
         self.status.clear();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Char('/') => self.start_find(""),
+            KeyCode::Char('s') => {
+                self.prompt = Prompt::SearchWiki;
+                self.find = None;
+                self.search = Some(Search {
+                    query: String::new(),
+                    hits: Vec::new(),
+                    sel: 0,
+                    scroll: 0,
+                    view: Rect::default(),
+                });
+            }
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Char('?') => self.show_help = true,
@@ -1198,6 +1412,28 @@ impl App {
             self.popup_mouse(mouse);
             return;
         }
+        if let Some(search) = &self.search {
+            let view = search.view;
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if view.contains((mouse.column, mouse.row).into()) =>
+                {
+                    let row = (mouse.row - view.y) as usize / 2 + search.scroll;
+                    if row < search.hits.len() {
+                        self.search.as_mut().unwrap().sel = row;
+                        self.search_open();
+                    }
+                }
+                MouseEventKind::Down(_) => {
+                    self.search = None;
+                    self.prompt = Prompt::None;
+                }
+                MouseEventKind::ScrollDown => self.search_move(1),
+                MouseEventKind::ScrollUp => self.search_move(-1),
+                _ => {}
+            }
+            return;
+        }
         let (x, y) = (mouse.column, mouse.row);
         let rects = self.rects;
         match mouse.kind {
@@ -1253,6 +1489,12 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// Display width of a run of characters.
+fn width_of(chars: &[char]) -> u16 {
+    use unicode_width::UnicodeWidthChar;
+    chars.iter().map(|c| c.width().unwrap_or(0) as u16).sum()
 }
 
 /// A picker like `picker` but sized for `font_size` cells.

@@ -35,6 +35,8 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `Enter` | open the selected page, link or folder; open the selected image full size |
 | `n` / `p` | select the next / previous link or image on the page |
 | `v` | toggle between the rendered page and its Markdown source |
+| `/` | find in the page: matches highlight as you type, `Enter`/`Up` step through them |
+| `s` | search the wiki: live list of matching pages, `Enter` opens one at the match |
 | `h` / `l` | collapse / expand a folder |
 | `b`, `Backspace` / `f` | back / forward |
 | `H` | home page |
