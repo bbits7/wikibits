@@ -1,0 +1,17 @@
+[package]
+name = "wikibits"
+version = "0.1.0"
+edition = "2024"
+description = "A terminal wiki built on plain Markdown files"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+image = "0.25"
+notify = "8"
+pulldown-cmark = "0.13"
+ratatui = "0.30"
+ratatui-image = { version = "11", default-features = false, features = ["image-defaults", "crossterm"] }
+unicode-width = "0.2"
+walkdir = "2"

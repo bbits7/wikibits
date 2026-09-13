@@ -1,0 +1,12 @@
+#!/usr/bin/env sh
+set -eu
+
+# Build wikiBits in release mode and install it for the current user (~/.local/bin).
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+PREFIX="${PREFIX:-$HOME/.local}"
+
+cargo build --release --manifest-path "$ROOT/Cargo.toml"
+install -Dm755 "$ROOT/target/release/wikibits" "$PREFIX/bin/wikibits"
+
+echo "Installed wikibits to $PREFIX/bin"
