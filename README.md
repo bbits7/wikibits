@@ -31,8 +31,8 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 |-----|--------|
 | `Tab` / `Shift-Tab`, `1` `2` `3` | switch column |
 | `j` / `k`, arrows, `PgUp` / `PgDn`, `g` / `G` | move / scroll |
-| `Enter` | open the selected page, link or folder |
-| `n` / `p` | select the next / previous link on the page |
+| `Enter` | open the selected page, link or folder; open the selected image full size |
+| `n` / `p` | select the next / previous link or image on the page |
 | `v` | toggle between the rendered page and its Markdown source |
 | `h` / `l` | collapse / expand a folder |
 | `b`, `Backspace` / `f` | back / forward |
@@ -45,9 +45,12 @@ The mouse works too: click to open, wheel to scroll, right-click to go back.
 
 ## Images
 
-Images render through the terminal's graphics protocol (sixel in foot). If they come out the
-wrong size, `wikibits --probe` prints what the terminal reports about protocol and cell size.
-Inside tmux, images are drawn with block characters.
+Images render through the terminal's graphics protocol (sixel in foot), scaled down to fit the
+page area when they are too big (never scaled up). Each image sits in a thin frame; select it
+with `n`/`p` (or click it) and press `Enter` to see it at full size in a pop-up, scrolling with
+`h`/`j`/`k`/`l`, the arrows or the mouse wheel; `Esc` closes it. If images come out the wrong
+size, `wikibits --probe` prints what the terminal reports about protocol and cell size. Inside
+tmux, images are drawn with block characters.
 
 ## Build and install
 

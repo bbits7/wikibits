@@ -12,9 +12,19 @@ use crate::wiki::{LinkTarget, parser_options};
 
 pub struct Rendered {
     pub lines: Vec<Line<'static>>,
-    /// In document order. Links are what `n`/`p` step through.
     pub links: Vec<Link>,
     pub images: Vec<ImageSlot>,
+    /// Links and images in document order: what `n`/`p` step through.
+    pub items: Vec<Item>,
+}
+
+/// Something on the page that can be selected and activated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Item {
+    /// Index into [`Rendered::links`].
+    Link(usize),
+    /// Index into [`Rendered::images`].
+    Image(usize),
 }
 
 pub struct Link {
@@ -23,15 +33,20 @@ pub struct Link {
     pub spans: Vec<(usize, usize)>,
 }
 
+/// An image on the page, drawn inside a one-cell frame. The frame occupies lines
+/// `line ..= line + height + 1` and columns `x - 1 ..= x + width`; the image itself is drawn at
+/// `(x, line + 1)`.
 pub struct ImageSlot {
     pub path: PathBuf,
-    /// First line of the reserved area.
+    /// First line of the frame.
     pub line: usize,
-    /// Column the image starts at (after any list or quote prefix).
+    /// Column the image starts at (after the frame's left edge).
     pub x: u16,
+    pub width: u16,
     pub height: u16,
-    /// Width bound the image was prepared for (the cache key).
+    /// Bounds the image was prepared for (the cache key).
     pub max_width: u16,
+    pub max_height: u16,
 }
 
 /// What the renderer needs from the outside world.
@@ -40,14 +55,17 @@ pub trait Context {
     fn title(&self, id: &str) -> String;
     /// Folder that relative image paths count from (the page's folder).
     fn image_path(&self, raw: &str) -> Option<PathBuf>;
-    /// Prepare the image for drawing at up to `max_width` columns and return its size in cells,
-    /// or `None` if it cannot be shown.
-    fn image_size(&mut self, path: &Path, max_width: u16) -> Option<(u16, u16)>;
+    /// Prepare the image for drawing within `max_width` x `max_height` cells (scaled down to fit,
+    /// never up) and return its size in cells, or `None` if it cannot be shown.
+    fn image_size(&mut self, path: &Path, max_width: u16, max_height: u16) -> Option<(u16, u16)>;
 }
 
-pub fn render(markdown: &str, width: u16, ctx: &mut dyn Context) -> Rendered {
+/// Render `markdown` for a page area `width` columns wide and `height` rows tall (the height
+/// only bounds images; the page itself scrolls).
+pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) -> Rendered {
     let mut r = Renderer {
         width: width.max(10) as usize,
+        height: height.max(5),
         ctx,
         lines: Vec::new(),
         cur: Vec::new(),
@@ -60,6 +78,7 @@ pub fn render(markdown: &str, width: u16, ctx: &mut dyn Context) -> Rendered {
         links: Vec::new(),
         cur_link: None,
         images: Vec::new(),
+        items: Vec::new(),
         lists: Vec::new(),
         in_code_block: false,
         image_alt: None,
@@ -78,6 +97,7 @@ pub fn render(markdown: &str, width: u16, ctx: &mut dyn Context) -> Rendered {
         lines: r.lines,
         links: r.links,
         images: r.images,
+        items: r.items,
     }
 }
 
@@ -105,6 +125,7 @@ pub fn render_raw(text: &str, width: u16) -> Rendered {
         lines,
         links: Vec::new(),
         images: Vec::new(),
+        items: Vec::new(),
     }
 }
 
@@ -122,6 +143,8 @@ struct Table {
 
 struct Renderer<'a> {
     width: usize,
+    /// Rows available for one image (frame included).
+    height: u16,
     ctx: &'a mut dyn Context,
     lines: Vec<Line<'static>>,
     cur: Vec<Span<'static>>,
@@ -136,6 +159,7 @@ struct Renderer<'a> {
     links: Vec<Link>,
     cur_link: Option<usize>,
     images: Vec<ImageSlot>,
+    items: Vec<Item>,
     /// `None` for bullet lists, `Some(next number)` for ordered ones.
     lists: Vec<Option<u64>>,
     in_code_block: bool,
@@ -157,6 +181,8 @@ pub const EXTERNAL_LINK: Style = Style::new()
     .add_modifier(Modifier::UNDERLINED);
 const CODE: Style = Style::new().fg(Color::Magenta);
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+/// The frame around an image; the UI recolors it when the image is selected.
+pub const FRAME: Style = Style::new().add_modifier(Modifier::DIM);
 
 impl Renderer<'_> {
     fn style(&self) -> Style {
@@ -309,6 +335,7 @@ impl Renderer<'_> {
             spans: Vec::new(),
         });
         self.cur_link = Some(self.links.len() - 1);
+        self.items.push(Item::Link(self.links.len() - 1));
         self.push_style(style);
         if show_title {
             let text = match &target {
@@ -342,20 +369,28 @@ impl Renderer<'_> {
             return;
         };
         let x = self.prefix_width();
-        let max_width = self.width.saturating_sub(x).max(1) as u16;
-        match self.ctx.image_size(&path, max_width) {
-            Some((_, height)) if self.table.is_none() => {
+        // Leave room for the one-cell frame around the image.
+        let max_width = self.width.saturating_sub(x + 2).max(1) as u16;
+        let max_height = self.height.saturating_sub(2).max(1);
+        match self.ctx.image_size(&path, max_width, max_height) {
+            Some((width, height)) if self.table.is_none() => {
                 self.finish_line();
                 self.images.push(ImageSlot {
                     path,
                     line: self.lines.len(),
-                    x: x as u16,
+                    x: x as u16 + 1,
+                    width,
                     height,
                     max_width,
+                    max_height,
                 });
+                self.items.push(Item::Image(self.images.len() - 1));
+                let w = width as usize;
+                self.frame_line(&format!("╭{}╮", "─".repeat(w)));
                 for _ in 0..height {
-                    self.blank_line();
+                    self.frame_line(&format!("│{}│", " ".repeat(w)));
                 }
+                self.frame_line(&format!("╰{}╯", "─".repeat(w)));
                 if !alt.is_empty() {
                     let style = self.style().patch(DIM.add_modifier(Modifier::ITALIC));
                     self.emit(&alt, style, None);
@@ -367,6 +402,13 @@ impl Renderer<'_> {
                 self.emit(&placeholder, style, None);
             }
         }
+    }
+
+    /// One line of an image frame, after any list or quote prefix.
+    fn frame_line(&mut self, text: &str) {
+        let mut spans = self.prefixes.clone();
+        spans.push(Span::styled(text.to_string(), FRAME));
+        self.lines.push(Line::from(spans));
     }
 
     fn end_table(&mut self) {
@@ -646,8 +688,8 @@ mod tests {
         fn image_path(&self, raw: &str) -> Option<PathBuf> {
             Some(PathBuf::from(raw))
         }
-        fn image_size(&mut self, _: &Path, _: u16) -> Option<(u16, u16)> {
-            Some((10, 3))
+        fn image_size(&mut self, _: &Path, w: u16, h: u16) -> Option<(u16, u16)> {
+            Some((10.min(w), 3.min(h)))
         }
     }
 
@@ -667,13 +709,18 @@ mod tests {
 
     #[test]
     fn wraps_words() {
-        let r = render("one two three four five", 10, &mut Ctx);
+        let r = render("one two three four five", 10, 40, &mut Ctx);
         assert_eq!(text(&r), vec!["one two", "three four", "five"]);
     }
 
     #[test]
     fn wiki_links_show_titles_and_are_tracked() {
-        let r = render("See [[a/b]] and [[a/b|that]] or [[nope]].", 80, &mut Ctx);
+        let r = render(
+            "See [[a/b]] and [[a/b|that]] or [[nope]].",
+            80,
+            40,
+            &mut Ctx,
+        );
         assert_eq!(text(&r), vec!["See Page B and that or nope."]);
         assert_eq!(r.links.len(), 3);
         assert_eq!(r.links[0].target, LinkTarget::Page("a/b".into()));
@@ -684,7 +731,12 @@ mod tests {
 
     #[test]
     fn lists_and_quotes_get_prefixes() {
-        let r = render("- one\n- two\n  - nested\n\n> quoted\n> text", 80, &mut Ctx);
+        let r = render(
+            "- one\n- two\n  - nested\n\n> quoted\n> text",
+            80,
+            40,
+            &mut Ctx,
+        );
         assert_eq!(
             text(&r),
             vec!["• one", "• two", "  • nested", "", "│ quoted text"]
@@ -692,16 +744,61 @@ mod tests {
     }
 
     #[test]
-    fn images_reserve_lines() {
-        let r = render("before\n\n![alt](pic.png)\n\nafter", 80, &mut Ctx);
+    fn images_get_a_frame_and_join_the_items() {
+        let r = render(
+            "before [[a/b]]\n\n![alt](pic.png)\n\nafter",
+            80,
+            40,
+            &mut Ctx,
+        );
         assert_eq!(r.images.len(), 1);
-        assert_eq!(r.images[0].line, 2);
-        assert_eq!(text(&r), vec!["before", "", "", "", "", "alt", "", "after"]);
+        let slot = &r.images[0];
+        assert_eq!((slot.line, slot.x, slot.width, slot.height), (2, 1, 10, 3));
+        assert_eq!(
+            text(&r),
+            vec![
+                "before Page B",
+                "",
+                "╭──────────╮",
+                "│          │",
+                "│          │",
+                "│          │",
+                "╰──────────╯",
+                "alt",
+                "",
+                "after"
+            ]
+        );
+        assert_eq!(r.items, vec![Item::Link(0), Item::Image(0)]);
+    }
+
+    /// Reports whatever bound it is given, like a huge image scaled down to fit.
+    struct Huge;
+    impl Context for Huge {
+        fn resolve(&self, raw: &str) -> LinkTarget {
+            Ctx.resolve(raw)
+        }
+        fn title(&self, id: &str) -> String {
+            Ctx.title(id)
+        }
+        fn image_path(&self, raw: &str) -> Option<PathBuf> {
+            Ctx.image_path(raw)
+        }
+        fn image_size(&mut self, _: &Path, w: u16, h: u16) -> Option<(u16, u16)> {
+            Some((w, h))
+        }
+    }
+
+    #[test]
+    fn images_are_bounded_by_the_page_area_minus_the_frame() {
+        let r = render("![alt](pic.png)", 80, 6, &mut Huge);
+        assert_eq!((r.images[0].width, r.images[0].height), (78, 4));
+        assert_eq!(r.lines[0].to_string().len(), "╭╮".len() + 78 * "─".len());
     }
 
     #[test]
     fn tables_line_up() {
-        let r = render("| a | bb |\n|---|---|\n| ccc | d |", 80, &mut Ctx);
+        let r = render("| a | bb |\n|---|---|\n| ccc | d |", 80, 40, &mut Ctx);
         assert_eq!(text(&r), vec!["a   │ bb", "────┼───", "ccc │ d "]);
     }
 }

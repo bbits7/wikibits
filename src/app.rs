@@ -11,14 +11,29 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Rect, Size};
 use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
 use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FontSize, Resize};
 
-use crate::markdown::{self, Rendered};
+use crate::markdown::{self, ImageSlot, Item, Rendered};
 use crate::wiki::{LinkTarget, TreeNode, Wiki};
 
-/// Images taller than this are scaled down to fit.
-const MAX_IMAGE_ROWS: u16 = 30;
+/// `(view size, scroll offset)` a pop-up image was encoded for.
+type PopupKey = ((u16, u16), (u16, u16));
+
+/// An image opened at full size over the page, scrolled in cells.
+pub struct ImagePopup {
+    pub name: String,
+    image: image::DynamicImage,
+    pub pixels: (u32, u32),
+    /// The whole image in cells at the current font size.
+    pub cells: (u16, u16),
+    pub off: (u16, u16),
+    /// Inner area from the last draw.
+    pub view: Rect,
+    /// Encoded for `(view size, offset)`.
+    protocol: Option<(PopupKey, Protocol)>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
@@ -91,9 +106,12 @@ pub struct App {
 
     pub rendered: Option<Rendered>,
     render_width: u16,
+    render_height: u16,
     pub scroll: usize,
-    pub link_sel: Option<usize>,
+    /// Selected entry of `rendered.items`.
+    pub sel: Option<usize>,
     pub content_height: usize,
+    pub popup: Option<ImagePopup>,
 
     pub related: Vec<RelatedRow>,
     pub related_sel: usize,
@@ -101,7 +119,7 @@ pub struct App {
 
     pub focus: Focus,
     picker: Option<Picker>,
-    images: HashMap<(PathBuf, u16), Option<Rc<SlicedProtocol>>>,
+    images: HashMap<(PathBuf, u16, u16), Option<Rc<SlicedProtocol>>>,
 
     pub status: String,
     pub show_help: bool,
@@ -127,9 +145,11 @@ impl App {
             future: Vec::new(),
             rendered: None,
             render_width: 0,
+            render_height: 0,
             scroll: 0,
-            link_sel: None,
+            sel: None,
             content_height: 0,
+            popup: None,
             related: Vec::new(),
             related_sel: 0,
             related_scroll: 0,
@@ -168,7 +188,7 @@ impl App {
         let scroll = self.scroll;
         self.render_current();
         self.scroll = scroll.min(self.max_scroll());
-        self.link_sel = None;
+        self.sel = None;
         self.status = if self.raw {
             "Showing the Markdown source (v to render)".into()
         } else {
@@ -196,7 +216,7 @@ impl App {
         }
         self.current = Some(id.to_string());
         self.scroll = 0;
-        self.link_sel = None;
+        self.sel = None;
         self.related_sel = 0;
         self.related_scroll = 0;
         self.status.clear();
@@ -267,7 +287,7 @@ impl App {
                 let scroll = self.scroll;
                 self.render_current();
                 self.scroll = scroll.min(self.max_scroll());
-                self.link_sel = None;
+                self.sel = None;
                 self.rebuild_related();
                 self.rebuild_crumbs();
                 self.reveal_in_tree(&id);
@@ -284,14 +304,15 @@ impl App {
         }
     }
 
-    /// Re-render for a new content width. Called from the draw code.
-    pub fn set_width(&mut self, width: u16) {
-        if width != self.render_width {
+    /// Re-render for a new page area. Called from the draw code.
+    pub fn set_size(&mut self, width: u16, height: u16) {
+        if (width, height) != (self.render_width, self.render_height) {
             self.render_width = width;
+            self.render_height = height;
             let scroll = self.scroll;
             self.render_current();
             self.scroll = scroll.min(self.max_scroll());
-            self.link_sel = None;
+            self.sel = None;
         }
     }
 
@@ -322,7 +343,7 @@ impl App {
         self.rendered = Some(if self.raw {
             markdown::render_raw(&text, self.render_width)
         } else {
-            markdown::render(&text, self.render_width, &mut ctx)
+            markdown::render(&text, self.render_width, self.render_height, &mut ctx)
         });
     }
 
@@ -344,11 +365,127 @@ impl App {
         self.scroll = scroll.min(self.max_scroll());
     }
 
-    pub fn image(&self, path: &Path, max_width: u16) -> Option<Rc<SlicedProtocol>> {
+    pub fn image(&self, slot: &ImageSlot) -> Option<Rc<SlicedProtocol>> {
         self.images
-            .get(&(path.to_path_buf(), max_width))
+            .get(&(slot.path.clone(), slot.max_width, slot.max_height))
             .cloned()
             .flatten()
+    }
+
+    // ----- image pop-up ----------------------------------------------------------------
+
+    fn open_image(&mut self, index: usize) {
+        let Some(slot) = self.rendered.as_ref().and_then(|r| r.images.get(index)) else {
+            return;
+        };
+        let path = slot.path.clone();
+        let decoded = image::ImageReader::open(&path)
+            .ok()
+            .and_then(|r| r.with_guessed_format().ok())
+            .and_then(|r| r.decode().ok());
+        let (Some(image), Some(picker)) = (decoded, &self.picker) else {
+            self.status = format!("Cannot open {}", path.display());
+            return;
+        };
+        let font = picker.font_size();
+        let pixels = (image.width(), image.height());
+        let cells = (
+            pixels
+                .0
+                .div_ceil(font.width.max(1) as u32)
+                .min(u16::MAX as u32) as u16,
+            pixels
+                .1
+                .div_ceil(font.height.max(1) as u32)
+                .min(u16::MAX as u32) as u16,
+        );
+        self.popup = Some(ImagePopup {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            image,
+            pixels,
+            cells,
+            off: (0, 0),
+            view: Rect::default(),
+            protocol: None,
+        });
+    }
+
+    /// The visible part of the pop-up image, encoded for `view`. Re-encodes only when the view
+    /// size or the scroll offset changed.
+    pub fn popup_protocol(&mut self, view: Rect) -> Option<&Protocol> {
+        let picker = self.picker.as_ref()?;
+        let font = picker.font_size();
+        let popup = self.popup.as_mut()?;
+        popup.view = view;
+        let key = ((view.width, view.height), popup.off);
+        if popup.protocol.as_ref().is_none_or(|(k, _)| *k != key) {
+            let (fw, fh) = (font.width.max(1) as u32, font.height.max(1) as u32);
+            let (iw, ih) = popup.pixels;
+            let px = (popup.off.0 as u32 * fw).min(iw.saturating_sub(1));
+            let py = (popup.off.1 as u32 * fh).min(ih.saturating_sub(1));
+            let cw = (view.width as u32 * fw).min(iw - px);
+            let ch = (view.height as u32 * fh).min(ih - py);
+            if cw == 0 || ch == 0 {
+                return None;
+            }
+            let cropped = popup.image.crop_imm(px, py, cw, ch);
+            let cells = Size::new(cw.div_ceil(fw) as u16, ch.div_ceil(fh) as u16);
+            // Crop, never scale: one image pixel is one screen pixel in the pop-up.
+            let proto = picker
+                .new_protocol(cropped, cells, Resize::Crop(None))
+                .ok()?;
+            popup.protocol = Some((key, proto));
+        }
+        popup.protocol.as_ref().map(|(_, p)| p)
+    }
+
+    fn popup_scroll(&mut self, dx: i32, dy: i32) {
+        let Some(popup) = &mut self.popup else { return };
+        let max_x = popup.cells.0.saturating_sub(popup.view.width);
+        let max_y = popup.cells.1.saturating_sub(popup.view.height);
+        popup.off.0 = (popup.off.0 as i32 + dx).clamp(0, max_x as i32) as u16;
+        popup.off.1 = (popup.off.1 as i32 + dy).clamp(0, max_y as i32) as u16;
+    }
+
+    fn popup_key(&mut self, key: KeyEvent) {
+        let Some(popup) = &self.popup else { return };
+        let page = popup.view.height.max(1) as i32;
+        let far = i32::MAX / 4;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.popup = None,
+            KeyCode::Char('h') | KeyCode::Left => self.popup_scroll(-4, 0),
+            KeyCode::Char('l') | KeyCode::Right => self.popup_scroll(4, 0),
+            KeyCode::Char('j') | KeyCode::Down => self.popup_scroll(0, 2),
+            KeyCode::Char('k') | KeyCode::Up => self.popup_scroll(0, -2),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.popup_scroll(0, page),
+            KeyCode::PageUp => self.popup_scroll(0, -page),
+            KeyCode::Char('g') | KeyCode::Home => self.popup_scroll(-far, -far),
+            KeyCode::Char('G') | KeyCode::End => self.popup_scroll(0, far),
+            _ => {}
+        }
+    }
+
+    fn popup_mouse(&mut self, mouse: MouseEvent) {
+        let Some(popup) = &self.popup else { return };
+        let outer = Rect {
+            x: popup.view.x.saturating_sub(1),
+            y: popup.view.y.saturating_sub(1),
+            width: popup.view.width + 2,
+            height: popup.view.height + 2,
+        };
+        match mouse.kind {
+            MouseEventKind::Down(_) if !outer.contains((mouse.column, mouse.row).into()) => {
+                self.popup = None;
+            }
+            MouseEventKind::ScrollDown => self.popup_scroll(0, 2),
+            MouseEventKind::ScrollUp => self.popup_scroll(0, -2),
+            MouseEventKind::ScrollRight => self.popup_scroll(4, 0),
+            MouseEventKind::ScrollLeft => self.popup_scroll(-4, 0),
+            _ => {}
+        }
     }
 
     // ----- scrolling and links --------------------------------------------------------
@@ -363,64 +500,53 @@ impl App {
         self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
     }
 
-    fn link_line(&self, index: usize) -> Option<usize> {
-        self.rendered
-            .as_ref()?
-            .links
-            .get(index)?
-            .spans
-            .first()
-            .map(|(line, _)| *line)
+    /// First line of an item (link or image).
+    fn item_line(&self, index: usize) -> Option<usize> {
+        let rendered = self.rendered.as_ref()?;
+        match *rendered.items.get(index)? {
+            Item::Link(l) => rendered.links[l].spans.first().map(|(line, _)| *line),
+            Item::Image(i) => Some(rendered.images[i].line),
+        }
     }
 
-    fn visible_links(&self) -> Vec<usize> {
-        let Some(rendered) = &self.rendered else {
-            return Vec::new();
-        };
+    fn visible_items(&self) -> Vec<usize> {
         let range = self.scroll..self.scroll + self.content_height;
-        rendered
-            .links
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| {
-                l.spans
-                    .first()
-                    .is_some_and(|(line, _)| range.contains(line))
-            })
-            .map(|(i, _)| i)
+        let count = self.rendered.as_ref().map_or(0, |r| r.items.len());
+        (0..count)
+            .filter(|&i| self.item_line(i).is_some_and(|line| range.contains(&line)))
             .collect()
     }
 
-    pub fn next_link(&mut self) {
-        let count = self.rendered.as_ref().map(|r| r.links.len()).unwrap_or(0);
+    pub fn next_item(&mut self) {
+        let count = self.rendered.as_ref().map_or(0, |r| r.items.len());
         if count == 0 {
-            self.status = "No links on this page".into();
+            self.status = "No links or images on this page".into();
             return;
         }
-        let next = match self.link_sel {
+        let next = match self.sel {
             Some(i) => (i + 1) % count,
-            None => self.visible_links().first().copied().unwrap_or(0),
+            None => self.visible_items().first().copied().unwrap_or(0),
         };
-        self.select_link(next);
+        self.select_item(next);
     }
 
-    pub fn prev_link(&mut self) {
-        let count = self.rendered.as_ref().map(|r| r.links.len()).unwrap_or(0);
+    pub fn prev_item(&mut self) {
+        let count = self.rendered.as_ref().map_or(0, |r| r.items.len());
         if count == 0 {
-            self.status = "No links on this page".into();
+            self.status = "No links or images on this page".into();
             return;
         }
-        let prev = match self.link_sel {
+        let prev = match self.sel {
             Some(0) => count - 1,
             Some(i) => i - 1,
-            None => self.visible_links().last().copied().unwrap_or(count - 1),
+            None => self.visible_items().last().copied().unwrap_or(count - 1),
         };
-        self.select_link(prev);
+        self.select_item(prev);
     }
 
-    fn select_link(&mut self, index: usize) {
-        self.link_sel = Some(index);
-        if let Some(line) = self.link_line(index)
+    fn select_item(&mut self, index: usize) {
+        self.sel = Some(index);
+        if let Some(line) = self.item_line(index)
             && (line < self.scroll || line >= self.scroll + self.content_height)
         {
             let target = line.saturating_sub(self.content_height / 3);
@@ -428,20 +554,32 @@ impl App {
         }
     }
 
-    pub fn follow_selected_link(&mut self) {
-        let target = self
-            .link_sel
-            .and_then(|i| self.rendered.as_ref()?.links.get(i))
-            .map(|l| l.target.clone());
-        match target {
-            Some(t) => self.follow(&t),
-            None => self.status = "Select a link first (n / p)".into(),
+    /// Follow the selected link, or open the selected image.
+    pub fn activate_selected(&mut self) {
+        let item = self
+            .sel
+            .and_then(|i| self.rendered.as_ref()?.items.get(i).copied());
+        match item {
+            Some(Item::Link(l)) => {
+                let target = self.rendered.as_ref().unwrap().links[l].target.clone();
+                self.follow(&target);
+            }
+            Some(Item::Image(i)) => self.open_image(i),
+            None => self.status = "Select a link or image first (n / p)".into(),
         }
     }
 
-    /// The link under a content cell, if any.
-    fn link_at(&self, line: usize, col: u16) -> Option<usize> {
+    /// The link or image under a content cell, if any.
+    fn item_at(&self, line: usize, col: u16) -> Option<usize> {
         let rendered = self.rendered.as_ref()?;
+        if let Some(i) = rendered.images.iter().position(|s| {
+            line >= s.line
+                && line <= s.line + s.height as usize + 1
+                && col + 1 >= s.x
+                && col <= s.x + s.width
+        }) {
+            return rendered.items.iter().position(|it| *it == Item::Image(i));
+        }
         let text_line = rendered.lines.get(line)?;
         let mut acc = 0u16;
         let span_index = text_line.spans.iter().position(|s| {
@@ -450,10 +588,11 @@ impl App {
             acc += w;
             hit
         })?;
-        rendered
+        let link = rendered
             .links
             .iter()
-            .position(|l| l.spans.contains(&(line, span_index)))
+            .position(|l| l.spans.contains(&(line, span_index)))?;
+        rendered.items.iter().position(|it| *it == Item::Link(link))
     }
 
     // ----- tree ------------------------------------------------------------------------
@@ -810,6 +949,10 @@ impl App {
             self.show_help = false;
             return;
         }
+        if self.popup.is_some() {
+            self.popup_key(key);
+            return;
+        }
         self.status.clear();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -874,10 +1017,10 @@ impl App {
             KeyCode::PageUp => self.scroll_by(-(page - 1)),
             KeyCode::Char('g') | KeyCode::Home => self.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => self.scroll = self.max_scroll(),
-            KeyCode::Char('n') => self.next_link(),
-            KeyCode::Char('p') => self.prev_link(),
-            KeyCode::Enter => self.follow_selected_link(),
-            KeyCode::Esc => self.link_sel = None,
+            KeyCode::Char('n') => self.next_item(),
+            KeyCode::Char('p') => self.prev_item(),
+            KeyCode::Enter => self.activate_selected(),
+            KeyCode::Esc => self.sel = None,
             _ => {}
         }
     }
@@ -896,6 +1039,10 @@ impl App {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.show_help = false;
             }
+            return;
+        }
+        if self.popup.is_some() {
+            self.popup_mouse(mouse);
             return;
         }
         let (x, y) = (mouse.column, mouse.row);
@@ -922,9 +1069,9 @@ impl App {
                     self.focus = Focus::Content;
                     let line = (y - rects.content.y) as usize + self.scroll;
                     let col = x - rects.content.x;
-                    if let Some(i) = self.link_at(line, col) {
-                        self.link_sel = Some(i);
-                        self.follow_selected_link();
+                    if let Some(i) = self.item_at(line, col) {
+                        self.sel = Some(i);
+                        self.activate_selected();
                     }
                 } else if rects.related.contains((x, y).into()) {
                     self.focus = Focus::Related;
@@ -979,7 +1126,7 @@ struct RenderCtx<'a> {
     page: &'a str,
     page_dir: PathBuf,
     picker: Option<&'a Picker>,
-    images: &'a mut HashMap<(PathBuf, u16), Option<Rc<SlicedProtocol>>>,
+    images: &'a mut HashMap<(PathBuf, u16, u16), Option<Rc<SlicedProtocol>>>,
 }
 
 impl markdown::Context for RenderCtx<'_> {
@@ -1002,8 +1149,8 @@ impl markdown::Context for RenderCtx<'_> {
             .find(|p| p.is_file())
     }
 
-    fn image_size(&mut self, path: &Path, max_width: u16) -> Option<(u16, u16)> {
-        let key = (path.to_path_buf(), max_width);
+    fn image_size(&mut self, path: &Path, max_width: u16, max_height: u16) -> Option<(u16, u16)> {
+        let key = (path.to_path_buf(), max_width, max_height);
         if !self.images.contains_key(&key) {
             let proto = self.picker.and_then(|picker| {
                 let img = image::ImageReader::open(path)
@@ -1012,7 +1159,7 @@ impl markdown::Context for RenderCtx<'_> {
                     .ok()?
                     .decode()
                     .ok()?;
-                let bound = Size::new(max_width, MAX_IMAGE_ROWS);
+                let bound = Size::new(max_width, max_height);
                 SlicedProtocol::new_with_resize(picker, img, bound, Resize::Fit(None))
                     .ok()
                     .map(Rc::new)

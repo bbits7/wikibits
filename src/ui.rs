@@ -5,10 +5,11 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui_image::Image;
 use ratatui_image::sliced::SlicedImage;
 
 use crate::app::{App, Focus, RelatedRow, TreeKind};
-use crate::markdown::{EXTERNAL_LINK, MISSING_LINK, PAGE_LINK};
+use crate::markdown::{EXTERNAL_LINK, Item, MISSING_LINK, PAGE_LINK};
 
 const ACCENT: Color = Color::Cyan;
 
@@ -27,8 +28,37 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_content(f, app, content);
     draw_related(f, app, related);
     draw_status(f, app, status);
+    if app.popup.is_some() {
+        draw_popup(f, app, area);
+    }
     if app.show_help {
         draw_help(f, area);
+    }
+}
+
+/// The selected image at full size, scrolled with the keys or the mouse wheel.
+fn draw_popup(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(popup) = &app.popup else { return };
+    let width = (popup.cells.0 + 2).min(area.width.saturating_sub(4)).max(4);
+    let height = (popup.cells.1 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let title = format!(
+        " {}  {}x{} px  ·  h/j/k/l scroll  Esc close ",
+        popup.name, popup.pixels.0, popup.pixels.1
+    );
+    let block = pane(&title, true);
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if let Some(proto) = app.popup_protocol(inner) {
+        f.render_widget(Image::new(proto), inner);
     }
 }
 
@@ -145,7 +175,7 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
     app.rects.crumbs = crumbs_area;
     app.rects.content = body;
     app.content_height = body.height as usize;
-    app.set_width(body.width);
+    app.set_size(body.width, body.height);
 
     draw_crumbs(f, app, crumbs_area);
     f.render_widget(
@@ -167,25 +197,41 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
         .take(body.height as usize)
         .cloned()
         .collect();
-    if let Some(link) = app.link_sel.and_then(|i| rendered.links.get(i)) {
-        for &(line, span) in &link.spans {
-            if line >= scroll
-                && let Some(s) = lines
-                    .get_mut(line - scroll)
-                    .and_then(|l| l.spans.get_mut(span))
-            {
-                s.style = s.style.add_modifier(Modifier::REVERSED);
+    match app.sel.and_then(|i| rendered.items.get(i)) {
+        Some(Item::Link(l)) => {
+            for &(line, span) in &rendered.links[*l].spans {
+                if line >= scroll
+                    && let Some(s) = lines
+                        .get_mut(line - scroll)
+                        .and_then(|l| l.spans.get_mut(span))
+                {
+                    s.style = s.style.add_modifier(Modifier::REVERSED);
+                }
             }
         }
+        Some(Item::Image(i)) => {
+            let slot = &rendered.images[*i];
+            for line in slot.line..=slot.line + slot.height as usize + 1 {
+                if line >= scroll
+                    && let Some(s) = lines
+                        .get_mut(line - scroll)
+                        .and_then(|l| l.spans.last_mut())
+                {
+                    s.style = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
+                }
+            }
+        }
+        None => {}
     }
     f.render_widget(Paragraph::new(Text::from(lines)), body);
 
     for slot in &rendered.images {
-        let y = slot.line as i32 - scroll as i32;
+        // The image sits one row below the frame's top line.
+        let y = slot.line as i32 + 1 - scroll as i32;
         if y + slot.height as i32 <= 0 || y >= body.height as i32 {
             continue;
         }
-        if let Some(proto) = app.image(&slot.path, slot.max_width) {
+        if let Some(proto) = app.image(slot) {
             let image = SlicedImage::new(&proto, (slot.x as i16, y as i16).into());
             f.render_widget(image, body);
         }
@@ -278,6 +324,7 @@ fn draw_related(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.focus {
+        _ if app.popup.is_some() => "h/j/k/l scroll  PgUp/PgDn  g/G  Esc close",
         Focus::Tree => "j/k move  Enter open  h/l fold  Tab pane  b back  ? help  q quit",
         Focus::Content => {
             "j/k scroll  n/p link  Enter follow  v source  Tab pane  b back  ? help  q quit"
@@ -322,9 +369,19 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Page", ""),
         ("j / k  PgUp / PgDn", "scroll"),
         ("g / G", "top / bottom"),
-        ("n / p", "next / previous link"),
+        ("n / p", "next / previous link or image"),
         ("v", "toggle Markdown source / rendered page"),
-        ("Enter", "follow the selected link"),
+        (
+            "Enter",
+            "follow the selected link / open the image full size",
+        ),
+        ("", ""),
+        ("Image pop-up", ""),
+        (
+            "h / j / k / l, arrows",
+            "scroll (PgUp / PgDn a screen, g / G top / bottom)",
+        ),
+        ("Esc  q  Enter", "close"),
         ("", ""),
         (
             "Mouse",
