@@ -567,17 +567,28 @@ impl Wiki {
     /// Pages whose title or text contains `query`, ignoring case: title matches first, then
     /// by title.
     pub fn search(&self, query: &str) -> Vec<SearchHit> {
-        let needle: Vec<char> = lower_chars(query.trim());
-        if needle.is_empty() {
+        // Every word must appear somewhere in the title or text.
+        let words: Vec<Vec<char>> = query.split_whitespace().map(lower_chars).collect();
+        if words.is_empty() {
             return Vec::new();
         }
         let mut hits: Vec<SearchHit> = self
             .pages
             .values()
             .filter_map(|page| {
-                let in_title = contains(&lower_chars(&page.title), &needle).is_some();
+                let title = lower_chars(&page.title);
+                let text = lower_chars(&page.text);
+                let in_title = words.iter().all(|w| contains(&title, w).is_some());
+                let all_found = in_title
+                    || words
+                        .iter()
+                        .all(|w| contains(&title, w).is_some() || contains(&text, w).is_some());
+                if !all_found {
+                    return None;
+                }
+                let first = &words[0];
                 let snippet = page.text.lines().find_map(|line| {
-                    contains(&lower_chars(line), &needle).map(|at| snippet(line, at, needle.len()))
+                    contains(&lower_chars(line), first).map(|at| snippet(line, at, first.len()))
                 });
                 (in_title || snippet.is_some()).then(|| SearchHit {
                     id: page.id.clone(),
@@ -987,6 +998,15 @@ mod tests {
             ]
         );
         assert!(wiki.search("   ").is_empty());
+        assert_eq!(
+            wiki.search("cinnamon apples").len(),
+            1,
+            "both words, any order"
+        );
+        assert!(
+            wiki.search("cinnamon nothing").is_empty(),
+            "words in different pages"
+        );
         assert_eq!(
             contains(&lower_chars("Éclair"), &lower_chars("éCL")),
             Some(0)

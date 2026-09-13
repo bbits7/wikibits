@@ -38,7 +38,7 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `x` | tick or untick the selected task (`Enter` or a click on the checkbox does too) |
 | `v` | toggle between the rendered page and its Markdown source |
 | `/` | find in the page: matches highlight as you type, `Enter`/`Up` step through them |
-| `s` | search the wiki: live list of matching pages, `Enter` opens one at the match |
+| `s` | search the wiki (all words must match): live list of pages, `Enter` opens one at the match |
 | `e` | edit the page in place; `N` creates a new page by path; `Enter` on a missing link offers to create it |
 | `R` / `D` | rename (move) the page, updating links to it everywhere / move it to `.trash/`, after confirmation |
 | `w` | wiki report: broken links, orphan pages and recently changed pages (`Enter` opens one) |
@@ -58,7 +58,10 @@ The mouse works too: click to open, wheel to scroll, right-click to go back.
 `Home`/`End`, `PgUp`/`PgDn`, `Ctrl+Left/Right` by word, `Shift`+arrows to select, `Ctrl-A`
 select all, `Ctrl-C`/`Ctrl-X`/`Ctrl-V` with the system clipboard (`wl-copy`/`wl-paste`; the
 terminal's own paste works too), `Ctrl-Z`/`Ctrl-Y` undo and redo, `Tab` two spaces, and long
-lines soft-wrap. Typing `[[` pops up matching pages as you type; `Enter` or `Tab` inserts the
+lines soft-wrap. Headings, list markers, links and code are coloured. `Enter` on a list item
+starts the next item (numbers count up, task boxes start unticked); `Enter` on an empty item
+ends the list. `Ctrl-F` finds in the text (`Enter`/`Up` step through matches); `Ctrl-R` then
+asks for a replacement (`Enter` replaces and moves on, `Ctrl-A` replaces all). Typing `[[` pops up matching pages as you type; `Enter` or `Tab` inserts the
 chosen page and closes the link with `]]`. `Ctrl-P` lists the images in the wiki folder
 (type to filter) and inserts `![name](path)` for the chosen one; pasting an image with `Ctrl-V`
 saves it as `assets/<page>-<n>.png` and inserts the link. After a save or a page delete,

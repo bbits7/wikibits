@@ -77,6 +77,15 @@ pub struct Editor {
     pub confirm: bool,
     /// Where the cursor was drawn last, for pop-ups anchored to it.
     pub cursor_screen: Position,
+    /// The find / replace bar, when open.
+    pub find: Option<EditorFind>,
+}
+
+/// The editor's find bar: `Ctrl-F` opens it, `Ctrl-R` adds a replacement.
+pub struct EditorFind {
+    pub query: String,
+    /// `Some` once Ctrl-R was pressed: the replacement being typed.
+    pub replace: Option<String>,
 }
 
 impl Editor {
@@ -99,6 +108,7 @@ impl Editor {
             clipboard: String::new(),
             confirm: false,
             cursor_screen: Position::default(),
+            find: None,
         }
     }
 
@@ -286,13 +296,32 @@ impl Editor {
     fn newline(&mut self) {
         self.snapshot(LastEdit::Other);
         self.delete_selection();
-        // Keep the indentation of the current line (nested lists, quoted blocks).
-        let indent: String = self.lines[self.cursor.line]
-            .chars()
-            .take(self.cursor.col)
-            .take_while(|c| *c == ' ')
-            .collect();
-        self.insert_text(&format!("\n{indent}"));
+        let line = self.lines[self.cursor.line].clone();
+        let (indent, marker) = list_prefix(&line);
+        // Enter on an empty list item ends the list instead of adding another marker.
+        if !marker.is_empty()
+            && line.trim_end().chars().count() == indent.len() + marker.chars().count() - 1
+        {
+            let start = Pos {
+                line: self.cursor.line,
+                col: 0,
+            };
+            let end = Pos {
+                line: self.cursor.line,
+                col: line.chars().count(),
+            };
+            self.delete_range(start, end);
+            return;
+        }
+        let at_end = self.cursor.col >= line.chars().count();
+        // Continue the list only when breaking at the end of the item; keep the indentation
+        // otherwise (nested lists, quoted blocks).
+        let next_marker = if at_end {
+            next_list_marker(&marker)
+        } else {
+            String::new()
+        };
+        self.insert_text(&format!("\n{indent}{next_marker}"));
     }
 
     fn backspace(&mut self) {
@@ -528,6 +557,22 @@ impl Editor {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if self.find.is_some() {
+            self.find_key(key, ctrl);
+            return Action::None;
+        }
+        if ctrl && key.code == KeyCode::Char('f') {
+            let query = self
+                .selection()
+                .map(|(s, e)| self.range_text(s, e))
+                .filter(|t| !t.contains('\n'))
+                .unwrap_or_default();
+            self.find = Some(EditorFind {
+                query,
+                replace: None,
+            });
+            return Action::None;
+        }
         let page = self.view.height.max(1) as isize;
         match key.code {
             KeyCode::Esc => {
@@ -609,6 +654,162 @@ impl Editor {
         Some(pos_at(&self.lines, row, (x - view.x) as usize))
     }
 
+    // ----- find and replace --------------------------------------------------------------
+
+    fn find_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let Some(find) = &mut self.find else { return };
+        match (find.replace.is_some(), key.code) {
+            (_, KeyCode::Esc) => self.find = None,
+            (_, KeyCode::Char('r')) if ctrl => {
+                if find.replace.is_none() {
+                    find.replace = Some(String::new());
+                }
+            }
+            (true, KeyCode::Char('a')) if ctrl => self.replace_all(),
+            (false, KeyCode::Enter | KeyCode::Down) => self.find_next(false),
+            (false, KeyCode::Up) => self.find_next(true),
+            (true, KeyCode::Enter) => self.replace_current(),
+            (true, KeyCode::Down) => self.find_next(false),
+            (true, KeyCode::Up) => self.find_next(true),
+            (false, KeyCode::Backspace) => {
+                find.query.pop();
+            }
+            (true, KeyCode::Backspace) => {
+                find.replace.as_mut().unwrap().pop();
+            }
+            (false, KeyCode::Char(c)) if !ctrl => {
+                find.query.push(c);
+                self.find_next_from_here();
+            }
+            (true, KeyCode::Char(c)) if !ctrl => find.replace.as_mut().unwrap().push(c),
+            _ => {}
+        }
+    }
+
+    /// Select the match at or after the cursor as the query grows.
+    fn find_next_from_here(&mut self) {
+        let from = self.selection().map(|(s, _)| s).unwrap_or(self.cursor);
+        if let Some((s, e)) = self.find_match_from(from, false) {
+            self.anchor = Some(s);
+            self.cursor = e;
+        }
+    }
+
+    /// Select the next (or previous) match, wrapping around.
+    fn find_next(&mut self, backwards: bool) {
+        let from = match (backwards, self.selection()) {
+            (false, Some((_, e))) => e,
+            (true, Some((s, _))) => s,
+            (_, None) => self.cursor,
+        };
+        if let Some((s, e)) = self.find_match_from(from, backwards) {
+            self.anchor = Some(s);
+            self.cursor = e;
+            self.preferred_col = None;
+        }
+    }
+
+    fn find_match_from(&self, from: Pos, backwards: bool) -> Option<(Pos, Pos)> {
+        let query: Vec<char> = self
+            .find
+            .as_ref()?
+            .query
+            .chars()
+            .map(|c| c.to_lowercase().next().unwrap_or(c))
+            .collect();
+        if query.is_empty() {
+            return None;
+        }
+        let mut matches: Vec<(Pos, Pos)> = Vec::new();
+        for (line_no, line) in self.lines.iter().enumerate() {
+            let lower: Vec<char> = line
+                .chars()
+                .map(|c| c.to_lowercase().next().unwrap_or(c))
+                .collect();
+            let mut at = 0;
+            while at + query.len() <= lower.len() {
+                if lower[at..at + query.len()] == query[..] {
+                    matches.push((
+                        Pos {
+                            line: line_no,
+                            col: at,
+                        },
+                        Pos {
+                            line: line_no,
+                            col: at + query.len(),
+                        },
+                    ));
+                    at += query.len();
+                } else {
+                    at += 1;
+                }
+            }
+        }
+        if backwards {
+            matches
+                .iter()
+                .rev()
+                .find(|(s, _)| *s < from)
+                .or(matches.last())
+                .copied()
+        } else {
+            matches
+                .iter()
+                .find(|(s, _)| *s >= from)
+                .or(matches.first())
+                .copied()
+        }
+    }
+
+    /// Replace the selected match and move to the next one.
+    fn replace_current(&mut self) {
+        let Some(find) = &self.find else { return };
+        let (query, replacement) = (find.query.clone(), find.replace.clone().unwrap_or_default());
+        let selected = self
+            .selection()
+            .map(|(s, e)| self.range_text(s, e))
+            .unwrap_or_default();
+        if !selected.is_empty() && selected.to_lowercase() == query.to_lowercase() {
+            self.snapshot(LastEdit::Other);
+            self.delete_selection();
+            self.insert_text(&replacement);
+        }
+        self.find_next(false);
+    }
+
+    fn replace_all(&mut self) {
+        let Some(find) = &self.find else { return };
+        let (query, replacement) = (find.query.clone(), find.replace.clone().unwrap_or_default());
+        if query.is_empty() {
+            return;
+        }
+        self.snapshot(LastEdit::Other);
+        self.anchor = None;
+        let mut count = 0;
+        while let Some((s, e)) = self.find_match_from(Pos::default(), false) {
+            self.delete_range(s, e);
+            self.cursor = s;
+            self.insert_text(&replacement);
+            count += 1;
+            if count > 10_000 || replacement.to_lowercase().contains(&query.to_lowercase()) {
+                // Replacing with something that still matches would never end.
+                if count == 1 {
+                    let mut rest = Pos::default();
+                    while let Some((s, e)) = self.find_match_from(rest, false) {
+                        if s < rest {
+                            break;
+                        }
+                        self.delete_range(s, e);
+                        self.cursor = s;
+                        self.insert_text(&replacement);
+                        rest = self.cursor;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     // ----- layout and drawing ----------------------------------------------------------
 
     fn rows(&self, width: usize) -> Vec<Row> {
@@ -631,31 +832,35 @@ impl Editor {
 
         let selection = self.selection();
         let selected = Style::new().add_modifier(Modifier::REVERSED);
+        let fenced = fenced_lines(&self.lines);
         let lines: Vec<Line> = rows
             .iter()
             .skip(self.scroll)
             .take(height)
             .map(|row| {
                 let chars: Vec<char> = self.lines[row.line].chars().collect();
+                let styles = markdown_styles(&chars, fenced[row.line]);
                 let mut spans = Vec::new();
                 let mut run = String::new();
-                let mut run_selected = false;
+                let mut run_style = Style::new();
                 for (i, c) in chars[row.start..row.end].iter().enumerate() {
+                    let col = row.start + i;
                     let pos = Pos {
                         line: row.line,
-                        col: row.start + i,
+                        col,
                     };
-                    let is_selected = selection.is_some_and(|(s, e)| pos >= s && pos < e);
-                    if is_selected != run_selected && !run.is_empty() {
-                        let style = if run_selected { selected } else { Style::new() };
-                        spans.push(Span::styled(std::mem::take(&mut run), style));
+                    let mut style = styles[col];
+                    if selection.is_some_and(|(s, e)| pos >= s && pos < e) {
+                        style = style.patch(selected);
                     }
-                    run_selected = is_selected;
+                    if style != run_style && !run.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut run), run_style));
+                    }
+                    run_style = style;
                     run.push(*c);
                 }
                 if !run.is_empty() {
-                    let style = if run_selected { selected } else { Style::new() };
-                    spans.push(Span::styled(run, style));
+                    spans.push(Span::styled(run, run_style));
                 }
                 // A selected line break shows as a selected cell at the row's end.
                 if row.end == chars.len()
@@ -776,6 +981,124 @@ fn pos_at(lines: &[String], row: Row, col: usize) -> Pos {
     }
 }
 
+/// Leading indentation and list marker of a line: `("  ", "- [ ] ")`, `("", "3. ")`, or
+/// empty strings when the line is not a list item.
+fn list_prefix(line: &str) -> (String, String) {
+    let indent: String = line.chars().take_while(|c| *c == ' ').collect();
+    let rest = &line[indent.len()..];
+    let bullet = rest
+        .strip_prefix("- ")
+        .or_else(|| rest.strip_prefix("* "))
+        .or_else(|| rest.strip_prefix("+ "))
+        .map(|after| (rest[..2].to_string(), after));
+    let number = rest
+        .find(". ")
+        .filter(|dot| *dot > 0 && rest[..*dot].bytes().all(|b| b.is_ascii_digit()))
+        .map(|dot| (rest[..dot + 2].to_string(), &rest[dot + 2..]));
+    let Some((mut marker, after)) = bullet.or(number) else {
+        return (indent, String::new());
+    };
+    if after.starts_with("[ ] ") || after.starts_with("[x] ") || after.starts_with("[X] ") {
+        marker.push_str(&after[..4]);
+    }
+    (indent, marker)
+}
+
+/// The marker for the item after one with `marker`: numbers count up, tasks start unticked.
+fn next_list_marker(marker: &str) -> String {
+    let mut next = marker.to_string();
+    if let Some(dot) = marker.find(". ")
+        && let Ok(n) = marker[..dot].parse::<u64>()
+    {
+        next = format!("{}. {}", n + 1, &marker[dot + 2..]);
+    }
+    next.replace("[x] ", "[ ] ").replace("[X] ", "[ ] ")
+}
+
+/// Which lines sit inside ``` fences.
+fn fenced_lines(lines: &[String]) -> Vec<bool> {
+    let mut inside = false;
+    lines
+        .iter()
+        .map(|l| {
+            let fence = l.trim_start().starts_with("```") || l.trim_start().starts_with("~~~");
+            if fence {
+                inside = !inside;
+                return true;
+            }
+            inside
+        })
+        .collect()
+}
+
+/// A style per character of a source line: headings, list markers, links and code.
+fn markdown_styles(chars: &[char], fenced: bool) -> Vec<Style> {
+    use ratatui::style::Color;
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let mut styles = vec![Style::new(); chars.len()];
+    if fenced {
+        return vec![Style::new().fg(Color::Magenta); chars.len()];
+    }
+    let text: String = chars.iter().collect();
+    let trimmed = text.trim_start();
+    let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
+    if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
+        let color = match hashes {
+            1 => Color::Yellow,
+            2 => Color::Green,
+            _ => Color::Blue,
+        };
+        return vec![Style::new().fg(color).add_modifier(Modifier::BOLD); chars.len()];
+    }
+    let (indent, marker) = list_prefix(&text);
+    for style in styles
+        .iter_mut()
+        .skip(indent.len())
+        .take(marker.chars().count())
+    {
+        *style = Style::new().fg(Color::Yellow);
+    }
+    if trimmed.starts_with('>') {
+        let at = chars.len() - trimmed.chars().count();
+        styles[at] = Style::new().fg(Color::Green);
+    }
+    // Inline spans: `code`, [[links]], [text](url).
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`'
+            && let Some(len) = chars[i + 1..].iter().position(|c| *c == '`')
+        {
+            for s in &mut styles[i..=i + 1 + len] {
+                *s = Style::new().fg(Color::Magenta);
+            }
+            i += len + 2;
+        } else if chars[i] == '['
+            && chars.get(i + 1) == Some(&'[')
+            && let Some(len) = chars[i + 2..].windows(2).position(|w| w == [']', ']'])
+        {
+            for s in &mut styles[i..i + len + 4] {
+                *s = Style::new().fg(Color::Cyan);
+            }
+            i += len + 4;
+        } else if chars[i] == '['
+            && let Some(close) = chars[i + 1..].iter().position(|c| *c == ']')
+            && chars.get(i + close + 2) == Some(&'(')
+            && let Some(end) = chars[i + close + 3..].iter().position(|c| *c == ')')
+        {
+            for s in &mut styles[i..=i + close + 1] {
+                *s = Style::new().fg(Color::Cyan);
+            }
+            for s in &mut styles[i + close + 2..=i + close + 3 + end] {
+                *s = dim;
+            }
+            i += close + end + 4;
+        } else {
+            i += 1;
+        }
+    }
+    styles
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +1127,68 @@ mod tests {
         let mut e = Editor::new("[[a]] and [[b");
         e.handle_key(key(KeyCode::End));
         assert_eq!(e.link_context().unwrap().1, "b");
+    }
+
+    #[test]
+    fn lists_continue_on_enter_and_end_on_an_empty_item() {
+        let mut e = Editor::new("- [x] done\n1. first");
+        e.handle_key(key(KeyCode::End));
+        e.handle_key(key(KeyCode::Enter));
+        e.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(e.text(), "- [x] done\n- [ ] n\n1. first\n");
+        e.handle_key(ctrl_key(KeyCode::End));
+        e.handle_key(key(KeyCode::Enter));
+        assert_eq!(e.text(), "- [x] done\n- [ ] n\n1. first\n2. \n");
+        e.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            e.text(),
+            "- [x] done\n- [ ] n\n1. first\n\n",
+            "an empty item ends the list"
+        );
+    }
+
+    #[test]
+    fn find_and_replace() {
+        let mut e = Editor::new("Foo bar foo\nfoo");
+        e.handle_key(ctrl('f'));
+        for c in "foo".chars() {
+            e.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            e.selection(),
+            Some((Pos::default(), Pos { line: 0, col: 3 }))
+        );
+        e.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            e.selection(),
+            Some((Pos { line: 0, col: 8 }, Pos { line: 0, col: 11 }))
+        );
+        e.handle_key(ctrl('r'));
+        for c in "baz".chars() {
+            e.handle_key(key(KeyCode::Char(c)));
+        }
+        e.handle_key(key(KeyCode::Enter));
+        assert_eq!(e.text(), "Foo bar baz\nfoo\n");
+        e.handle_key(ctrl('a'));
+        assert_eq!(e.text(), "baz bar baz\nbaz\n");
+        e.handle_key(key(KeyCode::Esc));
+        assert!(e.find.is_none());
+        assert_eq!(list_prefix("  - [ ] x"), ("  ".into(), "- [ ] ".into()));
+        assert_eq!(next_list_marker("9. "), "10. ");
+        assert_eq!(
+            fenced_lines(&[
+                "a".into(),
+                "```".into(),
+                "b".into(),
+                "```".into(),
+                "c".into()
+            ]),
+            vec![false, true, true, true, false]
+        );
+    }
+
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
     #[test]
@@ -850,7 +1235,7 @@ mod tests {
         e.handle_key(key(KeyCode::End));
         e.handle_key(key(KeyCode::Enter));
         e.handle_key(key(KeyCode::Char('x')));
-        assert_eq!(e.text(), "  - item\n  x\n");
+        assert_eq!(e.text(), "  - item\n  - x\n", "the list continues");
 
         let lines = vec!["one two three".to_string(), "".to_string()];
         let rows = wrap_rows(&lines, 8);

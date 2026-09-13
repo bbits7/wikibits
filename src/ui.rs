@@ -722,7 +722,31 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     if let Some(editor) = &app.editor {
-        let line = if editor.confirm {
+        let line = if let Some(find) = &editor.find {
+            match &find.replace {
+                None => Line::from(vec![
+                    Span::styled("Find: ", Style::new().fg(Color::Yellow)),
+                    Span::raw(find.query.clone()),
+                    Span::styled("▏", Style::new().fg(ACCENT)),
+                    Span::styled(
+                        "   Enter next  Up previous  Ctrl-R replace  Esc close",
+                        Style::new().add_modifier(Modifier::DIM),
+                    ),
+                ]),
+                Some(replacement) => Line::from(vec![
+                    Span::styled(
+                        format!("Replace '{}' with: ", find.query),
+                        Style::new().fg(Color::Yellow),
+                    ),
+                    Span::raw(replacement.clone()),
+                    Span::styled("▏", Style::new().fg(ACCENT)),
+                    Span::styled(
+                        "   Enter replace & next  Ctrl-A replace all  Esc close",
+                        Style::new().add_modifier(Modifier::DIM),
+                    ),
+                ]),
+            }
+        } else if editor.confirm {
             Line::from(vec![
                 Span::styled("Save changes? ", Style::new().fg(Color::Yellow)),
                 Span::raw("y = save   n = discard   Esc = keep editing"),
@@ -903,6 +927,14 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "copy / cut / paste (system clipboard)",
         ),
         ("Ctrl-Z  Ctrl-Y", "undo / redo"),
+        (
+            "Ctrl-F",
+            "find (Enter next); Ctrl-R then adds a replacement, Ctrl-A replaces all",
+        ),
+        (
+            "Enter on a list item",
+            "continues the list (numbers count up); Enter on an empty item ends it",
+        ),
         (
             "Ctrl+Left/Right",
             "word left / right;  Tab inserts two spaces",
