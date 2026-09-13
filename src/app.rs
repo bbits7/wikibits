@@ -1195,6 +1195,7 @@ impl App {
                 self.reload();
                 self.status = format!("Saved {id}");
                 self.clean_images();
+                self.commit(&format!("Edit {id}"));
             }
             Err(err) => {
                 // Keep the text so nothing is lost.
@@ -1299,7 +1300,7 @@ impl App {
             .and_then(|id| id.rsplit_once('/'))
             .map(|(dir, _)| dir)
             .unwrap_or("");
-        let path = relative_path(page_dir, image);
+        let path = wiki::relative_path(page_dir, image);
         let name = image
             .rsplit('/')
             .next()
@@ -1543,6 +1544,16 @@ impl App {
             self.status
                 .push_str(&format!("; {old} is now the folder page {new}"));
         }
+        self.commit(&format!("Create {id}"));
+    }
+
+    /// Record the wiki's state in git when the wiki folder is a repository.
+    fn commit(&mut self, message: &str) {
+        match self.wiki.git_commit(message) {
+            Some(true) => self.status.push_str("  (committed)"),
+            Some(false) => self.status.push_str("  (git commit failed)"),
+            None => {}
+        }
     }
 
     /// Turn folders that only hold an index back into plain pages, keeping the view on the
@@ -1606,6 +1617,7 @@ impl App {
                 self.status = format!("Deleted {id}");
                 self.clean_images();
                 self.demote_folders();
+                self.commit(&format!("Delete {id}"));
             }
             Err(err) => self.status = format!("{err:#}"),
         }
@@ -1654,6 +1666,7 @@ impl App {
                     n => format!("Renamed to {new}; updated links in {n} pages"),
                 };
                 self.demote_folders();
+                self.commit(&format!("Rename {old} to {new}"));
             }
             Err(err) => self.status = format!("{err:#}"),
         }
@@ -2105,17 +2118,6 @@ impl App {
     }
 }
 
-/// `target` (relative to the wiki root) written relative to the folder `from` (also root
-/// relative, `""` for the root): `../assets/x.png` from `projects`.
-fn relative_path(from: &str, target: &str) -> String {
-    let from: Vec<&str> = from.split('/').filter(|p| !p.is_empty()).collect();
-    let target: Vec<&str> = target.split('/').filter(|p| !p.is_empty()).collect();
-    let common = from.iter().zip(&target).take_while(|(a, b)| a == b).count();
-    let mut parts: Vec<&str> = vec![".."; from.len() - common];
-    parts.extend(&target[common..]);
-    parts.join("/")
-}
-
 /// Display width of a run of characters.
 fn width_of(chars: &[char]) -> u16 {
     use unicode_width::UnicodeWidthChar;
@@ -2194,7 +2196,7 @@ impl markdown::Context for RenderCtx<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::relative_path;
+    use crate::wiki::relative_path;
 
     #[test]
     fn image_paths_are_relative_to_the_page_folder() {

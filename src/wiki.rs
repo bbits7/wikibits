@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use pulldown_cmark::{Event, LinkType, Options, Parser, Tag};
@@ -278,6 +279,58 @@ impl Wiki {
         Ok(moved)
     }
 
+    /// Commit every change in the wiki folder when it is a git repository. `None` when it is
+    /// not one, `Some(false)` when there was nothing to commit or git failed.
+    pub fn git_commit(&self, message: &str) -> Option<bool> {
+        if !self.root.join(".git").exists() {
+            return None;
+        }
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.root)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        git(&["add", "-A"]);
+        Some(git(&["commit", "-q", "-m", message]))
+    }
+
+    /// Rewrite the relative links inside a page file that moved from folder `from` to folder
+    /// `to` (both root relative), so its images and `.md` links still point at the same files.
+    fn rebase_page_links(&self, path: &Path, from: &str, to: &str) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let text = fs::read_to_string(path)?;
+        let rebased = rewrite_links(&text, |kind, raw| {
+            if kind != LinkKind::Markdown
+                || raw.contains("://")
+                || raw.starts_with('/')
+                || raw.starts_with('#')
+                || raw.starts_with("mailto:")
+            {
+                return None;
+            }
+            let (target, fragment) = raw.split_once('#').unwrap_or((raw, ""));
+            let absolute = normalize(&format!("{from}/{target}"));
+            let mut new = relative_path(to, &absolute);
+            if !fragment.is_empty() {
+                new = format!("{new}#{fragment}");
+            }
+            (new != raw).then_some(new)
+        });
+        if rebased != text {
+            fs::write(path, rebased)?;
+        }
+        Ok(())
+    }
+
     /// Make room for a page under `id`: every ancestor that is a plain page (`backlog.md`)
     /// becomes that folder's index (`backlog/index.md`). Returns the ids that moved, old to
     /// new. Does not reload.
@@ -297,6 +350,8 @@ impl Wiki {
                         index_file.display()
                     )
                 })?;
+                let parent = folder.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                self.rebase_page_links(&index_file, parent, &folder)?;
                 moved.push((folder.clone(), format!("{folder}/index")));
             }
         }
@@ -331,6 +386,8 @@ impl Wiki {
             fs::rename(&entries[0], folder.with_extension("md"))?;
             let _ = fs::remove_dir(&folder);
             if let Some(id) = self.id_for(&folder.with_extension("md")) {
+                let parent = id.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                self.rebase_page_links(&folder.with_extension("md"), &id, parent)?;
                 moved.push((format!("{id}/index"), id));
             }
         }
@@ -339,7 +396,7 @@ impl Wiki {
         }
         // Links written as [[folder/index]] must follow the page to [[folder]].
         for page in self.pages.values() {
-            let rewritten = rewrite_links(&page.text, |raw| {
+            let rewritten = rewrite_links(&page.text, |_, raw| {
                 // Such links are written as [[folder/index]], which the resolver refuses,
                 // so match them by their normalized text.
                 let target = normalize(
@@ -404,6 +461,9 @@ impl Wiki {
             )
         })?;
         self.remove_empty_folders(page.path.parent());
+        let from_dir = old.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let to_dir = new.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        self.rebase_page_links(&target, from_dir, to_dir)?;
 
         let mut updated = 0;
         let linkers: Vec<String> = self.backlinks_of(old).to_vec();
@@ -411,7 +471,7 @@ impl Wiki {
             let Some(linker) = self.pages.get(&id) else {
                 continue;
             };
-            let rewritten = rewrite_links(&linker.text, |raw| {
+            let rewritten = rewrite_links(&linker.text, |_, raw| {
                 (self.resolve(&id, raw) == LinkTarget::Page(old.to_string())).then(|| {
                     if raw.trim_end().ends_with(".md") {
                         format!("{new}.md")
@@ -599,9 +659,17 @@ fn normalize(path: &str) -> String {
     parts.join("/")
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkKind {
+    /// `[[target]]` or `[[target|label]]`.
+    Wiki,
+    /// `[label](target)` or `![alt](target)`.
+    Markdown,
+}
+
 /// Replace link targets in `text`: `replace` gets each `[[target]]` / `[[target|label]]`
 /// target and each `[label](target)` target and returns the new target, or `None` to keep it.
-pub fn rewrite_links(text: &str, replace: impl Fn(&str) -> Option<String>) -> String {
+pub fn rewrite_links(text: &str, replace: impl Fn(LinkKind, &str) -> Option<String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while !rest.is_empty() {
@@ -613,7 +681,7 @@ pub fn rewrite_links(text: &str, replace: impl Fn(&str) -> Option<String>) -> St
                 .split_once('|')
                 .map_or((body, None), |(t, l)| (t, Some(l)));
             out.push_str("[[");
-            out.push_str(&replace(target).unwrap_or_else(|| target.to_string()));
+            out.push_str(&replace(LinkKind::Wiki, target).unwrap_or_else(|| target.to_string()));
             if let Some(label) = label {
                 out.push('|');
                 out.push_str(label);
@@ -625,7 +693,9 @@ pub fn rewrite_links(text: &str, replace: impl Fn(&str) -> Option<String>) -> St
         {
             let target = &inner[..close];
             out.push_str("](");
-            out.push_str(&replace(target).unwrap_or_else(|| target.to_string()));
+            out.push_str(
+                &replace(LinkKind::Markdown, target).unwrap_or_else(|| target.to_string()),
+            );
             out.push(')');
             rest = &inner[close + 1..];
         } else {
@@ -635,6 +705,17 @@ pub fn rewrite_links(text: &str, replace: impl Fn(&str) -> Option<String>) -> St
         }
     }
     out
+}
+
+/// `target` (relative to the wiki root) written relative to the folder `from` (also root
+/// relative, `""` for the root): `../assets/x.png` from `projects`.
+pub fn relative_path(from: &str, target: &str) -> String {
+    let from: Vec<&str> = from.split('/').filter(|p| !p.is_empty()).collect();
+    let target: Vec<&str> = target.split('/').filter(|p| !p.is_empty()).collect();
+    let common = from.iter().zip(&target).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<&str> = vec![".."; from.len() - common];
+    parts.extend(&target[common..]);
+    parts.join("/")
 }
 
 /// Lower-cased characters, one per input character, so positions line up with the original.
@@ -868,8 +949,24 @@ mod tests {
         fs::write(dir.join("other.md"), "# Other").unwrap();
         let mut wiki = Wiki::load(&dir).unwrap();
 
+        fs::write(
+            dir.join("old/thing.md"),
+            "# Thing\n![p](../assets/p.png) [h](../index.md) [x](https://x.y/a.png)",
+        )
+        .unwrap();
         let updated = wiki.rename_page("old/thing", "new/place").unwrap();
         assert_eq!(updated, 1);
+        assert_eq!(
+            fs::read_to_string(dir.join("new/place.md")).unwrap(),
+            "# Thing\n![p](../assets/p.png) [h](../index.md) [x](https://x.y/a.png)",
+            "same depth: unchanged"
+        );
+        wiki.rename_page("new/place", "deeper/still/place").unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("deeper/still/place.md")).unwrap(),
+            "# Thing\n![p](../../assets/p.png) [h](../../index.md) [x](https://x.y/a.png)"
+        );
+        wiki.rename_page("deeper/still/place", "new/place").unwrap();
         assert!(!dir.join("old").exists(), "the emptied folder is removed");
         assert!(wiki.pages.contains_key("new/place"));
         assert_eq!(

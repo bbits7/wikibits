@@ -70,6 +70,14 @@ again, and links written as `[[backlog/index]]` are rewritten to `[[backlog]]`. 
 the new `folder/name`; every `[[link]]` to it in other pages is rewritten, and emptied folders
 are removed) and `D` deletes it after a confirmation that mentions how many pages link to it.
 
+## History
+
+If the wiki folder is a git repository, every save, create, rename and delete is committed
+automatically ("Edit projects/wikibits"), so `git log` and `git diff` in the wiki folder are
+its history and a push is its backup. Set it up once with `git init` there (add `.trash/` to
+`.gitignore`). Moving a page to another folder rewrites the relative image and `.md` links
+inside it, so they keep pointing at the same files.
+
 ## Images
 
 Images render through the terminal's graphics protocol (sixel in foot), scaled down to fit the
