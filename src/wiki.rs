@@ -1048,7 +1048,7 @@ mod tests {
                 ("index".to_string(), "new/place.md".to_string())
             ]
         );
-        assert_eq!(wiki.orphan_pages(), vec!["other".to_string()]);
+        assert!(wiki.orphan_pages().is_empty(), "other is linked from index");
         assert_eq!(wiki.recently_changed(1).len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
