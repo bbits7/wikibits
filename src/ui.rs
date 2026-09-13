@@ -255,6 +255,7 @@ fn draw_related(f: &mut Frame, app: &mut App, area: Rect) {
                     "  (none)".to_string(),
                     Style::new().add_modifier(Modifier::DIM),
                 ),
+                RelatedRow::Blank => (String::new(), Style::new()),
             };
             let mut text = text;
             let pad = width.saturating_sub(unicode_width::UnicodeWidthStr::width(text.as_str()));

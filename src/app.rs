@@ -51,11 +51,15 @@ pub enum RelatedRow {
     Missing(String),
     External(String),
     None,
+    Blank,
 }
 
 impl RelatedRow {
     pub fn selectable(&self) -> bool {
-        !matches!(self, RelatedRow::Header(_) | RelatedRow::None)
+        !matches!(
+            self,
+            RelatedRow::Header(_) | RelatedRow::None | RelatedRow::Blank
+        )
     }
 }
 
@@ -631,6 +635,7 @@ impl App {
         }
         rows.extend(backlinks.iter().map(|b| RelatedRow::Page(b.clone())));
 
+        rows.push(RelatedRow::Blank);
         rows.push(RelatedRow::Header("Links on this page"));
         let mut seen: Vec<LinkTarget> = Vec::new();
         if let Some(page) = self.wiki.pages.get(id) {
