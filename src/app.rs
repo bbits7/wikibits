@@ -105,6 +105,8 @@ pub struct App {
 
     pub status: String,
     pub show_help: bool,
+    /// Show the page's Markdown source instead of rendering it.
+    pub raw: bool,
     pub should_quit: bool,
     pub rects: Rects,
     /// Breadcrumbs of the current page, with their column ranges from the last draw.
@@ -136,6 +138,7 @@ impl App {
             images: HashMap::new(),
             status: String::new(),
             show_help: false,
+            raw: false,
             should_quit: false,
             rects: Rects::default(),
             crumbs: Vec::new(),
@@ -157,6 +160,20 @@ impl App {
             None => app.status = format!("No .md files in {}", app.wiki.root.display()),
         }
         app
+    }
+
+    /// Switch the page between rendered Markdown and its source, keeping the scroll position.
+    pub fn toggle_raw(&mut self) {
+        self.raw = !self.raw;
+        let scroll = self.scroll;
+        self.render_current();
+        self.scroll = scroll.min(self.max_scroll());
+        self.link_sel = None;
+        self.status = if self.raw {
+            "Showing the Markdown source (v to render)".into()
+        } else {
+            "Showing the rendered page (v for source)".into()
+        };
     }
 
     pub fn page_title(&self) -> String {
@@ -302,7 +319,11 @@ impl App {
             picker: self.picker.as_ref(),
             images: &mut self.images,
         };
-        self.rendered = Some(markdown::render(&text, self.render_width, &mut ctx));
+        self.rendered = Some(if self.raw {
+            markdown::render_raw(&text, self.render_width)
+        } else {
+            markdown::render(&text, self.render_width, &mut ctx)
+        });
     }
 
     pub fn image(&self, path: &Path, max_width: u16) -> Option<Rc<SlicedProtocol>> {
@@ -784,6 +805,7 @@ impl App {
             KeyCode::Char('3') => self.focus = Focus::Related,
             KeyCode::Char('b') | KeyCode::Backspace => self.back(),
             KeyCode::Char('f') => self.forward(),
+            KeyCode::Char('v') => self.toggle_raw(),
             KeyCode::Char('r') => {
                 self.reload();
                 self.status = "Reloaded".into();

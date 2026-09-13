@@ -33,6 +33,7 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `j` / `k`, arrows, `PgUp` / `PgDn`, `g` / `G` | move / scroll |
 | `Enter` | open the selected page, link or folder |
 | `n` / `p` | select the next / previous link on the page |
+| `v` | toggle between the rendered page and its Markdown source |
 | `h` / `l` | collapse / expand a folder |
 | `b`, `Backspace` / `f` | back / forward |
 | `H` | home page |

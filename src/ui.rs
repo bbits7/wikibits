@@ -120,7 +120,12 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Content;
-    let block = pane(&app.page_title(), focused);
+    let title = if app.raw {
+        format!("{} (source)", app.page_title())
+    } else {
+        app.page_title()
+    };
+    let block = pane(&title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height < 3 {
@@ -274,7 +279,9 @@ fn draw_related(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.focus {
         Focus::Tree => "j/k move  Enter open  h/l fold  Tab pane  b back  ? help  q quit",
-        Focus::Content => "j/k scroll  n/p link  Enter follow  Tab pane  b back  ? help  q quit",
+        Focus::Content => {
+            "j/k scroll  n/p link  Enter follow  v source  Tab pane  b back  ? help  q quit"
+        }
         Focus::Related => "j/k move  Enter open  Tab pane  b back  ? help  q quit",
     };
     let left = if app.status.is_empty() {
@@ -316,6 +323,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("j / k  PgUp / PgDn", "scroll"),
         ("g / G", "top / bottom"),
         ("n / p", "next / previous link"),
+        ("v", "toggle Markdown source / rendered page"),
         ("Enter", "follow the selected link"),
         ("", ""),
         (

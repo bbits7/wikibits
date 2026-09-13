@@ -81,6 +81,33 @@ pub fn render(markdown: &str, width: u16, ctx: &mut dyn Context) -> Rendered {
     }
 }
 
+/// The Markdown source as-is, one text line per line, long lines wrapped at `width` columns.
+pub fn render_raw(text: &str, width: u16) -> Rendered {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(10) as usize;
+    let mut lines = Vec::new();
+    for source in text.lines() {
+        let source = source.replace('\t', "    ");
+        let mut line = String::new();
+        let mut used = 0;
+        for ch in source.chars() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > width {
+                lines.push(Line::raw(std::mem::take(&mut line)));
+                used = 0;
+            }
+            line.push(ch);
+            used += w;
+        }
+        lines.push(Line::raw(line));
+    }
+    Rendered {
+        lines,
+        links: Vec::new(),
+        images: Vec::new(),
+    }
+}
+
 #[derive(Clone)]
 struct Chunk {
     text: String,
@@ -626,6 +653,16 @@ mod tests {
 
     fn text(r: &Rendered) -> Vec<String> {
         r.lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn raw_view_keeps_source_lines() {
+        let r = render_raw("# T\n\n- [[a/b]] and *more*\n0123456789abc", 10);
+        assert_eq!(
+            text(&r),
+            vec!["# T", "", "- [[a/b]] ", "and *more*", "0123456789", "abc"]
+        );
+        assert!(r.links.is_empty());
     }
 
     #[test]
