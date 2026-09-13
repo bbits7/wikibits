@@ -93,6 +93,7 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         heading: None,
         lists: Vec::new(),
         in_code_block: false,
+        blank_after_nested: false,
         image_alt: None,
         skip_text: false,
         table: None,
@@ -204,6 +205,8 @@ struct Renderer<'a> {
     /// `None` for bullet lists, `Some(next number)` for ordered ones.
     lists: Vec<Option<u64>>,
     in_code_block: bool,
+    /// A nested list just ended: separate the next item of the outer list with a blank line.
+    blank_after_nested: bool,
     /// Collects an image's alt text while inside the image tag.
     image_alt: Option<(String, String)>,
     /// Ignore text events (used for wiki links that show the page title instead).
@@ -629,6 +632,10 @@ impl Renderer<'_> {
             }
             Tag::Item => {
                 self.finish_line();
+                if self.blank_after_nested {
+                    self.blank_line();
+                    self.blank_after_nested = false;
+                }
                 self.need_blank = false;
                 let bullet = match self.lists.last_mut() {
                     Some(Some(n)) => {
@@ -713,6 +720,8 @@ impl Renderer<'_> {
                 self.lists.pop();
                 self.finish_line();
                 self.need_blank = self.lists.is_empty();
+                // Back at an outer level: the next outer item gets a blank line before it.
+                self.blank_after_nested = !self.lists.is_empty();
             }
             TagEnd::Item => {
                 self.finish_line();
@@ -830,6 +839,42 @@ mod tests {
         assert_eq!(r.links[2].target, LinkTarget::Missing("nope".into()));
         let (line, span) = r.links[1].spans[0];
         assert_eq!(r.lines[line].spans[span].content, "that");
+    }
+
+    #[test]
+    fn a_blank_line_follows_a_nested_list() {
+        let r = render(
+            "* One\n* Two\n  * Two A\n  * Two B\n* Three\n* Four\n\n1. Main\n2. Parent\n   1. Child\n   2. Child\n3. Main\n4. Main",
+            80,
+            40,
+            &mut Ctx,
+        );
+        assert_eq!(
+            text(&r),
+            vec![
+                "• One",
+                "• Two",
+                "  • Two A",
+                "  • Two B",
+                "",
+                "• Three",
+                "• Four",
+                "",
+                "1. Main",
+                "2. Parent",
+                "   1. Child",
+                "   2. Child",
+                "",
+                "3. Main",
+                "4. Main",
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_list_at_the_end_adds_no_blank() {
+        let r = render("* One\n  * Deep\n\nAfter", 80, 40, &mut Ctx);
+        assert_eq!(text(&r), vec!["• One", "  • Deep", "", "After"]);
     }
 
     #[test]
