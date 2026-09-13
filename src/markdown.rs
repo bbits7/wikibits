@@ -16,6 +16,16 @@ pub struct Rendered {
     pub images: Vec<ImageSlot>,
     /// Links and images in document order: what `n`/`p` step through.
     pub items: Vec<Item>,
+    /// Headings in document order, for the table of contents.
+    pub headings: Vec<Heading>,
+}
+
+pub struct Heading {
+    /// 1 for `#`, 2 for `##`, and so on.
+    pub level: u8,
+    pub text: String,
+    /// Line the heading starts on.
+    pub line: usize,
 }
 
 /// Something on the page that can be selected and activated.
@@ -79,6 +89,8 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         cur_link: None,
         images: Vec::new(),
         items: Vec::new(),
+        headings: Vec::new(),
+        heading: None,
         lists: Vec::new(),
         in_code_block: false,
         image_alt: None,
@@ -98,6 +110,7 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         links: r.links,
         images: r.images,
         items: r.items,
+        headings: r.headings,
     }
 }
 
@@ -126,6 +139,7 @@ pub fn render_raw(text: &str, width: u16) -> Rendered {
         links: Vec::new(),
         images: Vec::new(),
         items: Vec::new(),
+        headings: Vec::new(),
     }
 }
 
@@ -160,6 +174,9 @@ struct Renderer<'a> {
     cur_link: Option<usize>,
     images: Vec<ImageSlot>,
     items: Vec<Item>,
+    headings: Vec<Heading>,
+    /// The heading being written: level, first line, and its text so far.
+    heading: Option<(u8, usize, String)>,
     /// `None` for bullet lists, `Some(next number)` for ordered ones.
     lists: Vec<Option<u64>>,
     in_code_block: bool,
@@ -255,6 +272,9 @@ impl Renderer<'_> {
     fn emit(&mut self, text: &str, style: Style, link: Option<usize>) {
         if text.is_empty() {
             return;
+        }
+        if let Some((_, _, heading_text)) = &mut self.heading {
+            heading_text.push_str(text);
         }
         if let Some(table) = &mut self.table {
             if let Some(cell) = table.rows.last_mut().and_then(|r| r.last_mut()) {
@@ -537,6 +557,15 @@ impl Renderer<'_> {
                     let style = self.style().patch(DIM);
                     self.emit(marker, style, None);
                 }
+                let number = match level {
+                    HeadingLevel::H1 => 1,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    HeadingLevel::H4 => 4,
+                    HeadingLevel::H5 => 5,
+                    HeadingLevel::H6 => 6,
+                };
+                self.heading = Some((number, self.lines.len(), String::new()));
             }
             Tag::BlockQuote(_) => {
                 self.start_block();
@@ -623,6 +652,13 @@ impl Renderer<'_> {
         match tag {
             TagEnd::Paragraph | TagEnd::HtmlBlock | TagEnd::FootnoteDefinition => self.end_block(),
             TagEnd::Heading(_) => {
+                if let Some((level, line, text)) = self.heading.take() {
+                    self.headings.push(Heading {
+                        level,
+                        text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+                        line,
+                    });
+                }
                 self.pop_style();
                 self.end_block();
             }
@@ -705,6 +741,25 @@ mod tests {
             vec!["# T", "", "- [[a/b]] ", "and *more*", "0123456789", "abc"]
         );
         assert!(r.links.is_empty());
+    }
+
+    #[test]
+    fn headings_are_collected_with_their_lines() {
+        let r = render(
+            "# Top\n\ntext\n\n## Two *words*\n\n### Deep",
+            80,
+            40,
+            &mut Ctx,
+        );
+        let got: Vec<(u8, &str, usize)> = r
+            .headings
+            .iter()
+            .map(|h| (h.level, h.text.as_str(), h.line))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, "Top", 0), (2, "Two words", 4), (3, "Deep", 6)]
+        );
     }
 
     #[test]

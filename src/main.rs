@@ -161,12 +161,16 @@ fn run(
         if app.should_quit {
             break;
         }
-        if event::poll(Duration::from_millis(250))? {
+        // Handle everything that is already waiting before drawing again, so a burst of
+        // mouse drag or wheel events does not cost one redraw each.
+        let mut wait = Duration::from_millis(250);
+        while event::poll(wait)? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => app.handle_key(key),
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
                 _ => {}
             }
+            wait = Duration::ZERO;
         }
         app.refresh_font_size();
         let mut changed = false;

@@ -49,8 +49,13 @@ fn draw_popup(f: &mut Frame, app: &mut App, area: Rect) {
         width,
         height,
     };
+    let position = if popup.off == (0, 0) {
+        String::new()
+    } else {
+        format!("  ·  at {},{}", popup.off.0, popup.off.1)
+    };
     let title = format!(
-        " {}  {}x{} px  ·  h/j/k/l scroll  Esc close ",
+        " {}  {}x{} px{position}  ·  h/j/k/l or drag  Esc close ",
         popup.name, popup.pixels.0, popup.pixels.1
     );
     let block = pane(&title, true);
@@ -302,6 +307,30 @@ fn draw_related(f: &mut Frame, app: &mut App, area: Rect) {
                     format!("  {url}"),
                     EXTERNAL_LINK.remove_modifier(Modifier::UNDERLINED),
                 ),
+                RelatedRow::Heading {
+                    index,
+                    depth,
+                    foldable,
+                    expanded,
+                } => {
+                    let marker = match (foldable, expanded) {
+                        (false, _) => "  ",
+                        (true, true) => "▾ ",
+                        (true, false) => "▸ ",
+                    };
+                    let text = app
+                        .rendered
+                        .as_ref()
+                        .and_then(|r| r.headings.get(*index))
+                        .map(|h| h.text.as_str())
+                        .unwrap_or("");
+                    let style = if *foldable {
+                        Style::new().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::new()
+                    };
+                    (format!("{}{marker}{text}", "  ".repeat(*depth)), style)
+                }
                 RelatedRow::None => (
                     "  (none)".to_string(),
                     Style::new().add_modifier(Modifier::DIM),
@@ -329,7 +358,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Focus::Content => {
             "j/k scroll  n/p link  Enter follow  v source  Tab pane  b back  ? help  q quit"
         }
-        Focus::Related => "j/k move  Enter open  Tab pane  b back  ? help  q quit",
+        Focus::Related => "j/k move  Enter open  h/l fold  Tab pane  b back  ? help  q quit",
     };
     let left = if app.status.is_empty() {
         Span::styled(hints, Style::new().add_modifier(Modifier::DIM))
@@ -366,6 +395,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Enter", "open page / fold folder"),
         ("h / l", "collapse / expand"),
         ("", ""),
+        ("Related column", ""),
+        ("Enter", "jump to the heading / open the page"),
+        ("h / l  Space", "fold / unfold a heading"),
+        ("", ""),
         ("Page", ""),
         ("j / k  PgUp / PgDn", "scroll"),
         ("g / G", "top / bottom"),
@@ -381,6 +414,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "h / j / k / l, arrows",
             "scroll (PgUp / PgDn a screen, g / G top / bottom)",
         ),
+        ("mouse", "drag the image, or use the wheel"),
         ("Esc  q  Enter", "close"),
         ("", ""),
         (

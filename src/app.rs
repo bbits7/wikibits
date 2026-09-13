@@ -31,6 +31,8 @@ pub struct ImagePopup {
     pub off: (u16, u16),
     /// Inner area from the last draw.
     pub view: Rect,
+    /// Mouse position and offset when a drag started.
+    drag: Option<((u16, u16), (u16, u16))>,
     /// Encoded for `(view size, offset)`.
     protocol: Option<(PopupKey, Protocol)>,
 }
@@ -65,6 +67,13 @@ pub enum RelatedRow {
     Page(String),
     Missing(String),
     External(String),
+    /// A heading of the current page (index into `rendered.headings`).
+    Heading {
+        index: usize,
+        depth: usize,
+        foldable: bool,
+        expanded: bool,
+    },
     None,
     Blank,
 }
@@ -116,6 +125,10 @@ pub struct App {
     pub related: Vec<RelatedRow>,
     pub related_sel: usize,
     pub related_scroll: usize,
+    /// Headings whose sub-headings are shown in "On this page".
+    toc_expanded: HashSet<usize>,
+    /// Reset `toc_expanded` to the defaults on the next rebuild (a new page was opened).
+    toc_fresh: bool,
 
     pub focus: Focus,
     picker: Option<Picker>,
@@ -153,6 +166,8 @@ impl App {
             related: Vec::new(),
             related_sel: 0,
             related_scroll: 0,
+            toc_expanded: HashSet::new(),
+            toc_fresh: true,
             focus: Focus::Content,
             picker,
             images: HashMap::new(),
@@ -189,6 +204,7 @@ impl App {
         self.render_current();
         self.scroll = scroll.min(self.max_scroll());
         self.sel = None;
+        self.rebuild_related();
         self.status = if self.raw {
             "Showing the Markdown source (v to render)".into()
         } else {
@@ -219,6 +235,7 @@ impl App {
         self.sel = None;
         self.related_sel = 0;
         self.related_scroll = 0;
+        self.toc_fresh = true;
         self.status.clear();
         self.render_current();
         self.rebuild_related();
@@ -313,6 +330,7 @@ impl App {
             self.render_current();
             self.scroll = scroll.min(self.max_scroll());
             self.sel = None;
+            self.rebuild_related();
         }
     }
 
@@ -363,6 +381,7 @@ impl App {
         let scroll = self.scroll;
         self.render_current();
         self.scroll = scroll.min(self.max_scroll());
+        self.rebuild_related();
     }
 
     pub fn image(&self, slot: &ImageSlot) -> Option<Rc<SlicedProtocol>> {
@@ -409,6 +428,7 @@ impl App {
             cells,
             off: (0, 0),
             view: Rect::default(),
+            drag: None,
             protocol: None,
         });
     }
@@ -476,10 +496,24 @@ impl App {
             width: popup.view.width + 2,
             height: popup.view.height + 2,
         };
+        let at = (mouse.column, mouse.row);
         match mouse.kind {
-            MouseEventKind::Down(_) if !outer.contains((mouse.column, mouse.row).into()) => {
-                self.popup = None;
+            MouseEventKind::Down(_) if !outer.contains(at.into()) => self.popup = None,
+            MouseEventKind::Down(MouseButton::Left) => {
+                let off = popup.off;
+                self.popup.as_mut().unwrap().drag = Some((at, off));
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // Dragging moves the image with the pointer, so the offset goes the other way.
+                if let Some(((sx, sy), (ox, oy))) = popup.drag {
+                    let dx = sx as i32 - at.0 as i32;
+                    let dy = sy as i32 - at.1 as i32;
+                    let (nx, ny) = (ox as i32 + dx, oy as i32 + dy);
+                    let current = popup.off;
+                    self.popup_scroll(nx - current.0 as i32, ny - current.1 as i32);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.popup.as_mut().unwrap().drag = None,
             MouseEventKind::ScrollDown => self.popup_scroll(0, 2),
             MouseEventKind::ScrollUp => self.popup_scroll(0, -2),
             MouseEventKind::ScrollRight => self.popup_scroll(4, 0),
@@ -801,25 +835,59 @@ impl App {
 
     // ----- related column and breadcrumbs ---------------------------------------------
 
+    /// The "On this page" rows: headings as a tree, level-1 headings expanded and deeper ones
+    /// collapsed by default.
+    fn toc_rows(&mut self) -> Vec<RelatedRow> {
+        let Some(rendered) = &self.rendered else {
+            return Vec::new();
+        };
+        let headings = &rendered.headings;
+        if self.toc_fresh {
+            self.toc_fresh = false;
+            self.toc_expanded = headings
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| h.level <= 1)
+                .map(|(i, _)| i)
+                .collect();
+        }
+        let mut rows = Vec::new();
+        let mut ancestors: Vec<usize> = Vec::new();
+        for (i, h) in headings.iter().enumerate() {
+            while ancestors
+                .last()
+                .is_some_and(|&a| headings[a].level >= h.level)
+            {
+                ancestors.pop();
+            }
+            if ancestors.iter().all(|a| self.toc_expanded.contains(a)) {
+                rows.push(RelatedRow::Heading {
+                    index: i,
+                    depth: ancestors.len(),
+                    foldable: headings.get(i + 1).is_some_and(|n| n.level > h.level),
+                    expanded: self.toc_expanded.contains(&i),
+                });
+            }
+            ancestors.push(i);
+        }
+        rows
+    }
+
     fn rebuild_related(&mut self) {
-        let mut rows = vec![RelatedRow::Header("Backlinks")];
-        let Some(id) = self.current.as_deref() else {
+        let mut rows = vec![RelatedRow::Header("On this page")];
+        let Some(id) = self.current.clone() else {
             self.related = rows;
             return;
         };
-        let backlinks = self.wiki.backlinks_of(id);
-        if backlinks.is_empty() {
+        let toc = self.toc_rows();
+        if toc.is_empty() {
             rows.push(RelatedRow::None);
         }
-        let mut section: Vec<RelatedRow> = backlinks
-            .iter()
-            .map(|b| RelatedRow::Page(b.clone()))
-            .collect();
-        self.sort_related(&mut section);
-        rows.extend(section);
+        rows.extend(toc);
 
         rows.push(RelatedRow::Blank);
         rows.push(RelatedRow::Header("Links on this page"));
+        let id = id.as_str();
         let mut section = Vec::new();
         let mut seen: Vec<LinkTarget> = Vec::new();
         if let Some(page) = self.wiki.pages.get(id) {
@@ -839,6 +907,19 @@ impl App {
         if seen.is_empty() {
             rows.push(RelatedRow::None);
         }
+        self.sort_related(&mut section);
+        rows.extend(section);
+
+        rows.push(RelatedRow::Blank);
+        rows.push(RelatedRow::Header("Backlinks"));
+        let backlinks = self.wiki.backlinks_of(id);
+        if backlinks.is_empty() {
+            rows.push(RelatedRow::None);
+        }
+        let mut section: Vec<RelatedRow> = backlinks
+            .iter()
+            .map(|b| RelatedRow::Page(b.clone()))
+            .collect();
         self.sort_related(&mut section);
         rows.extend(section);
         self.related = rows;
@@ -881,9 +962,59 @@ impl App {
             Some(RelatedRow::Page(id)) => LinkTarget::Page(id.clone()),
             Some(RelatedRow::Missing(raw)) => LinkTarget::Missing(raw.clone()),
             Some(RelatedRow::External(url)) => LinkTarget::External(url.clone()),
+            Some(RelatedRow::Heading { index, .. }) => {
+                // Jump so the heading is the first visible line.
+                if let Some(line) = self
+                    .rendered
+                    .as_ref()
+                    .and_then(|r| r.headings.get(*index))
+                    .map(|h| h.line)
+                {
+                    self.scroll = line.min(self.max_scroll());
+                    self.sel = None;
+                }
+                return;
+            }
             _ => return,
         };
         self.follow(&target);
+    }
+
+    /// Fold or unfold the selected heading: `Some(true)` expands, `Some(false)` collapses,
+    /// `None` toggles.
+    fn toc_fold(&mut self, expand: Option<bool>) {
+        let Some(RelatedRow::Heading {
+            index,
+            foldable,
+            expanded,
+            depth,
+            ..
+        }) = self.related.get(self.related_sel)
+        else {
+            return;
+        };
+        let (index, depth) = (*index, *depth);
+        if !foldable || expand == Some(*expanded) {
+            // `h` on a heading that cannot collapse further goes to its parent.
+            if expand == Some(false) && depth > 0
+                && let Some(parent) = (0..self.related_sel).rev().find(|&i| {
+                    matches!(&self.related[i], RelatedRow::Heading { depth: d, .. } if *d < depth)
+                }) {
+                    self.related_sel = parent;
+                }
+            return;
+        }
+        if !self.toc_expanded.remove(&index) {
+            self.toc_expanded.insert(index);
+        }
+        self.rebuild_related();
+        if let Some(i) = self
+            .related
+            .iter()
+            .position(|r| matches!(r, RelatedRow::Heading { index: h, .. } if *h == index))
+        {
+            self.related_sel = i;
+        }
     }
 
     /// One crumb per folder above the current page, each named after the folder's `index`
@@ -1030,6 +1161,9 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.related_move(1),
             KeyCode::Char('k') | KeyCode::Up => self.related_move(-1),
             KeyCode::Enter => self.related_activate(),
+            KeyCode::Char('l') | KeyCode::Right => self.toc_fold(Some(true)),
+            KeyCode::Char('h') | KeyCode::Left => self.toc_fold(Some(false)),
+            KeyCode::Char(' ') => self.toc_fold(None),
             _ => {}
         }
     }

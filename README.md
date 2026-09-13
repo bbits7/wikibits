@@ -9,8 +9,9 @@ wikibits -p projects/calcbits
 ```
 
 Three columns: the folder tree on the left (current page highlighted), the rendered
-page in the middle with breadcrumbs above it, and on the right the backlinks plus the
-links found on the page. Images render inline in terminals that support sixel (foot),
+page in the middle with breadcrumbs above it, and on the right "On this page" (the
+headings as a foldable outline; `Enter` jumps to one), the links found on the page, and
+the backlinks. Images render inline in terminals that support sixel (foot),
 kitty or iTerm2 graphics. Files are re-read when they change on disk.
 
 ## Pages and links
@@ -48,7 +49,7 @@ The mouse works too: click to open, wheel to scroll, right-click to go back.
 Images render through the terminal's graphics protocol (sixel in foot), scaled down to fit the
 page area when they are too big (never scaled up). Each image sits in a thin frame; select it
 with `n`/`p` (or click it) and press `Enter` to see it at full size in a pop-up, scrolling with
-`h`/`j`/`k`/`l`, the arrows or the mouse wheel; `Esc` closes it. If images come out the wrong
+`h`/`j`/`k`/`l`, the arrows, the mouse wheel or by dragging it; `Esc` closes it. If images come out the wrong
 size, `wikibits --probe` prints what the terminal reports about protocol and cell size. Inside
 tmux, images are drawn with block characters.
 
