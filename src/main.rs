@@ -31,10 +31,16 @@ struct Cli {
     /// Page to open first, e.g. `projects/calcbits`.
     #[arg(short, long)]
     page: Option<String>,
+    /// Print what the terminal reports about image support and cell size, then exit.
+    #[arg(long)]
+    probe: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.probe {
+        return probe();
+    }
     let dir = match cli.dir {
         Some(dir) => dir,
         None => PathBuf::from(std::env::var("HOME").context("HOME is not set")?).join("Wiki"),
@@ -63,8 +69,53 @@ fn main() -> Result<()> {
     result
 }
 
+/// Show how the terminal answers the image and cell-size queries, for debugging image sizing.
+fn probe() -> Result<()> {
+    use std::fmt::Write as _;
+    let window = ratatui::crossterm::terminal::window_size().ok();
+    let mut terminal = ratatui::init();
+    let picker = Picker::from_query_stdio();
+    ratatui::restore();
+    drop(terminal.clear());
+    let mut out = String::new();
+    match picker {
+        Ok(p) => {
+            let _ = writeln!(out, "protocol: {:?}", p.protocol_type());
+            let _ = writeln!(out, "font size (px): {:?}", p.font_size());
+        }
+        Err(e) => {
+            let _ = writeln!(out, "query failed: {e}");
+        }
+    }
+    if let Some(w) = window {
+        let _ = writeln!(
+            out,
+            "window: {} cols x {} rows, {} x {} px -> {}x{} px per cell",
+            w.columns,
+            w.rows,
+            w.width,
+            w.height,
+            w.width.checked_div(w.columns).unwrap_or(0),
+            w.height.checked_div(w.rows).unwrap_or(0)
+        );
+    }
+    for var in ["TERM", "TMUX", "GDK_SCALE", "WAYLAND_DISPLAY"] {
+        let _ = writeln!(out, "{var}={}", std::env::var(var).unwrap_or_default());
+    }
+    print!("{out}");
+    // Terminal queries need the real stdout, so results can also go to a file.
+    if let Ok(path) = std::env::var("WIKIBITS_PROBE_OUT") {
+        let _ = std::fs::write(path, &out);
+    }
+    Ok(())
+}
+
 /// Ask the terminal which image protocol it speaks (sixel in foot). Must run before any events
 /// are read.
+///
+/// A freshly opened window may answer before it is mapped, with a placeholder 80x24 size and
+/// cells far larger than the real ones, so wait until the terminal reports a real pixel size
+/// and take the cell size from that (see [`app::font_size_from_window`]).
 ///
 /// Not inside tmux: unless passthrough is enabled, tmux swallows the query, and the library's
 /// reader thread then waits on stdin forever and eats the first keystroke. Images fall back to
@@ -73,7 +124,15 @@ fn query_image_support() -> Option<Picker> {
     if std::env::var_os("TMUX").is_some() {
         return Some(Picker::halfblocks());
     }
-    Picker::from_query_stdio().ok()
+    let start = std::time::Instant::now();
+    while app::font_size_from_window().is_none() && start.elapsed() < Duration::from_millis(1500) {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let mut picker = Picker::from_query_stdio().ok()?;
+    if let Some(font_size) = app::font_size_from_window() {
+        picker = app::picker_with_font_size(&picker, font_size);
+    }
+    Some(picker)
 }
 
 fn run(
@@ -109,6 +168,7 @@ fn run(
                 _ => {}
             }
         }
+        app.refresh_font_size();
         let mut changed = false;
         while let Ok(res) = rx.try_recv() {
             if let Ok(ev) = res

@@ -43,6 +43,12 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 
 The mouse works too: click to open, wheel to scroll, right-click to go back.
 
+## Images
+
+Images render through the terminal's graphics protocol (sixel in foot). If they come out the
+wrong size, `wikibits --probe` prints what the terminal reports about protocol and cell size.
+Inside tmux, images are drawn with block characters.
+
 ## Build and install
 
 Needs a Rust toolchain (`rustup default stable`).

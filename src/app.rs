@@ -10,9 +10,9 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Rect, Size};
-use ratatui_image::Resize;
 use ratatui_image::picker::Picker;
 use ratatui_image::sliced::SlicedProtocol;
+use ratatui_image::{FontSize, Resize};
 
 use crate::markdown::{self, Rendered};
 use crate::wiki::{LinkTarget, TreeNode, Wiki};
@@ -324,6 +324,24 @@ impl App {
         } else {
             markdown::render(&text, self.render_width, &mut ctx)
         });
+    }
+
+    /// Pick up a changed cell size (the window was resized or moved to a monitor with another
+    /// scale) so images are rebuilt for the real pixel grid.
+    pub fn refresh_font_size(&mut self) {
+        let Some(font_size) = font_size_from_window() else {
+            return;
+        };
+        let Some(picker) = &self.picker else { return };
+        let current = picker.font_size();
+        if (current.width, current.height) == (font_size.width, font_size.height) {
+            return;
+        }
+        self.picker = Some(picker_with_font_size(picker, font_size));
+        self.images.clear();
+        let scroll = self.scroll;
+        self.render_current();
+        self.scroll = scroll.min(self.max_scroll());
     }
 
     pub fn image(&self, path: &Path, max_width: u16) -> Option<Rc<SlicedProtocol>> {
@@ -935,6 +953,24 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// A picker like `picker` but sized for `font_size` cells.
+#[allow(deprecated)] // from_fontsize is the only way to set a size the terminal did not report
+pub fn picker_with_font_size(picker: &Picker, font_size: FontSize) -> Picker {
+    let mut sized = Picker::from_fontsize(font_size);
+    sized.set_protocol_type(picker.protocol_type());
+    sized
+}
+
+/// The terminal's cell size in pixels, from the window size it reports; `None` until the window
+/// is mapped and reports real pixel dimensions.
+pub fn font_size_from_window() -> Option<FontSize> {
+    let w = ratatui::crossterm::terminal::window_size().ok()?;
+    if w.columns == 0 || w.rows == 0 || w.width == 0 || w.height == 0 {
+        return None;
+    }
+    Some(FontSize::new(w.width / w.columns, w.height / w.rows))
 }
 
 /// What the Markdown renderer needs while rendering one page.
