@@ -233,6 +233,16 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
         }
+        Some(Item::Task(t)) => {
+            let slot = &rendered.tasks[*t];
+            if slot.line >= scroll
+                && let Some(s) = lines
+                    .get_mut(slot.line - scroll)
+                    .and_then(|l| l.spans.get_mut(slot.span))
+            {
+                s.style = s.style.add_modifier(Modifier::REVERSED);
+            }
+        }
         Some(Item::Image(i)) => {
             let slot = &rendered.images[*i];
             for line in slot.line..=slot.line + slot.height as usize + 1 {
@@ -761,7 +771,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         _ if app.popup.is_some() => "h/j/k/l scroll  PgUp/PgDn  g/G  Esc close",
         Focus::Tree => "j/k move  Enter open  h/l fold  Tab pane  b back  ? help  q quit",
         Focus::Content => {
-            "j/k scroll  n/p link  Enter follow  v source  Tab pane  b back  ? help  q quit"
+            "j/k scroll  n/p link  Enter follow  x tick  v source  Tab pane  b back  ? help  q quit"
         }
         Focus::Related => "j/k move  Enter open  h/l fold  Tab pane  b back  ? help  q quit",
     };
@@ -812,7 +822,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Page", ""),
         ("j / k  PgUp / PgDn", "scroll"),
         ("g / G", "top / bottom"),
-        ("n / p", "next / previous link or image"),
+        ("n / p", "next / previous link, image or task"),
+        ("x", "tick / untick the selected task (Enter does too)"),
         ("v", "toggle Markdown source / rendered page"),
         ("/", "find in this page (Enter / Up step, Esc closes)"),
         ("s", "search the wiki (Enter opens the page at the match)"),

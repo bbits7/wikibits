@@ -631,7 +631,47 @@ impl App {
         match *rendered.items.get(index)? {
             Item::Link(l) => rendered.links[l].spans.first().map(|(line, _)| *line),
             Item::Image(i) => Some(rendered.images[i].line),
+            Item::Task(t) => Some(rendered.tasks[t].line),
         }
+    }
+
+    /// Flip a task-list checkbox in the page file.
+    fn toggle_task(&mut self, index: usize) {
+        let Some((page, task)) = self
+            .current
+            .as_ref()
+            .and_then(|id| self.wiki.pages.get(id))
+            .zip(self.rendered.as_ref().and_then(|r| r.tasks.get(index)))
+        else {
+            return;
+        };
+        let (path, id, range) = (page.path.clone(), page.id.clone(), task.source.clone());
+        let Ok(mut text) = fs::read_to_string(&path) else {
+            return;
+        };
+        let replacement = match text.get(range.clone()) {
+            Some("[ ]") => "[x]",
+            Some("[x]" | "[X]") => "[ ]",
+            _ => {
+                self.status = "The file changed; reload and try again".into();
+                return;
+            }
+        };
+        text.replace_range(range, replacement);
+        if let Err(err) = fs::write(&path, text) {
+            self.status = format!("Could not write {}: {err}", path.display());
+            return;
+        }
+        let (scroll, sel) = (self.scroll, self.sel);
+        self.reload();
+        self.scroll = scroll.min(self.max_scroll());
+        self.sel = sel;
+        self.status = if replacement == "[x]" {
+            "Ticked".into()
+        } else {
+            "Unticked".into()
+        };
+        self.commit(&format!("Tick task in {id}"));
     }
 
     fn visible_items(&self) -> Vec<usize> {
@@ -690,7 +730,8 @@ impl App {
                 self.follow(&target);
             }
             Some(Item::Image(i)) => self.open_image(i),
-            None => self.status = "Select a link or image first (n / p)".into(),
+            Some(Item::Task(t)) => self.toggle_task(t),
+            None => self.status = "Select a link, image or task first (n / p)".into(),
         }
     }
 
@@ -713,6 +754,13 @@ impl App {
             acc += w;
             hit
         })?;
+        if let Some(t) = rendered
+            .tasks
+            .iter()
+            .position(|t| t.line == line && t.span == span_index)
+        {
+            return rendered.items.iter().position(|it| *it == Item::Task(t));
+        }
         let link = rendered
             .links
             .iter()
@@ -1996,6 +2044,16 @@ impl App {
             KeyCode::Char('n') => self.next_item(),
             KeyCode::Char('p') => self.prev_item(),
             KeyCode::Enter => self.activate_selected(),
+            KeyCode::Char('x') => {
+                if let Some(Item::Task(t)) = self
+                    .sel
+                    .and_then(|i| self.rendered.as_ref()?.items.get(i).copied())
+                {
+                    self.toggle_task(t);
+                } else {
+                    self.status = "Select a task first (n / p)".into();
+                }
+            }
             KeyCode::Esc => self.sel = None,
             _ => {}
         }

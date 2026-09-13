@@ -34,7 +34,8 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `Tab` / `Shift-Tab`, `1` `2` `3` | switch column |
 | `j` / `k`, arrows, `PgUp` / `PgDn`, `g` / `G` | move / scroll |
 | `Enter` | open the selected page, link or folder; open the selected image full size |
-| `n` / `p` | select the next / previous link or image on the page |
+| `n` / `p` | select the next / previous link, image or task on the page |
+| `x` | tick or untick the selected task (`Enter` or a click on the checkbox does too) |
 | `v` | toggle between the rendered page and its Markdown source |
 | `/` | find in the page: matches highlight as you type, `Enter`/`Up` step through them |
 | `s` | search the wiki: live list of matching pages, `Enter` opens one at the match |

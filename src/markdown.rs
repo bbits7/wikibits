@@ -18,6 +18,7 @@ pub struct Rendered {
     pub items: Vec<Item>,
     /// Headings in document order, for the table of contents.
     pub headings: Vec<Heading>,
+    pub tasks: Vec<TaskSlot>,
 }
 
 pub struct Heading {
@@ -35,6 +36,17 @@ pub enum Item {
     Link(usize),
     /// Index into [`Rendered::images`].
     Image(usize),
+    /// Index into [`Rendered::tasks`].
+    Task(usize),
+}
+
+/// A task-list checkbox: where its marker is drawn and where it lives in the source.
+pub struct TaskSlot {
+    pub line: usize,
+    /// Index of the marker span in that line.
+    pub span: usize,
+    /// Byte range of `[ ]` / `[x]` in the Markdown source.
+    pub source: std::ops::Range<usize>,
 }
 
 pub struct Link {
@@ -91,6 +103,7 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         items: Vec::new(),
         headings: Vec::new(),
         heading: None,
+        tasks: Vec::new(),
         lists: Vec::new(),
         in_code_block: false,
         blank_after_nested: false,
@@ -100,8 +113,8 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         table: None,
     };
     r.start_line();
-    for event in Parser::new_ext(markdown, parser_options()) {
-        r.event(event);
+    for (event, range) in Parser::new_ext(markdown, parser_options()).into_offset_iter() {
+        r.event(event, range);
     }
     r.finish_line();
     while r.lines.last().is_some_and(|l| l.width() == 0) {
@@ -113,6 +126,7 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         images: r.images,
         items: r.items,
         headings: r.headings,
+        tasks: r.tasks,
     }
 }
 
@@ -155,6 +169,7 @@ pub fn render_raw(text: &str, width: u16) -> Rendered {
         images: Vec::new(),
         items: Vec::new(),
         headings,
+        tasks: Vec::new(),
     }
 }
 
@@ -201,6 +216,7 @@ struct Renderer<'a> {
     images: Vec<ImageSlot>,
     items: Vec<Item>,
     headings: Vec<Heading>,
+    tasks: Vec<TaskSlot>,
     /// The heading being written: level, first line, and its text so far.
     heading: Option<(u8, usize, String)>,
     /// `None` for bullet lists, `Some(next number)` for ordered ones.
@@ -513,7 +529,7 @@ impl Renderer<'_> {
         }
     }
 
-    fn event(&mut self, event: Event) {
+    fn event(&mut self, event: Event, range: std::ops::Range<usize>) {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
@@ -564,6 +580,12 @@ impl Renderer<'_> {
                 if self.at_line_start {
                     self.start_line();
                 }
+                self.tasks.push(TaskSlot {
+                    line: self.lines.len(),
+                    span: self.prefixes.len().saturating_sub(1),
+                    source: range,
+                });
+                self.items.push(Item::Task(self.tasks.len() - 1));
             }
             Event::Html(html) | Event::InlineHtml(html) => {
                 let style = self.style().patch(DIM);
@@ -908,8 +930,13 @@ mod tests {
 
     #[test]
     fn task_items_use_checkbox_bullets() {
-        let r = render("- [ ] open item\n- [x] done item here", 14, 40, &mut Ctx);
+        let src = "- [ ] open item\n- [x] done item here";
+        let r = render(src, 14, 40, &mut Ctx);
         assert_eq!(text(&r), vec!["⬛ open item", "✅ done item", "   here"]);
+        assert_eq!(r.items, vec![Item::Task(0), Item::Task(1)]);
+        let t = &r.tasks[1];
+        assert_eq!((t.line, &src[t.source.clone()]), (1, "[x]"));
+        assert_eq!(r.lines[t.line].spans[t.span].content, "✅ ");
     }
 
     #[test]
