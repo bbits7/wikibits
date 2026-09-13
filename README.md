@@ -63,7 +63,9 @@ outright), and the status bar says which. `Ctrl-S` saves and returns to the rend
 if there are unsaved changes. `N` creates a page from a `folder/name` path, and following a
 link to a page that does not exist offers to create it. Creating `backlog/history` when
 `backlog.md` is a plain page turns it into a folder: the page becomes `backlog/index.md`, so
-links to `backlog` keep working and the tree shows it as a folder. `R` renames or moves the page (type
+links to `backlog` keep working and the tree shows it as a folder. The reverse happens too:
+after a delete or rename, a folder left with nothing but `index.md` becomes the plain page
+again, and links written as `[[backlog/index]]` are rewritten to `[[backlog]]`. `R` renames or moves the page (type
 the new `folder/name`; every `[[link]]` to it in other pages is rewritten, and emptied folders
 are removed) and `D` deletes it after a confirmation that mentions how many pages link to it.
 

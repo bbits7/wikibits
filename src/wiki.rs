@@ -298,6 +298,65 @@ impl Wiki {
         Ok(moved)
     }
 
+    /// The opposite of promotion: a folder holding nothing but `index.md` becomes the plain
+    /// page `folder.md` again, and links to `folder/index` are rewritten to `folder`. Checks
+    /// the deepest folders first so a whole chain collapses. Returns the moves, old to new.
+    pub fn demote_lonely_folders(&mut self) -> Result<Vec<(String, String)>> {
+        let mut folders: Vec<PathBuf> = WalkDir::new(&self.root)
+            .min_depth(1)
+            .into_iter()
+            .filter_entry(|e| !is_hidden(e.file_name()))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_dir())
+            .map(|e| e.into_path())
+            .collect();
+        folders.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        let mut moved = Vec::new();
+        for folder in folders {
+            let entries: Vec<PathBuf> = fs::read_dir(&folder)?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| !is_hidden(p.file_name().unwrap_or_default()))
+                .collect();
+            let only_index =
+                entries.len() == 1 && entries[0].file_name().is_some_and(|n| n == "index.md");
+            if !only_index || folder.with_extension("md").exists() {
+                continue;
+            }
+            fs::rename(&entries[0], folder.with_extension("md"))?;
+            let _ = fs::remove_dir(&folder);
+            if let Some(id) = self.id_for(&folder.with_extension("md")) {
+                moved.push((format!("{id}/index"), id));
+            }
+        }
+        if moved.is_empty() {
+            return Ok(moved);
+        }
+        // Links written as [[folder/index]] must follow the page to [[folder]].
+        for page in self.pages.values() {
+            let rewritten = rewrite_links(&page.text, |raw| {
+                let LinkTarget::Page(target) = self.resolve(&page.id, raw) else {
+                    return None;
+                };
+                moved
+                    .iter()
+                    .find(|(old, _)| *old == target)
+                    .map(|(_, new)| {
+                        if raw.trim_end().ends_with(".md") {
+                            format!("{new}.md")
+                        } else {
+                            new.clone()
+                        }
+                    })
+            });
+            if rewritten != page.text {
+                fs::write(&page.path, rewritten)?;
+            }
+        }
+        self.reload()?;
+        Ok(moved)
+    }
+
     /// Delete a page's file and remove folders it leaves empty.
     pub fn delete_page(&mut self, id: &str) -> Result<()> {
         let page = self
@@ -814,6 +873,44 @@ mod tests {
             wiki.promote_ancestors_to_folders("backlog/history")
                 .unwrap()
                 .is_empty()
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_with_only_an_index_becomes_a_page_again() {
+        let dir = std::env::temp_dir().join(format!("wikibits-demote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("backlog")).unwrap();
+        fs::create_dir_all(dir.join("keep")).unwrap();
+        fs::write(
+            dir.join("index.md"),
+            "# Home\n[[backlog/index]] [[backlog]] [[keep]]",
+        )
+        .unwrap();
+        fs::write(dir.join("backlog/index.md"), "# Backlog").unwrap();
+        fs::write(dir.join("keep/index.md"), "# Keep").unwrap();
+        fs::write(dir.join("keep/child.md"), "# Child").unwrap();
+        let mut wiki = Wiki::load(&dir).unwrap();
+
+        let moved = wiki.demote_lonely_folders().unwrap();
+        assert_eq!(
+            moved,
+            vec![("backlog/index".to_string(), "backlog".to_string())]
+        );
+        assert!(dir.join("backlog.md").is_file());
+        assert!(!dir.join("backlog").exists());
+        assert!(
+            dir.join("keep/index.md").is_file(),
+            "folders with other pages stay"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("index.md")).unwrap(),
+            "# Home\n[[backlog]] [[backlog]] [[keep]]"
+        );
+        assert_eq!(
+            wiki.resolve("index", "backlog"),
+            LinkTarget::Page("backlog".into())
         );
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -1527,6 +1527,29 @@ impl App {
         }
     }
 
+    /// Turn folders that only hold an index back into plain pages, keeping the view on the
+    /// same page.
+    fn demote_folders(&mut self) {
+        match self.wiki.demote_lonely_folders() {
+            Ok(moved) if moved.is_empty() => {}
+            Ok(moved) => {
+                self.note_moved_pages(&moved);
+                self.rebuild_tree();
+                if let Some(id) = self.current.clone() {
+                    let (scroll, status) = (self.scroll, std::mem::take(&mut self.status));
+                    self.open(&id, false);
+                    self.scroll = scroll.min(self.max_scroll());
+                    self.status = status;
+                }
+                for (old, new) in &moved {
+                    self.status
+                        .push_str(&format!("; {old} is a plain page again ({new})"));
+                }
+            }
+            Err(err) => self.status = format!("{}; folder cleanup failed: {err:#}", self.status),
+        }
+    }
+
     /// Keep history pointing at pages that became folder indexes.
     fn note_moved_pages(&mut self, moved: &[(String, String)]) {
         for (old, new) in moved {
@@ -1564,6 +1587,7 @@ impl App {
                 }
                 self.status = format!("Deleted {id}");
                 self.clean_images();
+                self.demote_folders();
             }
             Err(err) => self.status = format!("{err:#}"),
         }
@@ -1606,6 +1630,7 @@ impl App {
                     1 => format!("Renamed to {new}; updated the link in 1 page"),
                     n => format!("Renamed to {new}; updated links in {n} pages"),
                 };
+                self.demote_folders();
             }
             Err(err) => self.status = format!("{err:#}"),
         }
