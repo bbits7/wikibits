@@ -426,16 +426,75 @@ impl Wiki {
         Ok(moved)
     }
 
-    /// Delete a page's file and remove folders it leaves empty.
+    /// Move a page's file into `.trash/` (keeping its folder path) and remove folders it
+    /// leaves empty.
     pub fn delete_page(&mut self, id: &str) -> Result<()> {
         let page = self
             .pages
             .get(id)
             .with_context(|| format!("no page {id}"))?;
-        fs::remove_file(&page.path)
-            .with_context(|| format!("cannot delete {}", page.path.display()))?;
+        let mut target = self.root.join(".trash").join(format!("{id}.md"));
+        let mut n = 1;
+        while target.exists() {
+            target = self.root.join(".trash").join(format!("{id}-{n}.md"));
+            n += 1;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&page.path, &target)
+            .with_context(|| format!("cannot move {} to .trash", page.path.display()))?;
         self.remove_empty_folders(page.path.parent());
         self.reload()
+    }
+
+    /// Links that do not reach a page: `(page id, link as written)`, in page order.
+    pub fn broken_links(&self) -> Vec<(String, String)> {
+        self.pages
+            .values()
+            .flat_map(|page| {
+                page.links
+                    .iter()
+                    .filter_map(|raw| match self.resolve(&page.id, raw) {
+                        LinkTarget::Missing(_) => Some((page.id.clone(), raw.clone())),
+                        _ => None,
+                    })
+            })
+            .collect()
+    }
+
+    /// Pages nothing links to, apart from the home page.
+    pub fn orphan_pages(&self) -> Vec<String> {
+        self.pages
+            .keys()
+            .filter(|id| id.as_str() != "index" && self.backlinks_of(id).is_empty())
+            .cloned()
+            .collect()
+    }
+
+    /// Pages by modification time, newest first, with how long ago each changed.
+    pub fn recently_changed(&self, limit: usize) -> Vec<(String, String)> {
+        let now = std::time::SystemTime::now();
+        let mut pages: Vec<(std::time::SystemTime, String)> = self
+            .pages
+            .values()
+            .filter_map(|p| Some((fs::metadata(&p.path).ok()?.modified().ok()?, p.id.clone())))
+            .collect();
+        pages.sort_by(|a, b| b.0.cmp(&a.0));
+        pages
+            .into_iter()
+            .take(limit)
+            .map(|(time, id)| {
+                let secs = now.duration_since(time).map(|d| d.as_secs()).unwrap_or(0);
+                let ago = match secs {
+                    0..=59 => "just now".to_string(),
+                    60..=3599 => format!("{} min ago", secs / 60),
+                    3600..=86399 => format!("{} h ago", secs / 3600),
+                    _ => format!("{} days ago", secs / 86400),
+                };
+                (id, ago)
+            })
+            .collect()
     }
 
     /// Move a page to a new id (`folder/name`) and rewrite the links that point at it in the
@@ -977,7 +1036,17 @@ mod tests {
 
         wiki.delete_page("new/place").unwrap();
         assert!(!dir.join("new").exists());
+        assert!(
+            dir.join(".trash/new/place.md").is_file(),
+            "deleted pages go to .trash"
+        );
         assert!(!wiki.pages.contains_key("new/place"));
+        assert_eq!(
+            wiki.broken_links(),
+            vec![("index".to_string(), "new/place".to_string()); 3]
+        );
+        assert_eq!(wiki.orphan_pages(), vec!["other".to_string()]);
+        assert_eq!(wiki.recently_changed(1).len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 

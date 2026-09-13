@@ -68,6 +68,24 @@ pub struct Complete {
     pub sel: usize,
 }
 
+/// The wiki report (`w`): broken links, orphan pages, recent changes.
+pub struct Report {
+    pub rows: Vec<ReportRow>,
+    pub sel: usize,
+    pub scroll: usize,
+    pub view: Rect,
+}
+
+pub enum ReportRow {
+    Header(String),
+    /// A page to open, with a note shown after it.
+    Page {
+        id: String,
+        note: String,
+    },
+    None,
+}
+
 pub struct Search {
     pub query: String,
     pub hits: Vec<SearchHit>,
@@ -208,6 +226,7 @@ pub struct App {
     pub editor: Option<Editor>,
     pub complete: Option<Complete>,
     pub image_pick: Option<ImagePick>,
+    pub report: Option<Report>,
     /// `[[` context the user dismissed with Esc; do not reopen until it changes.
     complete_dismissed: Option<Pos>,
     /// Page id waiting for the create-page confirmation.
@@ -257,6 +276,7 @@ impl App {
             editor: None,
             complete: None,
             image_pick: None,
+            report: None,
             complete_dismissed: None,
             pending_create: None,
             new_page: String::new(),
@@ -1641,6 +1661,103 @@ impl App {
         }
     }
 
+    // ----- wiki report and copying links ----------------------------------------------
+
+    fn open_report(&mut self) {
+        let mut rows = vec![ReportRow::Header("Broken links".into())];
+        let broken = self.wiki.broken_links();
+        if broken.is_empty() {
+            rows.push(ReportRow::None);
+        }
+        for (id, raw) in broken {
+            rows.push(ReportRow::Page {
+                id,
+                note: format!("→ [[{raw}]]"),
+            });
+        }
+        rows.push(ReportRow::Header(
+            "Orphan pages (nothing links to them)".into(),
+        ));
+        let orphans = self.wiki.orphan_pages();
+        if orphans.is_empty() {
+            rows.push(ReportRow::None);
+        }
+        for id in orphans {
+            rows.push(ReportRow::Page {
+                id,
+                note: String::new(),
+            });
+        }
+        rows.push(ReportRow::Header("Recently changed".into()));
+        for (id, ago) in self.wiki.recently_changed(10) {
+            rows.push(ReportRow::Page { id, note: ago });
+        }
+        let sel = rows
+            .iter()
+            .position(|r| matches!(r, ReportRow::Page { .. }))
+            .unwrap_or(0);
+        self.report = Some(Report {
+            rows,
+            sel,
+            scroll: 0,
+            view: Rect::default(),
+        });
+    }
+
+    fn report_move(&mut self, delta: isize) {
+        let Some(report) = &mut self.report else {
+            return;
+        };
+        let mut i = report.sel as isize;
+        loop {
+            i += delta;
+            if i < 0 || i >= report.rows.len() as isize {
+                return;
+            }
+            if matches!(report.rows[i as usize], ReportRow::Page { .. }) {
+                report.sel = i as usize;
+                return;
+            }
+        }
+    }
+
+    fn report_open(&mut self) {
+        let Some(report) = &self.report else { return };
+        if let Some(ReportRow::Page { id, .. }) = report.rows.get(report.sel) {
+            let id = id.clone();
+            self.report = None;
+            self.open(&id, true);
+        }
+    }
+
+    fn report_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'w') => self.report = None,
+            KeyCode::Char('j') | KeyCode::Down => self.report_move(1),
+            KeyCode::Char('k') | KeyCode::Up => self.report_move(-1),
+            KeyCode::Enter => self.report_open(),
+            _ => {}
+        }
+    }
+
+    /// Put `[[page]]` for the current page on the clipboard.
+    fn copy_link(&mut self) {
+        let Some(id) = &self.current else { return };
+        let link = format!("[[{}]]", wiki::link_target_for(id));
+        let ok = Command::new("wl-copy")
+            .arg(&link)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        self.status = if ok {
+            format!("Copied {link}")
+        } else {
+            "Could not reach the clipboard (wl-copy)".into()
+        };
+    }
+
     fn delete_current(&mut self) {
         let Some(id) = self.current.clone() else {
             return;
@@ -1662,7 +1779,7 @@ impl App {
                     Some(next) => self.open(&next, false),
                     None => self.reload(),
                 }
-                self.status = format!("Deleted {id}");
+                self.status = format!("Moved {id} to .trash");
                 self.clean_images();
                 self.demote_folders();
                 self.commit(&format!("Delete {id}"));
@@ -1947,6 +2064,10 @@ impl App {
             }
             return;
         }
+        if self.report.is_some() {
+            self.report_key(key);
+            return;
+        }
         if self.prompt != Prompt::None {
             self.prompt_key(key);
             return;
@@ -1965,6 +2086,8 @@ impl App {
             }
             KeyCode::Char('D') if self.current.is_some() => self.prompt = Prompt::DeletePage,
             KeyCode::Char('/') => self.start_find(""),
+            KeyCode::Char('w') => self.open_report(),
+            KeyCode::Char('y') => self.copy_link(),
             KeyCode::Char('s') => {
                 self.prompt = Prompt::SearchWiki;
                 self.find = None;
@@ -2095,6 +2218,25 @@ impl App {
         if let Some(editor) = &mut self.editor {
             editor.handle_mouse(mouse);
             self.update_complete();
+            return;
+        }
+        if let Some(report) = &self.report {
+            let view = report.view;
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if view.contains((mouse.column, mouse.row).into()) =>
+                {
+                    let row = (mouse.row - view.y) as usize + report.scroll;
+                    if matches!(report.rows.get(row), Some(ReportRow::Page { .. })) {
+                        self.report.as_mut().unwrap().sel = row;
+                        self.report_open();
+                    }
+                }
+                MouseEventKind::Down(_) => self.report = None,
+                MouseEventKind::ScrollDown => self.report_move(1),
+                MouseEventKind::ScrollUp => self.report_move(-1),
+                _ => {}
+            }
             return;
         }
         if let Some(search) = &self.search {

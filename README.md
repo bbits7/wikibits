@@ -40,7 +40,9 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `/` | find in the page: matches highlight as you type, `Enter`/`Up` step through them |
 | `s` | search the wiki: live list of matching pages, `Enter` opens one at the match |
 | `e` | edit the page in place; `N` creates a new page by path; `Enter` on a missing link offers to create it |
-| `R` / `D` | rename (move) the page, updating links to it everywhere / delete it, after confirmation |
+| `R` / `D` | rename (move) the page, updating links to it everywhere / move it to `.trash/`, after confirmation |
+| `w` | wiki report: broken links, orphan pages and recently changed pages (`Enter` opens one) |
+| `y` | copy a `[[link]]` to the current page to the clipboard |
 | `h` / `l` | collapse / expand a folder |
 | `b`, `Backspace` / `f` | back / forward |
 | `H` | home page |
@@ -69,7 +71,8 @@ links to `backlog` keep working and the tree shows it as a folder. The reverse h
 after a delete or rename, a folder left with nothing but `index.md` becomes the plain page
 again, and links written as `[[backlog/index]]` are rewritten to `[[backlog]]`. `R` renames or moves the page (type
 the new `folder/name`; every `[[link]]` to it in other pages is rewritten, and emptied folders
-are removed) and `D` deletes it after a confirmation that mentions how many pages link to it.
+are removed) and `D` moves it to `.trash/` after a confirmation that mentions how many pages
+link to it.
 
 ## History
 

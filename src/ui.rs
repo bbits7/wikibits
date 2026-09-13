@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui_image::Image;
 use ratatui_image::sliced::SlicedImage;
 
-use crate::app::{App, Focus, Prompt, RelatedRow, TreeKind};
+use crate::app::{App, Focus, Prompt, RelatedRow, ReportRow, TreeKind};
 use crate::markdown::{EXTERNAL_LINK, Item, MISSING_LINK, PAGE_LINK};
 
 const ACCENT: Color = Color::Cyan;
@@ -30,6 +30,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, app, status);
     if app.search.is_some() {
         draw_search(f, app, main);
+    }
+    if app.report.is_some() {
+        draw_report(f, app, main);
     }
     if app.complete.is_some() {
         draw_complete(f, app, area);
@@ -583,6 +586,60 @@ fn draw_complete(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The wiki search results, two lines per page, under the prompt in the status bar.
+/// Broken links, orphan pages and recent changes, one line per row.
+fn draw_report(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(report) = &mut app.report else {
+        return;
+    };
+    let width = (area.width * 2 / 3).clamp(40, 100).min(area.width);
+    let height = (report.rows.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + 1,
+        width,
+        height,
+    };
+    let block = pane("Wiki report  ·  Enter opens  Esc closes", true);
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    report.view = inner;
+    let visible = inner.height as usize;
+    if report.sel < report.scroll {
+        report.scroll = report.sel;
+    } else if visible > 0 && report.sel >= report.scroll + visible {
+        report.scroll = report.sel + 1 - visible;
+    }
+    let lines: Vec<Line> = report
+        .rows
+        .iter()
+        .enumerate()
+        .skip(report.scroll)
+        .take(visible)
+        .map(|(i, row)| match row {
+            ReportRow::Header(h) => Line::styled(
+                format!(" {h}"),
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            ReportRow::None => Line::styled("   (none)", Style::new().add_modifier(Modifier::DIM)),
+            ReportRow::Page { id, note } => {
+                let title = app.wiki.title(id);
+                let style = if i == report.sel {
+                    Style::new().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::new()
+                };
+                Line::from(vec![
+                    Span::styled(format!("   {title}"), style.fg(ACCENT)),
+                    Span::styled(format!("  {id}"), style.add_modifier(Modifier::DIM)),
+                    Span::styled(format!("  {note}"), style),
+                ])
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(search) = &mut app.search else {
         return;
@@ -827,6 +884,11 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("v", "toggle Markdown source / rendered page"),
         ("/", "find in this page (Enter / Up step, Esc closes)"),
         ("s", "search the wiki (Enter opens the page at the match)"),
+        (
+            "w",
+            "wiki report: broken links, orphan pages, recent changes",
+        ),
+        ("y", "copy [[link]] to this page to the clipboard"),
         ("e", "edit this page"),
         ("N", "new page (type folder/name)"),
         ("R", "rename / move this page (links to it are updated)"),
