@@ -839,7 +839,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "suggests pages as you type; Enter / Tab inserts the link",
         ),
         (
-            "Ctrl-I",
+            "Ctrl-P",
             "insert an image from the wiki folder (type to filter)",
         ),
         (

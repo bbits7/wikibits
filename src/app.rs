@@ -51,7 +51,7 @@ pub struct Find {
     pub current: usize,
 }
 
-/// The image picker (Ctrl-I in the editor): images under the wiki root, filtered by typing.
+/// The image picker (Ctrl-P in the editor): images under the wiki root, filtered by typing.
 pub struct ImagePick {
     pub query: String,
     /// Image paths relative to the wiki root.
