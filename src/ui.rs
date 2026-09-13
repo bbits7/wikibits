@@ -397,7 +397,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("h / l", "collapse / expand"),
         ("", ""),
         ("Related column", ""),
-        ("j / k  PgUp / PgDn  g / G", "move, a page at a time, top / bottom"),
+        (
+            "j / k  PgUp / PgDn  g / G",
+            "move, a page at a time, top / bottom",
+        ),
         ("Enter", "jump to the heading / open the page"),
         ("h / l  Space", "fold / unfold a heading"),
         ("", ""),

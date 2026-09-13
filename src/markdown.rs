@@ -115,11 +115,24 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
 }
 
 /// The Markdown source as-is, one text line per line, long lines wrapped at `width` columns.
+/// `#` heading lines (outside fenced code blocks) still feed the outline.
 pub fn render_raw(text: &str, width: u16) -> Rendered {
     use unicode_width::UnicodeWidthChar;
     let width = width.max(10) as usize;
     let mut lines = Vec::new();
+    let mut headings = Vec::new();
+    let mut in_fence = false;
     for source in text.lines() {
+        let trimmed = source.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence && let Some((level, heading)) = source_heading(trimmed) {
+            headings.push(Heading {
+                level,
+                text: heading,
+                line: lines.len(),
+            });
+        }
         let source = source.replace('\t', "    ");
         let mut line = String::new();
         let mut used = 0;
@@ -139,8 +152,19 @@ pub fn render_raw(text: &str, width: u16) -> Rendered {
         links: Vec::new(),
         images: Vec::new(),
         items: Vec::new(),
-        headings: Vec::new(),
+        headings,
     }
+}
+
+/// Level and text of a `# Heading` source line, if it is one.
+fn source_heading(line: &str) -> Option<(u8, String)> {
+    let hashes = line.bytes().take_while(|b| *b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = line[hashes..].strip_prefix(' ')?;
+    let text = rest.trim().trim_end_matches('#').trim();
+    (!text.is_empty()).then(|| (hashes as u8, text.to_string()))
 }
 
 #[derive(Clone)]
@@ -741,6 +765,20 @@ mod tests {
             vec!["# T", "", "- [[a/b]] ", "and *more*", "0123456789", "abc"]
         );
         assert!(r.links.is_empty());
+    }
+
+    #[test]
+    fn raw_view_still_finds_headings() {
+        let r = render_raw(
+            "# Top\n\n```\n# not a heading\n```\n## Two ##\n#nope\n###### Six",
+            80,
+        );
+        let got: Vec<(u8, &str, usize)> = r
+            .headings
+            .iter()
+            .map(|h| (h.level, h.text.as_str(), h.line))
+            .collect();
+        assert_eq!(got, vec![(1, "Top", 0), (2, "Two", 5), (6, "Six", 7)]);
     }
 
     #[test]
