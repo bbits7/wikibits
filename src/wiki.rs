@@ -179,6 +179,11 @@ impl Wiki {
             target = stripped;
         }
         let target = target.trim_matches('/');
+        // Index pages are reached through their folder: [[folder]], or [[/]] for the home
+        // page. A direct [[folder/index]] stays red so it gets fixed.
+        if is_index_id(target) {
+            return LinkTarget::Missing(raw.to_string());
+        }
 
         let from_dir = from.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
         let candidates = [
@@ -335,9 +340,16 @@ impl Wiki {
         // Links written as [[folder/index]] must follow the page to [[folder]].
         for page in self.pages.values() {
             let rewritten = rewrite_links(&page.text, |raw| {
-                let LinkTarget::Page(target) = self.resolve(&page.id, raw) else {
-                    return None;
-                };
+                // Such links are written as [[folder/index]], which the resolver refuses,
+                // so match them by their normalized text.
+                let target = normalize(
+                    raw.split('#')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_end_matches(".md")
+                        .trim_matches('/'),
+                );
                 moved
                     .iter()
                     .find(|(old, _)| *old == target)
@@ -470,6 +482,20 @@ impl Wiki {
         fold_indexes(&mut root);
         sort_tree(&mut root);
         root
+    }
+}
+
+/// Whether an id names an index page (`index` or `folder/index`).
+pub fn is_index_id(id: &str) -> bool {
+    id == "index" || id.ends_with("/index")
+}
+
+/// The link target that reaches a page: the folder for an index page (`/` for the root).
+pub fn link_target_for(id: &str) -> String {
+    match id.strip_suffix("/index") {
+        Some(folder) => folder.to_string(),
+        None if id == "index" => "/".to_string(),
+        None => id.to_string(),
     }
 }
 
@@ -729,6 +755,14 @@ mod tests {
     }
 
     #[test]
+    fn index_pages_are_only_reached_through_their_folder() {
+        assert_eq!(link_target_for("projects/index"), "projects");
+        assert_eq!(link_target_for("index"), "/");
+        assert_eq!(link_target_for("projects/calcbits"), "projects/calcbits");
+        assert!(is_index_id("a/b/index") && is_index_id("index") && !is_index_id("indexes"));
+    }
+
+    #[test]
     fn folder_links_open_the_folder_index() {
         let dir = std::env::temp_dir().join(format!("wikibits-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -753,6 +787,14 @@ mod tests {
         assert_eq!(
             wiki.resolve("projects/index", "calc"),
             LinkTarget::Page("projects/calc".into())
+        );
+        assert_eq!(
+            wiki.resolve("index", "projects/index"),
+            LinkTarget::Missing("projects/index".into())
+        );
+        assert_eq!(
+            wiki.resolve("projects/calc", "index"),
+            LinkTarget::Missing("index".into())
         );
         assert_eq!(wiki.folder_index(""), Some("index".into()));
         assert_eq!(wiki.folder_index("nope"), None);

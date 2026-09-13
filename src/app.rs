@@ -354,6 +354,11 @@ impl App {
                 self.open(&id, true);
             }
             LinkTarget::Missing(raw) => match self.new_page_id(raw) {
+                Some(id) if wiki::is_index_id(&id) => {
+                    let folder = wiki::link_target_for(&id);
+                    self.status =
+                        format!("Index pages are the folder pages: link to [[{folder}]] instead");
+                }
                 Some(id) => {
                     self.pending_create = Some(id);
                     self.prompt = Prompt::CreatePage;
@@ -1412,7 +1417,8 @@ impl App {
                 } else {
                     return None;
                 };
-                Some((rank, p.title.clone(), p.id.clone()))
+                // Index pages are offered as their folder, which is how they are linked.
+                Some((rank, p.title.clone(), wiki::link_target_for(&p.id)))
             })
             .collect();
         hits.sort_by_cached_key(|(rank, title, id)| (*rank, title.to_lowercase(), id.clone()));
@@ -1484,6 +1490,18 @@ impl App {
 
     /// Create `id.md` with a title heading, open it, and start editing.
     fn create_page(&mut self, id: &str) {
+        if wiki::is_index_id(id) {
+            self.status =
+                "Index pages come with their folder: create folder/name, or the folder itself"
+                    .into();
+            return;
+        }
+        // Creating the page for an existing folder means its index page.
+        let id = &if self.wiki.root.join(id).is_dir() {
+            format!("{id}/index")
+        } else {
+            id.to_string()
+        };
         let path = self.wiki.root.join(format!("{id}.md"));
         if path.exists() {
             self.open(id, true);
@@ -1614,6 +1632,11 @@ impl App {
             return;
         };
         if new == old {
+            return;
+        }
+        if wiki::is_index_id(&new) {
+            self.status =
+                "Index pages belong to their folder: rename to the folder path instead".into();
             return;
         }
         match self.wiki.rename_page(&old, &new) {

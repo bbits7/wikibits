@@ -24,7 +24,8 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 - Ordinary Markdown links to `.md` files work too; `http(s)` links open in the browser.
 - A folder's `index.md` stands for the folder: the folder takes its title in the tree,
   opening the folder shows it, and `[[/projects]]` links to it. The root `index.md` is the
-  wiki's home page (`[[/]]`).
+  wiki's home page (`[[/]]`). Index pages are only linked through their folder: a direct
+  `[[projects/index]]` shows as a missing link, and `[[` completion offers the folder path.
 
 ## Keys
 
