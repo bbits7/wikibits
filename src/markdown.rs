@@ -96,6 +96,7 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         blank_after_nested: false,
         image_alt: None,
         skip_text: false,
+        hiding_title: false,
         table: None,
     };
     r.start_line();
@@ -211,6 +212,9 @@ struct Renderer<'a> {
     image_alt: Option<(String, String)>,
     /// Ignore text events (used for wiki links that show the page title instead).
     skip_text: bool,
+    /// The page's leading `# Title` is being read for the outline but not drawn: the
+    /// breadcrumbs already show it.
+    hiding_title: bool,
     table: Option<Table>,
 }
 
@@ -514,7 +518,11 @@ impl Renderer<'_> {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) => {
-                if let Some((_, alt)) = &mut self.image_alt {
+                if self.hiding_title {
+                    if let Some((_, _, heading)) = &mut self.heading {
+                        heading.push_str(&text);
+                    }
+                } else if let Some((_, alt)) = &mut self.image_alt {
                     alt.push_str(&text);
                 } else if self.in_code_block {
                     self.write_code_block(&text);
@@ -573,6 +581,11 @@ impl Renderer<'_> {
     fn start(&mut self, tag: Tag) {
         match tag {
             Tag::Paragraph => self.start_block(),
+            Tag::Heading { level, .. } if level == HeadingLevel::H1 && self.lines.is_empty() => {
+                // The first thing on the page is its title heading: outline only.
+                self.hiding_title = true;
+                self.heading = Some((1, 0, String::new()));
+            }
             Tag::Heading { level, .. } => {
                 self.start_block();
                 let style = match level {
@@ -700,8 +713,12 @@ impl Renderer<'_> {
                         line,
                     });
                 }
-                self.pop_style();
-                self.end_block();
+                if self.hiding_title {
+                    self.hiding_title = false;
+                } else {
+                    self.pop_style();
+                    self.end_block();
+                }
             }
             TagEnd::BlockQuote(_) => {
                 self.finish_line();
@@ -801,9 +818,21 @@ mod tests {
     }
 
     #[test]
+    fn the_title_heading_is_in_the_outline_but_not_drawn() {
+        let r = render("# Title here\n\ntext\n\n# Another h1", 80, 40, &mut Ctx);
+        assert_eq!(text(&r), vec!["text", "", "Another h1"]);
+        let got: Vec<(u8, &str, usize)> = r
+            .headings
+            .iter()
+            .map(|h| (h.level, h.text.as_str(), h.line))
+            .collect();
+        assert_eq!(got, vec![(1, "Title here", 0), (1, "Another h1", 2)]);
+    }
+
+    #[test]
     fn headings_are_collected_with_their_lines() {
         let r = render(
-            "# Top\n\ntext\n\n## Two *words*\n\n### Deep",
+            "intro\n\n# Top\n\ntext\n\n## Two *words*\n\n### Deep",
             80,
             40,
             &mut Ctx,
@@ -815,7 +844,7 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            vec![(1, "Top", 0), (2, "Two words", 4), (3, "Deep", 6)]
+            vec![(1, "Top", 2), (2, "Two words", 6), (3, "Deep", 8)]
         );
     }
 

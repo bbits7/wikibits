@@ -212,13 +212,6 @@ impl App {
         };
     }
 
-    pub fn page_title(&self) -> String {
-        self.current
-            .as_deref()
-            .map(|id| self.wiki.title(id))
-            .unwrap_or_else(|| "wikiBits".to_string())
-    }
-
     // ----- pages -------------------------------------------------------------------------
 
     pub fn open(&mut self, id: &str, record: bool) {

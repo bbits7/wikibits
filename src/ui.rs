@@ -78,10 +78,14 @@ fn pane(title: &str, focused: bool) -> Block<'static> {
     } else {
         Style::new().add_modifier(Modifier::BOLD)
     };
-    Block::bordered()
+    let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(border)
-        .title(Span::styled(format!(" {title} "), title_style))
+        .border_style(border);
+    if title.is_empty() {
+        block
+    } else {
+        block.title(Span::styled(format!(" {title} "), title_style))
+    }
 }
 
 fn selection_style(focused: bool) -> Style {
@@ -155,38 +159,20 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Content;
-    let title = if app.raw {
-        format!("{} (source)", app.page_title())
-    } else {
-        app.page_title()
-    };
-    let block = pane(&title, focused);
+    let block = pane("", focused).title(crumbs_title(app, area, focused));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    if inner.height < 3 {
+    if inner.height < 1 {
         return;
     }
-    let [crumbs_area, rule_area, body] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(1),
-    ])
-    .areas(inner);
     let body = Rect {
-        x: body.x + 1,
-        width: body.width.saturating_sub(2),
-        ..body
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(2),
+        ..inner
     };
-    app.rects.crumbs = crumbs_area;
     app.rects.content = body;
     app.content_height = body.height as usize;
     app.set_size(body.width, body.height);
-
-    draw_crumbs(f, app, crumbs_area);
-    f.render_widget(
-        Paragraph::new("─".repeat(inner.width as usize)).dim(),
-        rule_area,
-    );
 
     let Some(rendered) = &app.rendered else {
         let msg = Paragraph::new(app.status.clone()).dim();
@@ -243,10 +229,12 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn draw_crumbs(f: &mut Frame, app: &mut App, area: Rect) {
-    let mut spans = Vec::new();
+/// The breadcrumbs as the page frame's title, remembering where each crumb lands so a click
+/// on it can be told apart.
+fn crumbs_title(app: &mut App, area: Rect, focused: bool) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
     let mut columns = Vec::new();
-    let mut col = 0u16;
+    let mut col = 1u16;
     let last = app.crumbs.len().saturating_sub(1);
     for (i, crumb) in app.crumbs.iter().enumerate() {
         if i > 0 {
@@ -258,7 +246,11 @@ fn draw_crumbs(f: &mut Frame, app: &mut App, area: Rect) {
         }
         let width = unicode_width::UnicodeWidthStr::width(crumb.label.as_str()) as u16;
         let style = if i == last {
-            Style::new().add_modifier(Modifier::BOLD)
+            let mut s = Style::new().add_modifier(Modifier::BOLD);
+            if focused {
+                s = s.fg(ACCENT);
+            }
+            s
         } else {
             Style::new().fg(ACCENT)
         };
@@ -266,8 +258,22 @@ fn draw_crumbs(f: &mut Frame, app: &mut App, area: Rect) {
         columns.push((col, col + width));
         col += width;
     }
+    if app.raw {
+        spans.push(Span::styled(
+            " (source)",
+            Style::new().add_modifier(Modifier::DIM),
+        ));
+    }
+    spans.push(Span::raw(" "));
     app.crumb_columns = columns;
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    // The title starts right after the top-left corner.
+    app.rects.crumbs = Rect {
+        x: area.x + 1,
+        y: area.y,
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    Line::from(spans)
 }
 
 fn draw_related(f: &mut Frame, app: &mut App, area: Rect) {

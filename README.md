@@ -9,7 +9,7 @@ wikibits -p projects/calcbits
 ```
 
 Three columns: the folder tree on the left (current page highlighted), the rendered
-page in the middle with breadcrumbs above it, and on the right "On this page" (the
+page in the middle with breadcrumbs in its frame, and on the right "On this page" (the
 headings as a foldable outline; `Enter` jumps to one), the links found on the page, and
 the backlinks. Images render inline in terminals that support sixel (foot),
 kitty or iTerm2 graphics. Files are re-read when they change on disk.
