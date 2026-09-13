@@ -247,10 +247,12 @@ impl Renderer<'_> {
 
     fn start_line(&mut self) {
         let mut spans = self.prefixes.clone();
-        if let Some(first) = self.first_prefix.take()
+        // The bullet stays pending until a line carrying it is written, so a loose list item
+        // (whose text starts a new paragraph) still gets it.
+        if let Some(first) = &self.first_prefix
             && let Some(last) = spans.last_mut()
         {
-            *last = first;
+            *last = first.clone();
         }
         self.cur_width = spans.iter().map(|s| s.width()).sum();
         self.cur = spans;
@@ -260,6 +262,7 @@ impl Renderer<'_> {
     fn newline(&mut self) {
         let line = Line::from(std::mem::take(&mut self.cur));
         self.lines.push(line);
+        self.first_prefix = None;
         self.start_line();
     }
 
@@ -450,9 +453,10 @@ impl Renderer<'_> {
 
     /// One line of an image frame, after any list or quote prefix.
     fn frame_line(&mut self, text: &str) {
-        let mut spans = self.prefixes.clone();
-        spans.push(Span::styled(text.to_string(), FRAME));
-        self.lines.push(Line::from(spans));
+        self.start_line();
+        self.cur.push(Span::styled(text.to_string(), FRAME));
+        self.at_line_start = false;
+        self.newline();
     }
 
     fn end_table(&mut self) {
@@ -538,11 +542,17 @@ impl Renderer<'_> {
                 self.end_block();
             }
             Event::TaskListMarker(done) => {
-                let mark = if done { "[x] " } else { "[ ] " };
-                let style = self
-                    .style()
-                    .patch(if done { CODE } else { Style::default() });
-                self.emit(mark, style, None);
+                // The checkbox replaces the list bullet, and the item's continuation lines
+                // indent to match its width.
+                let mark = if done { "✅ " } else { "⬛ " };
+                let indent = " ".repeat(mark.width());
+                if let Some(bullet) = self.prefixes.last_mut() {
+                    *bullet = Span::raw(indent);
+                }
+                self.first_prefix = Some(Span::raw(mark));
+                if self.at_line_start {
+                    self.start_line();
+                }
             }
             Event::Html(html) | Event::InlineHtml(html) => {
                 let style = self.style().patch(DIM);
@@ -820,6 +830,18 @@ mod tests {
         assert_eq!(r.links[2].target, LinkTarget::Missing("nope".into()));
         let (line, span) = r.links[1].spans[0];
         assert_eq!(r.lines[line].spans[span].content, "that");
+    }
+
+    #[test]
+    fn task_items_use_checkbox_bullets() {
+        let r = render("- [ ] open item\n- [x] done item here", 14, 40, &mut Ctx);
+        assert_eq!(text(&r), vec!["⬛ open item", "✅ done item", "   here"]);
+    }
+
+    #[test]
+    fn loose_list_items_keep_their_bullets() {
+        let r = render("- one\n\n- [x] two\n\n  more", 80, 40, &mut Ctx);
+        assert_eq!(text(&r), vec!["• one", "✅ two", "", "   more"]);
     }
 
     #[test]
