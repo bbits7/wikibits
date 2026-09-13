@@ -273,6 +273,31 @@ impl Wiki {
         Ok(moved)
     }
 
+    /// Make room for a page under `id`: every ancestor that is a plain page (`backlog.md`)
+    /// becomes that folder's index (`backlog/index.md`). Returns the ids that moved, old to
+    /// new. Does not reload.
+    pub fn promote_ancestors_to_folders(&self, id: &str) -> Result<Vec<(String, String)>> {
+        let mut moved = Vec::new();
+        let parts: Vec<&str> = id.split('/').collect();
+        for depth in 1..parts.len() {
+            let folder = parts[..depth].join("/");
+            let page_file = self.root.join(format!("{folder}.md"));
+            let index_file = self.root.join(&folder).join("index.md");
+            if page_file.is_file() && !index_file.exists() {
+                fs::create_dir_all(self.root.join(&folder))?;
+                fs::rename(&page_file, &index_file).with_context(|| {
+                    format!(
+                        "cannot move {} to {}",
+                        page_file.display(),
+                        index_file.display()
+                    )
+                })?;
+                moved.push((folder.clone(), format!("{folder}/index")));
+            }
+        }
+        Ok(moved)
+    }
+
     /// Delete a page's file and remove folders it leaves empty.
     pub fn delete_page(&mut self, id: &str) -> Result<()> {
         let page = self
@@ -296,6 +321,7 @@ impl Wiki {
         if target.exists() {
             anyhow::bail!("a page named {new} already exists");
         }
+        self.promote_ancestors_to_folders(new)?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -754,6 +780,41 @@ mod tests {
         wiki.delete_page("new/place").unwrap();
         assert!(!dir.join("new").exists());
         assert!(!wiki.pages.contains_key("new/place"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_page_becomes_a_folder_index_when_it_gets_a_child() {
+        let dir = std::env::temp_dir().join(format!("wikibits-promote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("index.md"),
+            "# Home\n[[backlog]] [[backlog/history]]",
+        )
+        .unwrap();
+        fs::write(dir.join("backlog.md"), "# Backlog").unwrap();
+        let mut wiki = Wiki::load(&dir).unwrap();
+
+        let moved = wiki
+            .promote_ancestors_to_folders("backlog/history")
+            .unwrap();
+        assert_eq!(
+            moved,
+            vec![("backlog".to_string(), "backlog/index".to_string())]
+        );
+        assert!(dir.join("backlog/index.md").is_file());
+        assert!(!dir.join("backlog.md").exists());
+        wiki.reload().unwrap();
+        assert_eq!(
+            wiki.resolve("index", "backlog"),
+            LinkTarget::Page("backlog/index".into())
+        );
+        assert!(
+            wiki.promote_ancestors_to_folders("backlog/history")
+                .unwrap()
+                .is_empty()
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

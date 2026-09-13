@@ -1491,6 +1491,15 @@ impl App {
             return;
         }
         let title = wiki::prettify(id);
+        // A parent that is a plain page becomes its folder's index page first.
+        let moved = match self.wiki.promote_ancestors_to_folders(id) {
+            Ok(moved) => moved,
+            Err(err) => {
+                self.status = format!("Could not create {id}: {err:#}");
+                return;
+            }
+        };
+        self.note_moved_pages(&moved);
         let result = path
             .parent()
             .map(fs::create_dir_all)
@@ -1512,6 +1521,24 @@ impl App {
             editor.cursor_to_end();
         }
         self.status = format!("Created {id}");
+        for (old, new) in &moved {
+            self.status
+                .push_str(&format!("; {old} is now the folder page {new}"));
+        }
+    }
+
+    /// Keep history pointing at pages that became folder indexes.
+    fn note_moved_pages(&mut self, moved: &[(String, String)]) {
+        for (old, new) in moved {
+            for h in self.history.iter_mut().chain(self.future.iter_mut()) {
+                if h == old {
+                    *h = new.clone();
+                }
+            }
+            if self.current.as_deref() == Some(old.as_str()) {
+                self.current = Some(new.clone());
+            }
+        }
     }
 
     fn delete_current(&mut self) {

@@ -61,7 +61,9 @@ saves it as `assets/<page>-<n>.png` and inserts the link. After a save or a page
 images no page mentions any more are moved to `.trash/` in the wiki folder (never deleted
 outright), and the status bar says which. `Ctrl-S` saves and returns to the rendered page; `Esc` returns, asking first
 if there are unsaved changes. `N` creates a page from a `folder/name` path, and following a
-link to a page that does not exist offers to create it. `R` renames or moves the page (type
+link to a page that does not exist offers to create it. Creating `backlog/history` when
+`backlog.md` is a plain page turns it into a folder: the page becomes `backlog/index.md`, so
+links to `backlog` keep working and the tree shows it as a folder. `R` renames or moves the page (type
 the new `folder/name`; every `[[link]]` to it in other pages is rewritten, and emptied folders
 are removed) and `D` deletes it after a confirmation that mentions how many pages link to it.
 
