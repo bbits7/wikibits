@@ -424,6 +424,7 @@ impl App {
                 }
             }
         }
+        self.expanded.insert(String::new());
         walk(&self.wiki.tree(), &mut self.expanded);
     }
 
@@ -464,14 +465,35 @@ impl App {
                 }
             }
         }
+        // The root index page is the root of the tree; everything else hangs under it.
+        let mut nodes = self.wiki.tree();
         let mut rows = Vec::new();
-        walk(&self.wiki.tree(), 0, &self.expanded, &mut rows);
+        let mut depth = 0;
+        if let Some(home) = self.wiki.folder_index("") {
+            nodes.retain(|n| !matches!(n, TreeNode::Page { id, .. } if *id == home));
+            let open = self.expanded.contains("");
+            rows.push(TreeRow {
+                depth: 0,
+                label: self.wiki.title(&home),
+                kind: TreeKind::Folder {
+                    path: String::new(),
+                    expanded: open,
+                    index: Some(home),
+                },
+            });
+            if !open {
+                nodes.clear();
+            }
+            depth = 1;
+        }
+        walk(&nodes, depth, &self.expanded, &mut rows);
         self.tree = rows;
         self.tree_sel = self.tree_sel.min(self.tree.len().saturating_sub(1));
     }
 
     /// Expand the folders above `id` and put the tree cursor on it.
     fn reveal_in_tree(&mut self, id: &str) {
+        self.expanded.insert(String::new());
         let mut folder = String::new();
         for part in id.split('/').take(id.matches('/').count()) {
             if !folder.is_empty() {
@@ -490,6 +512,7 @@ impl App {
     }
 
     pub fn reveal_folder(&mut self, path: &str) {
+        self.expanded.insert(String::new());
         let mut folder = String::new();
         for part in path.split('/') {
             if !folder.is_empty() {
