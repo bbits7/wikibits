@@ -73,19 +73,34 @@ fn pane(title: &str, focused: bool) -> Block<'static> {
     } else {
         Style::new().add_modifier(Modifier::DIM)
     };
-    let title_style = if focused {
-        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().add_modifier(Modifier::BOLD)
-    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(border);
     if title.is_empty() {
         block
     } else {
-        block.title(Span::styled(format!(" {title} "), title_style))
+        block.title(Span::styled(format!(" {title} "), title_style(focused)))
     }
+}
+
+fn title_style(focused: bool) -> Style {
+    if focused {
+        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().add_modifier(Modifier::BOLD)
+    }
+}
+
+/// A column is a title line above a bordered box; returns `(title, box)`.
+fn column(area: Rect) -> (Rect, Rect) {
+    let [title, boxed] = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
+    // Indent the title to line up with the box's contents.
+    let title = Rect {
+        x: title.x + 1,
+        width: title.width.saturating_sub(1),
+        ..title
+    };
+    (title, boxed)
 }
 
 fn selection_style(focused: bool) -> Style {
@@ -110,7 +125,9 @@ fn keep_visible(scroll: &mut usize, sel: usize, height: usize) {
 
 fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Tree;
-    let block = pane("Pages", focused);
+    let (title, area) = column(area);
+    f.render_widget(Paragraph::new("Pages").style(title_style(focused)), title);
+    let block = pane("", focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.rects.tree = inner;
@@ -159,7 +176,9 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Content;
-    let block = pane("", focused).title(crumbs_title(app, area, focused));
+    let (title, area) = column(area);
+    f.render_widget(Paragraph::new(crumbs_title(app, title, focused)), title);
+    let block = pane("", focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height < 1 {
@@ -229,12 +248,12 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// The breadcrumbs as the page frame's title, remembering where each crumb lands so a click
-/// on it can be told apart.
+/// The breadcrumbs for the line above the page box, remembering where each crumb lands so a
+/// click on it can be told apart.
 fn crumbs_title(app: &mut App, area: Rect, focused: bool) -> Line<'static> {
-    let mut spans = vec![Span::raw(" ")];
+    let mut spans = Vec::new();
     let mut columns = Vec::new();
-    let mut col = 1u16;
+    let mut col = 0u16;
     let last = app.crumbs.len().saturating_sub(1);
     for (i, crumb) in app.crumbs.iter().enumerate() {
         if i > 0 {
@@ -264,21 +283,16 @@ fn crumbs_title(app: &mut App, area: Rect, focused: bool) -> Line<'static> {
             Style::new().add_modifier(Modifier::DIM),
         ));
     }
-    spans.push(Span::raw(" "));
     app.crumb_columns = columns;
-    // The title starts right after the top-left corner.
-    app.rects.crumbs = Rect {
-        x: area.x + 1,
-        y: area.y,
-        width: area.width.saturating_sub(2),
-        height: 1,
-    };
+    app.rects.crumbs = area;
     Line::from(spans)
 }
 
 fn draw_related(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Related;
-    let block = pane("Related", focused);
+    let (title, area) = column(area);
+    f.render_widget(Paragraph::new("Related").style(title_style(focused)), title);
+    let block = pane("", focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.rects.related = inner;
