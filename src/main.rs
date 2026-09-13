@@ -161,6 +161,7 @@ fn run(
         if app.should_quit {
             break;
         }
+        let had_overlay = app.popup.is_some() || app.show_help;
         // Handle everything that is already waiting before drawing again, so a burst of
         // mouse drag or wheel events does not cost one redraw each.
         let mut wait = Duration::from_millis(250);
@@ -171,6 +172,12 @@ fn run(
                 _ => {}
             }
             wait = Duration::ZERO;
+        }
+        // An overlay that covered an inline image leaves its pixels behind: the cells under an
+        // image are never rewritten, so the terminal keeps showing what was drawn there last.
+        // Repaint everything when an overlay goes away.
+        if had_overlay && app.popup.is_none() && !app.show_help {
+            terminal.clear()?;
         }
         app.refresh_font_size();
         let mut changed = false;
