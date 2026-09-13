@@ -31,6 +31,10 @@ pub enum Prompt {
     CreatePage,
     /// `N`: type the path of a page to create.
     NewPage,
+    /// `D`: delete the current page? (y / n)
+    DeletePage,
+    /// `R`: type the new path for the current page.
+    RenamePage,
 }
 
 /// A match of the find-in-page query: line and column range.
@@ -198,7 +202,7 @@ pub struct App {
     complete_dismissed: Option<Pos>,
     /// Page id waiting for the create-page confirmation.
     pub pending_create: Option<String>,
-    /// Path typed at the new-page prompt.
+    /// Path typed at the new-page or rename prompt.
     pub new_page: String,
     /// Clear the terminal before the next draw (an image may be left on screen).
     pub repaint: bool,
@@ -1332,6 +1336,63 @@ impl App {
         self.status = format!("Created {id}");
     }
 
+    fn delete_current(&mut self) {
+        let Some(id) = self.current.clone() else {
+            return;
+        };
+        // Land on the folder's index, or the home page, after the page is gone.
+        let folder = id.rsplit_once('/').map(|(f, _)| f).unwrap_or("");
+        match self.wiki.delete_page(&id) {
+            Ok(()) => {
+                self.history.retain(|h| *h != id);
+                self.future.retain(|h| *h != id);
+                self.current = None;
+                self.rebuild_tree();
+                let next = self
+                    .wiki
+                    .folder_index(folder)
+                    .filter(|i| *i != id)
+                    .or_else(|| self.wiki.landing_page());
+                match next {
+                    Some(next) => self.open(&next, false),
+                    None => self.reload(),
+                }
+                self.status = format!("Deleted {id}");
+            }
+            Err(err) => self.status = format!("{err:#}"),
+        }
+    }
+
+    fn rename_current(&mut self, typed: &str) {
+        let Some(old) = self.current.clone() else {
+            return;
+        };
+        let Some(new) = self.new_page_id(typed) else {
+            self.status = "That is not a page path (folder/name)".into();
+            return;
+        };
+        if new == old {
+            return;
+        }
+        match self.wiki.rename_page(&old, &new) {
+            Ok(updated) => {
+                for h in self.history.iter_mut().chain(self.future.iter_mut()) {
+                    if *h == old {
+                        *h = new.clone();
+                    }
+                }
+                self.rebuild_tree();
+                self.open(&new, false);
+                self.status = match updated {
+                    0 => format!("Renamed to {new}"),
+                    1 => format!("Renamed to {new}; updated the link in 1 page"),
+                    n => format!("Renamed to {new}; updated links in {n} pages"),
+                };
+            }
+            Err(err) => self.status = format!("{err:#}"),
+        }
+    }
+
     pub fn handle_paste(&mut self, text: &str) {
         if let Some(editor) = &mut self.editor {
             editor.paste(text);
@@ -1460,7 +1521,8 @@ impl App {
                 self.search = None;
                 self.pending_create = None;
             }
-            (Prompt::CreatePage, KeyCode::Char('y' | 'Y') | KeyCode::Enter) => {
+            // Only an explicit "y" creates: Enter (the key that got here) declines.
+            (Prompt::CreatePage, KeyCode::Char('y' | 'Y')) => {
                 self.prompt = Prompt::None;
                 if let Some(id) = self.pending_create.take() {
                     self.create_page(&id);
@@ -1478,10 +1540,22 @@ impl App {
                     None => self.status = "That is not a page path (folder/name)".into(),
                 }
             }
-            (Prompt::NewPage, KeyCode::Backspace) => {
+            (Prompt::NewPage | Prompt::RenamePage, KeyCode::Backspace) => {
                 self.new_page.pop();
             }
-            (Prompt::NewPage, KeyCode::Char(c)) if !ctrl => self.new_page.push(c),
+            (Prompt::NewPage | Prompt::RenamePage, KeyCode::Char(c)) if !ctrl => {
+                self.new_page.push(c)
+            }
+            (Prompt::RenamePage, KeyCode::Enter) => {
+                self.prompt = Prompt::None;
+                let typed = std::mem::take(&mut self.new_page);
+                self.rename_current(&typed);
+            }
+            (Prompt::DeletePage, KeyCode::Char('y' | 'Y')) => {
+                self.prompt = Prompt::None;
+                self.delete_current();
+            }
+            (Prompt::DeletePage, _) => self.prompt = Prompt::None,
             (Prompt::FindPage, KeyCode::Enter | KeyCode::Down) => self.find_step(1),
             (Prompt::FindPage, KeyCode::Up) => self.find_step(-1),
             (Prompt::FindPage, KeyCode::Char('n')) if ctrl => self.find_step(1),
@@ -1556,6 +1630,11 @@ impl App {
                 self.prompt = Prompt::NewPage;
                 self.new_page.clear();
             }
+            KeyCode::Char('R') if self.current.is_some() => {
+                self.prompt = Prompt::RenamePage;
+                self.new_page = self.current.clone().unwrap_or_default();
+            }
+            KeyCode::Char('D') if self.current.is_some() => self.prompt = Prompt::DeletePage,
             KeyCode::Char('/') => self.start_find(""),
             KeyCode::Char('s') => {
                 self.prompt = Prompt::SearchWiki;

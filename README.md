@@ -38,6 +38,7 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `/` | find in the page: matches highlight as you type, `Enter`/`Up` step through them |
 | `s` | search the wiki: live list of matching pages, `Enter` opens one at the match |
 | `e` | edit the page in place; `N` creates a new page by path; `Enter` on a missing link offers to create it |
+| `R` / `D` | rename (move) the page, updating links to it everywhere / delete it, after confirmation |
 | `h` / `l` | collapse / expand a folder |
 | `b`, `Backspace` / `f` | back / forward |
 | `H` | home page |
@@ -56,7 +57,9 @@ terminal's own paste works too), `Ctrl-Z`/`Ctrl-Y` undo and redo, `Tab` two spac
 lines soft-wrap. Typing `[[` pops up matching pages as you type; `Enter` or `Tab` inserts the
 chosen page and closes the link with `]]`. `Ctrl-S` saves and returns to the rendered page; `Esc` returns, asking first
 if there are unsaved changes. `N` creates a page from a `folder/name` path, and following a
-link to a page that does not exist offers to create it.
+link to a page that does not exist offers to create it. `R` renames or moves the page (type
+the new `folder/name`; every `[[link]]` to it in other pages is rewritten, and emptied folders
+are removed) and `D` deletes it after a confirmation that mentions how many pages link to it.
 
 ## Images
 

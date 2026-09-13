@@ -222,6 +222,81 @@ impl Wiki {
         self.pages.contains_key(&index).then_some(index)
     }
 
+    /// Delete a page's file and remove folders it leaves empty.
+    pub fn delete_page(&mut self, id: &str) -> Result<()> {
+        let page = self
+            .pages
+            .get(id)
+            .with_context(|| format!("no page {id}"))?;
+        fs::remove_file(&page.path)
+            .with_context(|| format!("cannot delete {}", page.path.display()))?;
+        self.remove_empty_folders(page.path.parent());
+        self.reload()
+    }
+
+    /// Move a page to a new id (`folder/name`) and rewrite the links that point at it in the
+    /// other pages. Returns how many pages had links updated.
+    pub fn rename_page(&mut self, old: &str, new: &str) -> Result<usize> {
+        let page = self
+            .pages
+            .get(old)
+            .with_context(|| format!("no page {old}"))?;
+        let target = self.root.join(format!("{new}.md"));
+        if target.exists() {
+            anyhow::bail!("a page named {new} already exists");
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&page.path, &target).with_context(|| {
+            format!(
+                "cannot move {} to {}",
+                page.path.display(),
+                target.display()
+            )
+        })?;
+        self.remove_empty_folders(page.path.parent());
+
+        let mut updated = 0;
+        let linkers: Vec<String> = self.backlinks_of(old).to_vec();
+        for id in linkers {
+            let Some(linker) = self.pages.get(&id) else {
+                continue;
+            };
+            let rewritten = rewrite_links(&linker.text, |raw| {
+                (self.resolve(&id, raw) == LinkTarget::Page(old.to_string())).then(|| {
+                    if raw.trim_end().ends_with(".md") {
+                        format!("{new}.md")
+                    } else {
+                        new.to_string()
+                    }
+                })
+            });
+            if rewritten != linker.text {
+                fs::write(&linker.path, rewritten)?;
+                updated += 1;
+            }
+        }
+        self.reload()?;
+        Ok(updated)
+    }
+
+    /// Remove `folder` and its parents while they are empty, stopping at the root.
+    fn remove_empty_folders(&self, folder: Option<&Path>) {
+        let mut current = folder;
+        while let Some(dir) = current {
+            if dir == self.root
+                || fs::read_dir(dir)
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(true)
+                || fs::remove_dir(dir).is_err()
+            {
+                break;
+            }
+            current = dir.parent();
+        }
+    }
+
     /// Pages whose title or text contains `query`, ignoring case: title matches first, then
     /// by title.
     pub fn search(&self, query: &str) -> Vec<SearchHit> {
@@ -360,6 +435,44 @@ fn normalize(path: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// Replace link targets in `text`: `replace` gets each `[[target]]` / `[[target|label]]`
+/// target and each `[label](target)` target and returns the new target, or `None` to keep it.
+pub fn rewrite_links(text: &str, replace: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(inner) = rest.strip_prefix("[[")
+            && let Some(close) = inner.find("]]")
+        {
+            let body = &inner[..close];
+            let (target, label) = body
+                .split_once('|')
+                .map_or((body, None), |(t, l)| (t, Some(l)));
+            out.push_str("[[");
+            out.push_str(&replace(target).unwrap_or_else(|| target.to_string()));
+            if let Some(label) = label {
+                out.push('|');
+                out.push_str(label);
+            }
+            out.push_str("]]");
+            rest = &inner[close + 2..];
+        } else if let Some(inner) = rest.strip_prefix("](")
+            && let Some(close) = inner.find(')')
+        {
+            let target = &inner[..close];
+            out.push_str("](");
+            out.push_str(&replace(target).unwrap_or_else(|| target.to_string()));
+            out.push(')');
+            rest = &inner[close + 1..];
+        } else {
+            let c = rest.chars().next().unwrap();
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
 }
 
 /// Lower-cased characters, one per input character, so positions line up with the original.
@@ -560,6 +673,36 @@ mod tests {
             contains(&lower_chars("Éclair"), &lower_chars("éCL")),
             Some(0)
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rename_moves_the_file_and_rewrites_links() {
+        let dir = std::env::temp_dir().join(format!("wikibits-rename-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("old")).unwrap();
+        fs::write(
+            dir.join("index.md"),
+            "# Home\n[[old/thing]] [[/old/thing|it]] [a](old/thing.md) [[other]]",
+        )
+        .unwrap();
+        fs::write(dir.join("old/thing.md"), "# Thing").unwrap();
+        fs::write(dir.join("other.md"), "# Other").unwrap();
+        let mut wiki = Wiki::load(&dir).unwrap();
+
+        let updated = wiki.rename_page("old/thing", "new/place").unwrap();
+        assert_eq!(updated, 1);
+        assert!(!dir.join("old").exists(), "the emptied folder is removed");
+        assert!(wiki.pages.contains_key("new/place"));
+        assert_eq!(
+            fs::read_to_string(dir.join("index.md")).unwrap(),
+            "# Home\n[[new/place]] [[new/place|it]] [a](new/place.md) [[other]]"
+        );
+        assert_eq!(wiki.backlinks_of("new/place"), ["index"]);
+
+        wiki.delete_page("new/place").unwrap();
+        assert!(!dir.join("new").exists());
+        assert!(!wiki.pages.contains_key("new/place"));
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -607,20 +607,45 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
                 format!("Create page '{id}'? "),
                 Style::new().fg(Color::Yellow),
             ),
-            Span::raw("y = create and edit   n = no"),
+            Span::raw("y = create and edit   Enter or n = no"),
         ]);
         f.render_widget(Paragraph::new(line), area);
         return;
     }
-    if app.prompt == Prompt::NewPage {
+    if app.prompt == Prompt::DeletePage {
+        let id = app.current.clone().unwrap_or_default();
+        let linkers = app.wiki.backlinks_of(&id).len();
+        let warning = match linkers {
+            0 => String::new(),
+            1 => " (1 page links to it)".to_string(),
+            n => format!(" ({n} pages link to it)"),
+        };
         let line = Line::from(vec![
-            Span::styled("New page (folder/name): ", Style::new().fg(Color::Yellow)),
+            Span::styled(
+                format!("Delete page '{id}'{warning}? "),
+                Style::new().fg(Color::Red),
+            ),
+            Span::raw("y = delete   n = keep"),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if app.prompt == Prompt::NewPage || app.prompt == Prompt::RenamePage {
+        let label = if app.prompt == Prompt::NewPage {
+            "New page (folder/name): "
+        } else {
+            "Rename page to (folder/name): "
+        };
+        let hint = if app.prompt == Prompt::NewPage {
+            "   Enter create  Esc cancel"
+        } else {
+            "   Enter rename (links to it are updated)  Esc cancel"
+        };
+        let line = Line::from(vec![
+            Span::styled(label, Style::new().fg(Color::Yellow)),
             Span::raw(app.new_page.clone()),
             Span::styled("▏", Style::new().fg(ACCENT)),
-            Span::styled(
-                "   Enter create  Esc cancel",
-                Style::new().add_modifier(Modifier::DIM),
-            ),
+            Span::styled(hint, Style::new().add_modifier(Modifier::DIM)),
         ]);
         f.render_widget(Paragraph::new(line), area);
         return;
@@ -724,6 +749,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("s", "search the wiki (Enter opens the page at the match)"),
         ("e", "edit this page"),
         ("N", "new page (type folder/name)"),
+        ("R", "rename / move this page (links to it are updated)"),
+        ("D", "delete this page (asks first)"),
         ("Enter on a red link", "offers to create that page"),
         ("", ""),
         ("Editor", ""),
