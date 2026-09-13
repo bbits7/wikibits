@@ -60,9 +60,6 @@ pub struct ImagePick {
     pub sel: usize,
 }
 
-/// Image file extensions the page renderer can show.
-const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
-
 /// Page suggestions for a `[[` being typed in the editor.
 pub struct Complete {
     /// Position right after the `[[`.
@@ -1203,6 +1200,7 @@ impl App {
             Ok(()) => {
                 self.reload();
                 self.status = format!("Saved {id}");
+                self.clean_images();
             }
             Err(err) => {
                 // Keep the text so nothing is lost.
@@ -1330,7 +1328,7 @@ impl App {
                 e.path()
                     .extension()
                     .and_then(|x| x.to_str())
-                    .is_some_and(|x| IMAGE_EXTENSIONS.contains(&x.to_lowercase().as_str()))
+                    .is_some_and(|x| wiki::IMAGE_EXTENSIONS.contains(&x.to_lowercase().as_str()))
             })
             .filter_map(|e| {
                 e.path()
@@ -1549,8 +1547,21 @@ impl App {
                     None => self.reload(),
                 }
                 self.status = format!("Deleted {id}");
+                self.clean_images();
             }
             Err(err) => self.status = format!("{err:#}"),
+        }
+    }
+
+    /// Move images no page mentions any more into `.trash/`, and say so.
+    fn clean_images(&mut self) {
+        match self.wiki.trash_unreferenced_images() {
+            Ok(moved) if moved.is_empty() => {}
+            Ok(moved) => {
+                let list = moved.join(", ");
+                self.status = format!("{}; moved unused images to .trash: {list}", self.status);
+            }
+            Err(err) => self.status = format!("{}; image cleanup failed: {err:#}", self.status),
         }
     }
 

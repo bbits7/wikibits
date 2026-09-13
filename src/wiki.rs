@@ -55,6 +55,9 @@ pub enum TreeNode {
     },
 }
 
+/// Image file extensions the page renderer can show.
+pub const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
 pub struct Wiki {
     pub root: PathBuf,
     pub pages: BTreeMap<String, Page>,
@@ -220,6 +223,54 @@ impl Wiki {
     pub fn folder_index(&self, folder: &str) -> Option<String> {
         let index = index_id(folder);
         self.pages.contains_key(&index).then_some(index)
+    }
+
+    /// Image files under the root (hidden folders excluded) whose file name no page mentions.
+    pub fn unreferenced_images(&self) -> Vec<PathBuf> {
+        let texts: Vec<&str> = self.pages.values().map(|p| p.text.as_str()).collect();
+        WalkDir::new(&self.root)
+            .into_iter()
+            .filter_entry(|e| !is_hidden(e.file_name()))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|x| IMAGE_EXTENSIONS.contains(&x.to_lowercase().as_str()))
+            })
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy();
+                !texts.iter().any(|t| t.contains(name.as_ref()))
+            })
+            .map(|e| e.into_path())
+            .collect()
+    }
+
+    /// Move the images no page mentions into `.trash/` under the root, where the wiki does
+    /// not look. Returns the moved file names.
+    pub fn trash_unreferenced_images(&self) -> Result<Vec<String>> {
+        let unused = self.unreferenced_images();
+        if unused.is_empty() {
+            return Ok(Vec::new());
+        }
+        let trash = self.root.join(".trash");
+        fs::create_dir_all(&trash)?;
+        let mut moved = Vec::new();
+        for path in unused {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let mut target = trash.join(&name);
+            let mut n = 1;
+            while target.exists() {
+                target = trash.join(format!("{n}-{name}"));
+                n += 1;
+            }
+            fs::rename(&path, &target)
+                .with_context(|| format!("cannot move {} to .trash", path.display()))?;
+            self.remove_empty_folders(path.parent());
+            moved.push(name);
+        }
+        Ok(moved)
     }
 
     /// Delete a page's file and remove folders it leaves empty.
@@ -703,6 +754,27 @@ mod tests {
         wiki.delete_page("new/place").unwrap();
         assert!(!dir.join("new").exists());
         assert!(!wiki.pages.contains_key("new/place"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unreferenced_images_go_to_trash() {
+        let dir = std::env::temp_dir().join(format!("wikibits-images-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::create_dir_all(dir.join("old")).unwrap();
+        fs::write(dir.join("index.md"), "# Home\n![used](assets/used.png)").unwrap();
+        fs::write(dir.join("assets/used.png"), b"x").unwrap();
+        fs::write(dir.join("assets/unused.png"), b"x").unwrap();
+        fs::write(dir.join("old/stale.jpg"), b"x").unwrap();
+        let wiki = Wiki::load(&dir).unwrap();
+        let mut moved = wiki.trash_unreferenced_images().unwrap();
+        moved.sort();
+        assert_eq!(moved, vec!["stale.jpg", "unused.png"]);
+        assert!(dir.join("assets/used.png").exists());
+        assert!(dir.join(".trash/unused.png").exists());
+        assert!(!dir.join("old").exists(), "an emptied folder is removed");
+        assert!(wiki.trash_unreferenced_images().unwrap().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 

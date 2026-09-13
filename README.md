@@ -57,7 +57,9 @@ terminal's own paste works too), `Ctrl-Z`/`Ctrl-Y` undo and redo, `Tab` two spac
 lines soft-wrap. Typing `[[` pops up matching pages as you type; `Enter` or `Tab` inserts the
 chosen page and closes the link with `]]`. `Ctrl-P` lists the images in the wiki folder
 (type to filter) and inserts `![name](path)` for the chosen one; pasting an image with `Ctrl-V`
-saves it as `assets/<page>-<n>.png` and inserts the link. `Ctrl-S` saves and returns to the rendered page; `Esc` returns, asking first
+saves it as `assets/<page>-<n>.png` and inserts the link. After a save or a page delete,
+images no page mentions any more are moved to `.trash/` in the wiki folder (never deleted
+outright), and the status bar says which. `Ctrl-S` saves and returns to the rendered page; `Esc` returns, asking first
 if there are unsaved changes. `N` creates a page from a `folder/name` path, and following a
 link to a page that does not exist offers to create it. `R` renames or moves the page (type
 the new `folder/name`; every `[[link]]` to it in other pages is rewritten, and emptied folders
