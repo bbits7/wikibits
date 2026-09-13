@@ -262,7 +262,9 @@ impl App {
             new_page: String::new(),
             repaint: false,
         };
-        app.expand_all();
+        // Only the root is open at first: top-level folders show collapsed, and opening a
+        // page expands the folders above it (see `reveal_in_tree`).
+        app.expanded.insert(String::new());
         app.rebuild_tree();
         let first = start
             .and_then(|p| match app.wiki.resolve("", &p) {
@@ -714,19 +716,6 @@ impl App {
     }
 
     // ----- tree ------------------------------------------------------------------------
-
-    fn expand_all(&mut self) {
-        fn walk(nodes: &[TreeNode], out: &mut HashSet<String>) {
-            for node in nodes {
-                if let TreeNode::Folder { path, children, .. } = node {
-                    out.insert(path.clone());
-                    walk(children, out);
-                }
-            }
-        }
-        self.expanded.insert(String::new());
-        walk(&self.wiki.tree(), &mut self.expanded);
-    }
 
     fn rebuild_tree(&mut self) {
         fn walk(
