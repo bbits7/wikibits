@@ -5,6 +5,11 @@ edition = "2024"
 description = "A terminal wiki built on plain Markdown files"
 license = "MIT"
 
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

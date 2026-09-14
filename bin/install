@@ -1,17 +1,28 @@
 #!/usr/bin/env sh
 set -eu
 
-# Build wikiBits in release mode and install it for the current user: the binary in
-# ~/.local/bin, plus a launcher entry and icon so it shows up in the app launcher.
+# Install wikiBits for the current user: the binary in ~/.local/bin, plus a launcher entry
+# and icon so it shows up in the app launcher. Works from a source checkout (builds with
+# cargo) and from a release tarball (which ships the binary next to this script).
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
 
-cargo build --release --manifest-path "$ROOT/Cargo.toml"
-install -Dm755 "$ROOT/target/release/wikibits" "$PREFIX/bin/wikibits"
+if [ -x "$ROOT/wikibits" ]; then
+    BINARY="$ROOT/wikibits"
+else
+    cargo build --release --manifest-path "$ROOT/Cargo.toml"
+    BINARY="$ROOT/target/release/wikibits"
+fi
+
+install -Dm755 "$BINARY" "$PREFIX/bin/wikibits"
 install -Dm644 "$ROOT/data/wikibits.svg" "$PREFIX/share/icons/hicolor/scalable/apps/wikibits.svg"
 mkdir -p "$PREFIX/share/applications"
 sed "s|@BINDIR@|$PREFIX/bin|" "$ROOT/data/wikibits.desktop" \
     > "$PREFIX/share/applications/wikibits.desktop"
 
 echo "Installed wikibits to $PREFIX (binary, launcher entry, icon)"
+case ":$PATH:" in
+    *":$PREFIX/bin:"*) ;;
+    *) echo "Note: $PREFIX/bin is not on your PATH." ;;
+esac

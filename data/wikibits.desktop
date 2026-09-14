@@ -4,9 +4,9 @@ Type=Application
 Name=wikiBits
 GenericName=Wiki
 Comment=Terminal wiki over the Markdown files in ~/Wiki
-Exec=omarchy-launch-tui --app-id=wikibits @BINDIR@/wikibits
+Exec=@BINDIR@/wikibits
 Icon=wikibits
-Terminal=false
+Terminal=true
 Categories=Office;
 Keywords=wiki;notes;markdown;knowledge;
 StartupWMClass=wikibits

@@ -38,16 +38,64 @@ struct Cli {
     probe: bool,
 }
 
+/// The starter wiki, offered when the default folder does not exist yet.
+const STARTER: &[(&str, &[u8])] = &[
+    ("index.md", include_bytes!("../examples/wiki/index.md")),
+    (
+        "getting-started.md",
+        include_bytes!("../examples/wiki/getting-started.md"),
+    ),
+    (
+        "notes/index.md",
+        include_bytes!("../examples/wiki/notes/index.md"),
+    ),
+    (
+        "notes/markdown-cheatsheet.md",
+        include_bytes!("../examples/wiki/notes/markdown-cheatsheet.md"),
+    ),
+    (
+        "assets/calcbits.png",
+        include_bytes!("../examples/wiki/assets/calcbits.png"),
+    ),
+];
+
+/// Ask on the plain terminal whether to create `dir` from the starter wiki; true if created.
+fn offer_starter_wiki(dir: &std::path::Path) -> Result<bool> {
+    use std::io::{BufRead, Write};
+    print!(
+        "{} does not exist yet. Create it with a few starter pages? [y/N] ",
+        dir.display()
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        return Ok(false);
+    }
+    for (name, bytes) in STARTER {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, bytes)?;
+    }
+    println!("Created {} with {} files.", dir.display(), STARTER.len());
+    Ok(true)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.probe {
         return probe();
     }
-    let dir = match cli.dir {
-        Some(dir) => dir,
-        None => PathBuf::from(std::env::var("HOME").context("HOME is not set")?).join("Wiki"),
+    let (dir, is_default) = match cli.dir {
+        Some(dir) => (dir, false),
+        None => (
+            PathBuf::from(std::env::var("HOME").context("HOME is not set")?).join("Wiki"),
+            true,
+        ),
     };
-    if !dir.is_dir() {
+    if !dir.is_dir() && !(is_default && offer_starter_wiki(&dir)?) {
         bail!(
             "{} is not a folder. Create it, or pass the folder holding your .md files.",
             dir.display()

@@ -95,11 +95,18 @@ with `n`/`p` (or click it) and press `Enter` to see it at full size in a pop-up,
 size, `wikibits --probe` prints what the terminal reports about protocol and cell size. Inside
 tmux, images are drawn with block characters.
 
-## Build and install
+## Install
 
-Needs a Rust toolchain (`rustup default stable`).
+**Prebuilt (Linux x86_64):** download `wikibits-<version>-x86_64-linux.tar.gz` from the
+[releases page](https://github.com/bbits7/wikibits/releases), unpack it and run
+`bin/install`. It puts the (statically linked) binary in `~/.local/bin` and adds a launcher
+entry and icon. Then run `wikibits`: if `~/Wiki` does not exist it offers to create it with a
+few starter pages.
 
-```sh
-bin/install     # cargo build --release, then copies the binary to ~/.local/bin
-cargo test      # unit tests for the index and the Markdown renderer
-```
+**With Rust:** `cargo install --git https://github.com/bbits7/wikibits`, or clone and run
+`bin/install` (builds with `cargo build --release` first). `cargo test` runs the unit tests.
+
+**What it expects:** a terminal that draws images with the sixel or kitty protocol for
+inline pictures (foot, kitty, WezTerm, Ghostty…; others get block characters), `wl-clipboard`
+(`wl-copy` / `wl-paste`) for copy and paste on Wayland, `xdg-open` for web links, and `git`
+if you want the automatic history. Built and tested on Omarchy (Arch Linux, Hyprland).
