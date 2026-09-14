@@ -72,7 +72,10 @@ c --> end
 d --> end
 ```
 
-Each line of shapes is a row, top to bottom; shapes on one line share the row. `id[label]`
+Each line of shapes is a row, top to bottom; shapes on one line share the row. The fullest
+row sets the number of columns, each column is as wide as its widest shape, and every shape
+is centred in its column (a row with fewer shapes spreads them over the columns), so shapes
+stacked in a column line up. `id[label]`
 is a box, `id(label)` a rounded pill, `id<label>` a diamond. Lines join ids with `-->`,
 `<--`, `<->` or `---`, can be chained, and take a label after `|`. Lines between neighbouring
 rows go straight down (fanning out and merging as needed); lines that skip rows run down a

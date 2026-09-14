@@ -227,18 +227,46 @@ fn layout(d: &mut Diagram) {
         };
         node.h = 3;
     }
-    // Rows are centred on the widest one.
-    let widths: Vec<usize> = d
-        .rows
-        .iter()
-        .map(|row| row.iter().map(|&n| d.nodes[n].w).sum::<usize>() + ROW_GAP * (row.len() - 1))
-        .collect();
-    let content = widths.iter().copied().max().unwrap_or(0);
-    for (r, row) in d.rows.iter().enumerate() {
-        let mut x = (content - widths[r]) / 2;
-        for &n in row {
-            d.nodes[n].x = x;
-            x += d.nodes[n].w + ROW_GAP;
+    // A grid of columns: as many as the fullest row has shapes. A row with fewer shapes
+    // spreads them over the columns (one shape spans them all), and every shape is centred
+    // in the columns it spans, so shapes stacked in a column line up.
+    let columns = d.rows.iter().map(Vec::len).max().unwrap_or(1);
+    let span = |row_len: usize, i: usize| (i * columns / row_len, (i + 1) * columns / row_len);
+    let mut widths = vec![0usize; columns];
+    // Single-column shapes set the column widths; wider spanning shapes stretch their span.
+    for row in &d.rows {
+        for (i, &n) in row.iter().enumerate() {
+            let (c0, c1) = span(row.len(), i);
+            if c1 - c0 == 1 {
+                widths[c0] = widths[c0].max(d.nodes[n].w);
+            }
+        }
+    }
+    for row in &d.rows {
+        for (i, &n) in row.iter().enumerate() {
+            let (c0, c1) = span(row.len(), i);
+            let have = widths[c0..c1].iter().sum::<usize>() + ROW_GAP * (c1 - c0 - 1);
+            if d.nodes[n].w > have {
+                let extra = d.nodes[n].w - have;
+                let each = extra.div_ceil(c1 - c0);
+                for w in &mut widths[c0..c1] {
+                    *w += each;
+                }
+            }
+        }
+    }
+    let mut starts = Vec::with_capacity(columns);
+    let mut x = 0;
+    for w in &widths {
+        starts.push(x);
+        x += w + ROW_GAP;
+    }
+    for row in &d.rows {
+        for (i, &n) in row.iter().enumerate() {
+            let (c0, c1) = span(row.len(), i);
+            let left = starts[c0];
+            let total = widths[c0..c1].iter().sum::<usize>() + ROW_GAP * (c1 - c0 - 1);
+            d.nodes[n].x = left + (total - d.nodes[n].w) / 2;
         }
     }
     // Vertical positions: each gap between rows is as tall as its edges need.
@@ -757,6 +785,26 @@ mod tests {
         );
         assert!(render("hello").unwrap_err().contains("is not id[label]"));
         assert!(render("a[A], b[B]\na -- b").is_err());
+    }
+
+    #[test]
+    fn shapes_in_a_column_line_up() {
+        let out = render("a[A], b[A much longer label]\nc[C], d[D]\na --> c\nb --> d").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(
+            !text.contains('┬') && !text.contains('┴'),
+            "straight lines, no buses"
+        );
+        assert_eq!(text.matches('▼').count(), 2);
+        // The lone shape of a one-shape row is centred over both columns.
+        let out = render("a[A], b[B]\nc[Centre]\na --> c\nb --> c").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(
+            text.contains("└") && text.contains("┘") && text.contains("┬"),
+            "merge bus"
+        );
     }
 
     #[test]
