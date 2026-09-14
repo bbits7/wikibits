@@ -103,6 +103,7 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         items: Vec::new(),
         headings: Vec::new(),
         heading: None,
+        line_fill: None,
         tasks: Vec::new(),
         lists: Vec::new(),
         in_code_block: false,
@@ -217,6 +218,8 @@ struct Renderer<'a> {
     items: Vec<Item>,
     headings: Vec<Heading>,
     tasks: Vec<TaskSlot>,
+    /// Style to pad the rest of each line with while set (heading bands and underlines).
+    line_fill: Option<Style>,
     /// The heading being written: level, first line, and its text so far.
     heading: Option<(u8, usize, String)>,
     /// `None` for bullet lists, `Some(next number)` for ordered ones.
@@ -283,6 +286,12 @@ impl Renderer<'_> {
     }
 
     fn newline(&mut self) {
+        if let Some(fill) = self.line_fill
+            && self.cur_width < self.width
+        {
+            self.cur
+                .push(Span::styled(" ".repeat(self.width - self.cur_width), fill));
+        }
         let line = Line::from(std::mem::take(&mut self.cur));
         self.lines.push(line);
         self.first_prefix = None;
@@ -610,24 +619,25 @@ impl Renderer<'_> {
             }
             Tag::Heading { level, .. } => {
                 self.start_block();
+                // `#` and `##` are a band in the theme colour across the whole line (reverse
+                // video, so the text takes the terminal's background colour); deeper headings
+                // are underlined across the whole line.
                 let style = match level {
-                    HeadingLevel::H1 => Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    HeadingLevel::H2 => Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-                    HeadingLevel::H3 => Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
-                    _ => Style::new().add_modifier(Modifier::BOLD),
+                    HeadingLevel::H1 => Style::new()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                    HeadingLevel::H2 => Style::new()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                    HeadingLevel::H3 => Style::new()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    _ => Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 };
                 self.push_style(style);
-                let marker = match level {
-                    HeadingLevel::H1 => "",
-                    HeadingLevel::H2 => "## ",
-                    HeadingLevel::H3 => "### ",
-                    HeadingLevel::H4 => "#### ",
-                    HeadingLevel::H5 => "##### ",
-                    HeadingLevel::H6 => "###### ",
-                };
-                if !marker.is_empty() {
-                    let style = self.style().patch(DIM);
-                    self.emit(marker, style, None);
+                self.line_fill = Some(style);
+                if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+                    self.emit(" ", style, None);
                 }
                 let number = match level {
                     HeadingLevel::H1 => 1,
@@ -738,6 +748,8 @@ impl Renderer<'_> {
                 if self.hiding_title {
                     self.hiding_title = false;
                 } else {
+                    self.finish_line();
+                    self.line_fill = None;
                     self.pop_style();
                     self.end_block();
                 }
@@ -842,7 +854,9 @@ mod tests {
     #[test]
     fn the_title_heading_is_in_the_outline_but_not_drawn() {
         let r = render("# Title here\n\ntext\n\n# Another h1", 80, 40, &mut Ctx);
-        assert_eq!(text(&r), vec!["text", "", "Another h1"]);
+        assert_eq!(text(&r)[..2], ["text", ""]);
+        assert_eq!(text(&r)[2].trim(), "Another h1");
+        assert_eq!(r.lines[2].width(), 80, "a heading band spans the line");
         let got: Vec<(u8, &str, usize)> = r
             .headings
             .iter()
