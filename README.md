@@ -53,6 +53,31 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 
 The mouse works too: click to open, wheel to scroll, right-click to go back.
 
+## Diagrams
+
+A ```diaBits block draws a flowchart with box-drawing characters — no external tools:
+
+```diaBits
+diaType: flowchart
+start(Start)
+a[Go to the pet store]
+b<Cats or dogs?>
+c[Buy a cat], d[Buy a dog]
+end(End)
+
+start --> a --> b
+b --> c | Cats
+b --> d | Dogs
+c --> end
+d --> end
+```
+
+Each line of shapes is a row, top to bottom; shapes on one line share the row. `id[label]`
+is a box, `id(label)` a rounded pill, `id<label>` a diamond. Lines join ids with `-->`,
+`<--`, `<->` or `---`, can be chained, and take a label after `|`. Lines between neighbouring
+rows go straight down (fanning out and merging as needed); lines that skip rows run down a
+channel on the right. A block that does not parse shows its source with the problem.
+
 ## Editing
 
 `e` opens the page's Markdown in the middle pane as a plain editor: type to insert, arrows,

@@ -104,6 +104,7 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         headings: Vec::new(),
         heading: None,
         line_fill: None,
+        diagram: None,
         tasks: Vec::new(),
         lists: Vec::new(),
         in_code_block: false,
@@ -220,6 +221,8 @@ struct Renderer<'a> {
     tasks: Vec<TaskSlot>,
     /// Style to pad the rest of each line with while set (heading bands and underlines).
     line_fill: Option<Style>,
+    /// Source of a ```diaBits block being collected.
+    diagram: Option<String>,
     /// The heading being written: level, first line, and its text so far.
     heading: Option<(u8, usize, String)>,
     /// `None` for bullet lists, `Some(next number)` for ordered ones.
@@ -248,6 +251,8 @@ pub const EXTERNAL_LINK: Style = Style::new()
     .add_modifier(Modifier::UNDERLINED);
 const CODE: Style = Style::new().fg(Color::Magenta);
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+/// Lines and shapes of a diaBits diagram.
+const DIAGRAM: Style = Style::new().fg(Color::Cyan);
 /// The frame around an image; the UI recolors it when the image is selected.
 pub const FRAME: Style = Style::new().add_modifier(Modifier::DIM);
 
@@ -483,6 +488,29 @@ impl Renderer<'_> {
         }
     }
 
+    /// Draw a diaBits block, or show its source with the problem when it does not parse.
+    fn end_diagram(&mut self, source: &str) {
+        self.finish_line();
+        match crate::diabits::render(source) {
+            Ok(lines) => {
+                for line in lines {
+                    self.emit(&line, DIAGRAM, None);
+                    self.newline();
+                }
+            }
+            Err(problem) => {
+                let style = self.style().patch(CODE);
+                for line in source.lines() {
+                    self.emit(line, style, None);
+                    self.newline();
+                }
+                self.emit(&format!("diaBits: {problem}"), MISSING_LINK, None);
+                self.newline();
+            }
+        }
+        self.need_blank = true;
+    }
+
     /// One line of an image frame, after any list or quote prefix.
     fn frame_line(&mut self, text: &str) {
         self.start_line();
@@ -549,6 +577,8 @@ impl Renderer<'_> {
                     }
                 } else if let Some((_, alt)) = &mut self.image_alt {
                     alt.push_str(&text);
+                } else if let Some(diagram) = &mut self.diagram {
+                    diagram.push_str(&text);
                 } else if self.in_code_block {
                     self.write_code_block(&text);
                 } else if !self.skip_text {
@@ -657,6 +687,13 @@ impl Renderer<'_> {
             }
             Tag::CodeBlock(kind) => {
                 self.start_block();
+                if let CodeBlockKind::Fenced(lang) = &kind
+                    && lang.trim().eq_ignore_ascii_case("diabits")
+                {
+                    // Drawn when the block closes; see `end_diagram`.
+                    self.diagram = Some(String::new());
+                    return;
+                }
                 if let CodeBlockKind::Fenced(lang) = kind
                     && !lang.is_empty()
                 {
@@ -761,6 +798,10 @@ impl Renderer<'_> {
                 self.start_line();
             }
             TagEnd::CodeBlock => {
+                if let Some(source) = self.diagram.take() {
+                    self.end_diagram(&source);
+                    return;
+                }
                 self.finish_line();
                 self.in_code_block = false;
                 self.prefixes.pop();
@@ -881,6 +922,29 @@ mod tests {
         assert_eq!(
             got,
             vec![(1, "Top", 2), (2, "Two words", 6), (3, "Deep", 8)]
+        );
+    }
+
+    #[test]
+    fn diabits_blocks_are_drawn() {
+        let r = render(
+            "before\n\n```diaBits\na[One]\nb[Two]\na --> b\n```\n\nafter",
+            80,
+            40,
+            &mut Ctx,
+        );
+        let lines = text(&r);
+        assert_eq!(lines[0], "before");
+        assert_eq!(lines[2].trim(), "┌─────┐");
+        assert_eq!(lines[5].trim(), "│");
+        assert_eq!(lines[6].trim(), "▼");
+        assert_eq!(lines.last().unwrap(), "after");
+
+        let r = render("```diabits\na[One]\na --> nope\n```", 80, 40, &mut Ctx);
+        assert!(
+            text(&r)
+                .iter()
+                .any(|l| l.starts_with("diaBits: line 2: no shape named 'nope'"))
         );
     }
 

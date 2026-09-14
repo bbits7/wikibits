@@ -1,6 +1,7 @@
 //! wikiBits: a terminal wiki built on a folder of plain Markdown files.
 
 mod app;
+mod diabits;
 mod editor;
 mod markdown;
 mod ui;
