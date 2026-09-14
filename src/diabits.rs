@@ -80,6 +80,18 @@ struct Diagram {
 /// Columns between shapes on the same row.
 const ROW_GAP: usize = 4;
 
+/// Whether an edge is routed down a channel on the right instead of between its rows:
+/// edges that skip rows, edges between non-neighbouring shapes of one row, and edges that
+/// point back up (or both ways) without lining up, which would be ambiguous on a shared bus.
+fn goes_sideways(d: &Diagram, e: usize) -> bool {
+    let (u, l, au, _) = d.edges[e].vertical(&d.nodes);
+    let (ru, rl) = (d.nodes[u].row, d.nodes[l].row);
+    if ru == rl {
+        return !neighbours(d, u, l);
+    }
+    rl > ru + 1 || (au && d.nodes[u].center() != d.nodes[l].center())
+}
+
 /// Render a diaBits block to text lines, or explain what is wrong with it.
 pub fn render(source: &str) -> Result<Vec<String>, String> {
     let mut diagram = parse(source)?;
@@ -266,7 +278,10 @@ fn layout(d: &mut Diagram) {
             let (c0, c1) = span(row.len(), i);
             let left = starts[c0];
             let total = widths[c0..c1].iter().sum::<usize>() + ROW_GAP * (c1 - c0 - 1);
-            d.nodes[n].x = left + (total - d.nodes[n].w) / 2;
+            // Place by centre, not by left edge, so shapes of different widths in one
+            // column share the same centre column exactly.
+            let centre = left + total / 2;
+            d.nodes[n].x = centre - d.nodes[n].w / 2;
         }
     }
     // Vertical positions: each gap between rows is as tall as its edges need.
@@ -304,7 +319,7 @@ fn region_plan(d: &Diagram, r: usize) -> RegionPlan {
     let edges: Vec<usize> = (0..d.edges.len())
         .filter(|&e| {
             let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
-            d.nodes[u].row == r && d.nodes[l].row == r + 1
+            d.nodes[u].row == r && d.nodes[l].row == r + 1 && !goes_sideways(d, e)
         })
         .collect();
     // Union-find over the nodes the edges touch, so fan-outs and merges share a bus.
@@ -462,11 +477,7 @@ fn draw(d: &Diagram) -> Vec<String> {
     // Edges that skip rows, or join non-neighbouring shapes of a row, use channels on the
     // right; each gets its own column.
     let side: Vec<usize> = (0..d.edges.len())
-        .filter(|&e| {
-            let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
-            let (ru, rl) = (d.nodes[u].row, d.nodes[l].row);
-            rl > ru + 1 || (ru == rl && !neighbours(d, u, l))
-        })
+        .filter(|&e| goes_sideways(d, e))
         .collect();
     let label_room = side
         .iter()
@@ -804,6 +815,37 @@ mod tests {
         assert!(
             text.contains("└") && text.contains("┘") && text.contains("┬"),
             "merge bus"
+        );
+    }
+
+    #[test]
+    fn single_shapes_share_one_centre_and_back_edges_go_sideways() {
+        let out = render("a[X], b[Y]\nc[Some odd]\nd[Even ln]\nz(End)\nc --> d --> z").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(
+            !text.contains('┬') && !text.contains('┴'),
+            "no bus between centred shapes"
+        );
+        let arrow_columns: Vec<usize> = out
+            .iter()
+            .filter_map(|l| l.chars().position(|c| c == '▼'))
+            .collect();
+        assert_eq!(
+            arrow_columns,
+            vec![arrow_columns[0]; 2],
+            "arrows share one column"
+        );
+
+        let out = render("a[A], b[B]\nc<Choice?>\na --> c\nc --> b | back").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(text.contains("◀"), "the back edge enters B from the side");
+        assert!(text.contains("│ back") || text.contains("back"));
+        assert_eq!(
+            text.matches('▲').count(),
+            0,
+            "no upward head on a shared bus"
         );
     }
 
