@@ -245,6 +245,30 @@ fn layout(d: &mut Diagram) {
     let columns = d.rows.iter().map(Vec::len).max().unwrap_or(1);
     let span = |row_len: usize, i: usize| (i * columns / row_len, (i + 1) * columns / row_len);
     let mut widths = vec![0usize; columns];
+    // The gap between two columns widens to fit the label of a line drawn across it.
+    let mut gaps = vec![ROW_GAP; columns.saturating_sub(1)];
+    for e in &d.edges {
+        let (a, b) = (&d.nodes[e.from], &d.nodes[e.to]);
+        let Some(label) = &e.label else { continue };
+        if a.row != b.row {
+            continue;
+        }
+        let row = &d.rows[a.row];
+        let (Some(ia), Some(ib)) = (
+            row.iter().position(|&n| n == e.from),
+            row.iter().position(|&n| n == e.to),
+        ) else {
+            continue;
+        };
+        if ia.abs_diff(ib) != 1 {
+            continue;
+        }
+        let (_, c1) = span(row.len(), ia.min(ib));
+        if let Some(gap) = gaps.get_mut(c1 - 1) {
+            *gap = (*gap).max(label.width() + 2);
+        }
+    }
+    let gap_sum = |gaps: &[usize], c0: usize, c1: usize| gaps[c0..c1 - 1].iter().sum::<usize>();
     // Single-column shapes set the column widths; wider spanning shapes stretch their span.
     for row in &d.rows {
         for (i, &n) in row.iter().enumerate() {
@@ -257,7 +281,7 @@ fn layout(d: &mut Diagram) {
     for row in &d.rows {
         for (i, &n) in row.iter().enumerate() {
             let (c0, c1) = span(row.len(), i);
-            let have = widths[c0..c1].iter().sum::<usize>() + ROW_GAP * (c1 - c0 - 1);
+            let have = widths[c0..c1].iter().sum::<usize>() + gap_sum(&gaps, c0, c1);
             if d.nodes[n].w > have {
                 let extra = d.nodes[n].w - have;
                 let each = extra.div_ceil(c1 - c0);
@@ -269,15 +293,15 @@ fn layout(d: &mut Diagram) {
     }
     let mut starts = Vec::with_capacity(columns);
     let mut x = 0;
-    for w in &widths {
+    for (c, w) in widths.iter().enumerate() {
         starts.push(x);
-        x += w + ROW_GAP;
+        x += w + gaps.get(c).copied().unwrap_or(0);
     }
     for row in &d.rows {
         for (i, &n) in row.iter().enumerate() {
             let (c0, c1) = span(row.len(), i);
             let left = starts[c0];
-            let total = widths[c0..c1].iter().sum::<usize>() + ROW_GAP * (c1 - c0 - 1);
+            let total = widths[c0..c1].iter().sum::<usize>() + gap_sum(&gaps, c0, c1);
             // Place by centre, not by left edge, so shapes of different widths in one
             // column share the same centre column exactly.
             let centre = left + total / 2;
@@ -679,7 +703,10 @@ fn draw_same_row(
         g.put(right.x - 1, y, '▶');
     }
     if let Some(label) = label {
-        g.text(left.x + left.w, y - 1, label);
+        // Centred over the line, which is what the gap was widened for.
+        let gap = right.x.saturating_sub(left.x + left.w);
+        let at = left.x + left.w + gap.saturating_sub(label.width()) / 2;
+        g.text(at, y - 1, label);
     }
 }
 
@@ -853,5 +880,13 @@ mod tests {
     fn same_row_neighbours_join_horizontally() {
         let out = render("a[A], b[B]\na --> b").unwrap();
         assert_eq!(out[1], "│ A │───▶│ B │");
+        // A label widens the gap so it fits above the line, and the columns below follow.
+        let out =
+            render("a[A], b[B]\nc[C], d[D]\na --> b | a long label\na --> c\nb --> d").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(out[0].contains("┌───┐ a long label ┌───┐"), "label centred in the widened gap");
+        assert!(out[1].contains("│ A │─────────────▶│ B │"));
+        assert!(!text.contains('┬'), "the columns still line up");
     }
 }
