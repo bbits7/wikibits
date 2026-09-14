@@ -15,7 +15,7 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FontSize, Resize};
 
-use crate::editor::{Action, Editor, Pos};
+use crate::editor::{Action, Editor, Pos, clipboard_copy};
 use crate::markdown::{self, ImageSlot, Item, Rendered};
 use crate::wiki::{self, LinkTarget, SearchHit, TreeNode, Wiki};
 
@@ -66,6 +66,14 @@ pub struct Complete {
     pub start: Pos,
     pub hits: Vec<(String, String)>,
     pub sel: usize,
+}
+
+/// Text selected on the rendered page, as `(line, column)` ends.
+pub struct TextSelect {
+    pub anchor: (usize, u16),
+    pub cursor: (usize, u16),
+    /// Started with `V`: the keys move the cursor until Esc or a copy.
+    pub keyboard: bool,
 }
 
 /// The wiki report (`w`): broken links, orphan pages, recent changes.
@@ -227,6 +235,9 @@ pub struct App {
     pub complete: Option<Complete>,
     pub image_pick: Option<ImagePick>,
     pub report: Option<Report>,
+    pub select: Option<TextSelect>,
+    /// Where the left button went down on the page, until it comes up.
+    drag_press: Option<(usize, u16)>,
     /// `[[` context the user dismissed with Esc; do not reopen until it changes.
     complete_dismissed: Option<Pos>,
     /// Page id waiting for the create-page confirmation.
@@ -277,6 +288,8 @@ impl App {
             complete: None,
             image_pick: None,
             report: None,
+            select: None,
+            drag_press: None,
             complete_dismissed: None,
             pending_create: None,
             new_page: String::new(),
@@ -1661,6 +1674,115 @@ impl App {
         }
     }
 
+    // ----- selecting text on the page --------------------------------------------------
+
+    /// The page cell under a screen position, if it is inside the page area.
+    fn content_pos(&self, x: u16, y: u16) -> Option<(usize, u16)> {
+        let body = self.rects.content;
+        if !body.contains((x, y).into()) {
+            return None;
+        }
+        let last = self.rendered.as_ref()?.lines.len().checked_sub(1)?;
+        let line = ((y - body.y) as usize + self.scroll).min(last);
+        Some((line, x - body.x))
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let sel = self.select.as_ref()?;
+        let rendered = self.rendered.as_ref()?;
+        let (start, end) = (sel.anchor.min(sel.cursor), sel.anchor.max(sel.cursor));
+        if start == end {
+            return None;
+        }
+        let mut out = Vec::new();
+        for line in start.0..=end.0 {
+            let text = rendered.lines.get(line)?.to_string();
+            let from = if line == start.0 { start.1 } else { 0 };
+            let to = if line == end.0 { end.1 } else { u16::MAX };
+            out.push(slice_columns(&text, from, to).trim_end().to_string());
+        }
+        Some(out.join("\n"))
+    }
+
+    fn copy_selection(&mut self) {
+        match self.selected_text() {
+            Some(text) if !text.trim().is_empty() => {
+                let n = text.chars().count();
+                self.status = if clipboard_copy(&text) {
+                    format!("Copied {n} characters")
+                } else {
+                    "Could not reach the clipboard (wl-copy)".into()
+                };
+            }
+            _ => self.status = "Nothing selected".into(),
+        }
+    }
+
+    /// `V`: select with the keyboard, starting at the top of the view.
+    fn start_keyboard_select(&mut self) {
+        if self.rendered.is_none() {
+            return;
+        }
+        let at = (self.scroll, 0);
+        self.select = Some(TextSelect {
+            anchor: at,
+            cursor: at,
+            keyboard: true,
+        });
+        self.focus = Focus::Content;
+        self.status.clear();
+    }
+
+    /// Keys while selecting with the keyboard.
+    fn select_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT)
+            || matches!(key.code, KeyCode::Char(c) if c.is_ascii_uppercase());
+        let page = self.content_height.max(1) as isize;
+        let (dl, dc): (isize, isize) = match key.code {
+            KeyCode::Esc => {
+                self.select = None;
+                return;
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.copy_selection();
+                self.select = None;
+                return;
+            }
+            KeyCode::Char('c') if ctrl => {
+                self.copy_selection();
+                self.select = None;
+                return;
+            }
+            KeyCode::Left | KeyCode::Char('h' | 'H') => (0, -1),
+            KeyCode::Right | KeyCode::Char('l' | 'L') => (0, 1),
+            KeyCode::Up | KeyCode::Char('k' | 'K') => (-1, 0),
+            KeyCode::Down | KeyCode::Char('j' | 'J') => (1, 0),
+            KeyCode::PageUp => (-page, 0),
+            KeyCode::PageDown => (page, 0),
+            KeyCode::Home => (0, isize::MIN / 2),
+            KeyCode::End => (0, isize::MAX / 2),
+            _ => return,
+        };
+        let Some(rendered) = &self.rendered else {
+            return;
+        };
+        let last_line = rendered.lines.len().saturating_sub(1);
+        let Some(sel) = &mut self.select else { return };
+        let line = (sel.cursor.0 as isize + dl).clamp(0, last_line as isize) as usize;
+        let width = rendered.lines[line].width() as isize;
+        let col = (sel.cursor.1 as isize + dc).clamp(0, width) as u16;
+        sel.cursor = (line, col);
+        if !shift {
+            sel.anchor = sel.cursor;
+        }
+        if line < self.scroll {
+            self.scroll = line;
+        } else if line >= self.scroll + self.content_height.max(1) {
+            self.scroll = line + 1 - self.content_height.max(1);
+        }
+    }
+
     // ----- wiki report and copying links ----------------------------------------------
 
     fn open_report(&mut self) {
@@ -2068,6 +2190,10 @@ impl App {
             self.report_key(key);
             return;
         }
+        if self.select.as_ref().is_some_and(|s| s.keyboard) {
+            self.select_key(key);
+            return;
+        }
         if self.prompt != Prompt::None {
             self.prompt_key(key);
             return;
@@ -2104,7 +2230,13 @@ impl App {
             KeyCode::Char('D') if self.current.is_some() => self.prompt = Prompt::DeletePage,
             KeyCode::Char('/') => self.start_find(""),
             KeyCode::Char('w') => self.open_report(),
+            KeyCode::Char('y') if self.select.is_some() => {
+                self.copy_selection();
+                self.select = None;
+            }
             KeyCode::Char('y') => self.copy_link(),
+            KeyCode::Char('V') => self.start_keyboard_select(),
+            KeyCode::Esc if self.select.is_some() => self.select = None,
             KeyCode::Char('s') => {
                 self.prompt = Prompt::SearchWiki;
                 self.find = None;
@@ -2117,6 +2249,10 @@ impl App {
                 });
             }
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('c') if ctrl && self.select.is_some() => {
+                self.copy_selection();
+                self.select = None;
+            }
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Tab => self.cycle_focus(1),
@@ -2299,19 +2435,35 @@ impl App {
                         self.crumb_activate(i);
                     }
                 } else if rects.content.contains((x, y).into()) {
+                    // Decided on release: a drag selects text, a plain click activates.
                     self.focus = Focus::Content;
-                    let line = (y - rects.content.y) as usize + self.scroll;
-                    let col = x - rects.content.x;
-                    if let Some(i) = self.item_at(line, col) {
-                        self.sel = Some(i);
-                        self.activate_selected();
-                    }
+                    self.select = None;
+                    self.drag_press = self.content_pos(x, y);
                 } else if rects.related.contains((x, y).into()) {
                     self.focus = Focus::Related;
                     let row = (y - rects.related.y) as usize + self.related_scroll;
                     if self.related.get(row).is_some_and(RelatedRow::selectable) {
                         self.related_sel = row;
                         self.related_activate();
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let (Some(press), Some(pos)) = (self.drag_press, self.content_pos(x, y)) {
+                    self.select = Some(TextSelect {
+                        anchor: press,
+                        cursor: pos,
+                        keyboard: false,
+                    });
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(press) = self.drag_press.take() {
+                    if self.select.is_some() {
+                        self.copy_selection();
+                    } else if let Some(i) = self.item_at(press.0, press.1) {
+                        self.sel = Some(i);
+                        self.activate_selected();
                     }
                 }
             }
@@ -2333,6 +2485,24 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// The characters of `text` between display columns `from` and `to`.
+fn slice_columns(text: &str, from: u16, to: u16) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut col = 0u16;
+    let mut out = String::new();
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0) as u16;
+        if col >= from && col < to {
+            out.push(c);
+        }
+        col = col.saturating_add(w);
+        if col >= to {
+            break;
+        }
+    }
+    out
 }
 
 /// Display width of a run of characters.
@@ -2414,6 +2584,14 @@ impl markdown::Context for RenderCtx<'_> {
 #[cfg(test)]
 mod tests {
     use crate::wiki::relative_path;
+
+    #[test]
+    fn column_slices_respect_wide_characters() {
+        use super::slice_columns;
+        assert_eq!(slice_columns("hello world", 6, 11), "world");
+        assert_eq!(slice_columns("✅ done", 3, u16::MAX), "done");
+        assert_eq!(slice_columns("abc", 1, 2), "b");
+    }
 
     #[test]
     fn image_paths_are_relative_to_the_page_folder() {

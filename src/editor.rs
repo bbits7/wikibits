@@ -394,17 +394,7 @@ impl Editor {
         };
         let text = self.range_text(start, end);
         self.clipboard = text.clone();
-        if let Ok(mut child) = Command::new("wl-copy")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-        }
+        clipboard_copy(&text);
     }
 
     fn cut(&mut self) {
@@ -979,6 +969,22 @@ fn pos_at(lines: &[String], row: Row, col: usize) -> Pos {
         line: row.line,
         col: at.min(chars.len()),
     }
+}
+
+/// Put `text` on the system clipboard through `wl-copy`; false if that did not work.
+pub fn clipboard_copy(text: &str) -> bool {
+    let Ok(mut child) = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    child.wait().is_ok_and(|s| s.success())
 }
 
 /// Leading indentation and list marker of a line: `("  ", "- [ ] ")`, `("", "3. ")`, or

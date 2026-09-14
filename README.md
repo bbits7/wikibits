@@ -42,7 +42,8 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `e` | edit the page in place; `N` creates a new page by path (prefilled with the current folder); `C` creates a child of the current page; `Enter` on a missing link offers to create it |
 | `R` / `D` | rename (move) the page, updating links to it everywhere / move it to `.trash/`, after confirmation |
 | `w` | wiki report: broken links, orphan pages and recently changed pages (`Enter` opens one) |
-| `y` | copy a `[[link]]` to the current page to the clipboard |
+| `y` | copy a `[[link]]` to the current page to the clipboard (or the selected text) |
+| `V` | select text with the keyboard: arrows move, `Shift`+arrows extend, `y` copies, `Esc` ends; dragging with the mouse selects and copies too |
 | `h` / `l` | collapse / expand a folder |
 | `b`, `Backspace` / `f` | back / forward |
 | `H` | home page |

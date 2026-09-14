@@ -274,6 +274,33 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
             }
         }
     }
+    if let Some(sel) = &app.select {
+        let (start, end) = (sel.anchor.min(sel.cursor), sel.anchor.max(sel.cursor));
+        for line_no in start.0..=end.0 {
+            if line_no < scroll {
+                continue;
+            }
+            let Some(line) = lines.get_mut(line_no - scroll) else {
+                break;
+            };
+            let from = if line_no == start.0 { start.1 } else { 0 };
+            let to = if line_no == end.0 { end.1 } else { u16::MAX };
+            if from < to {
+                highlight_columns(
+                    line,
+                    from,
+                    to,
+                    Style::new().add_modifier(Modifier::REVERSED),
+                );
+            }
+        }
+        if sel.keyboard && sel.cursor.0 >= scroll && sel.cursor.0 < scroll + body.height as usize {
+            f.set_cursor_position(ratatui::layout::Position {
+                x: body.x + sel.cursor.1.min(body.width.saturating_sub(1)),
+                y: body.y + (sel.cursor.0 - scroll) as u16,
+            });
+        }
+    }
     f.render_widget(Paragraph::new(Text::from(lines)), body);
 
     for slot in &rendered.images {
@@ -850,6 +877,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     }
     let hints = match app.focus {
         _ if app.popup.is_some() => "h/j/k/l scroll  PgUp/PgDn  g/G  Esc close",
+        _ if app.select.as_ref().is_some_and(|s| s.keyboard) => {
+            "Select: arrows move  Shift+arrows extend  y copy  Esc done"
+        }
+        _ if app.select.is_some() => "Selected: y copy  Esc clear",
         Focus::Tree => "j/k move  Enter open  h/l fold  Tab pane  b back  ? help  q quit",
         Focus::Content => {
             "j/k scroll  n/p link  Enter follow  x tick  v source  Tab pane  b back  ? help  q quit"
@@ -912,7 +943,15 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "w",
             "wiki report: broken links, orphan pages, recent changes",
         ),
-        ("y", "copy [[link]] to this page to the clipboard"),
+        (
+            "y",
+            "copy [[link]] to this page (or the selected text) to the clipboard",
+        ),
+        (
+            "V",
+            "select text with the keyboard: arrows move, Shift+arrows extend, y copies",
+        ),
+        ("mouse drag", "selects text on the page and copies it"),
         ("e", "edit this page"),
         (
             "N",
