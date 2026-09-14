@@ -35,6 +35,8 @@ struct Node {
     label: String,
     shape: Shape,
     row: usize,
+    /// Position in the row's comma-separated list, counting empty slots.
+    slot: usize,
     /// Left column and top row on the grid, and size.
     x: usize,
     y: usize,
@@ -75,6 +77,9 @@ struct Diagram {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     rows: Vec<Vec<usize>>,
+    /// For each row: `Some(slot count)` when the line used empty slots (`,, z(End)`) to put
+    /// shapes in explicit columns; `None` when its shapes spread over the columns.
+    explicit: Vec<Option<usize>>,
 }
 
 /// Columns between shapes on the same row.
@@ -105,6 +110,7 @@ fn parse(source: &str) -> Result<Diagram, String> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges = Vec::new();
     let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut explicit: Vec<Option<usize>> = Vec::new();
     let mut ids: HashMap<String, usize> = HashMap::new();
     let mut seen_type = false;
     for (number, raw) in source.lines().enumerate() {
@@ -174,9 +180,11 @@ fn parse(source: &str) -> Result<Diagram, String> {
             continue;
         }
         let mut row = Vec::new();
-        for item in line.split(',') {
-            let item = item.trim();
+        let mut empty_slots = false;
+        let items: Vec<&str> = line.split(',').map(str::trim).collect();
+        for (slot, item) in items.iter().enumerate() {
             if item.is_empty() {
+                empty_slots = true;
                 continue;
             }
             let (id, label, shape) = parse_shape(item).ok_or_else(|| {
@@ -191,6 +199,7 @@ fn parse(source: &str) -> Result<Diagram, String> {
                 label: label.trim().to_string(),
                 shape,
                 row: rows.len(),
+                slot,
                 x: 0,
                 y: 0,
                 w: 0,
@@ -200,12 +209,18 @@ fn parse(source: &str) -> Result<Diagram, String> {
         if row.is_empty() {
             return Err(format!("line {at}: nothing defined"));
         }
+        explicit.push(empty_slots.then_some(items.len()));
         rows.push(row);
     }
     if nodes.is_empty() {
         return Err("no shapes: add lines like id[label]".to_string());
     }
-    Ok(Diagram { nodes, edges, rows })
+    Ok(Diagram {
+        nodes,
+        edges,
+        rows,
+        explicit,
+    })
 }
 
 fn parse_shape(item: &str) -> Option<(&str, &str, Shape)> {
@@ -239,11 +254,32 @@ fn layout(d: &mut Diagram) {
         };
         node.h = 3;
     }
-    // A grid of columns: as many as the fullest row has shapes. A row with fewer shapes
-    // spreads them over the columns (one shape spans them all), and every shape is centred
-    // in the columns it spans, so shapes stacked in a column line up.
-    let columns = d.rows.iter().map(Vec::len).max().unwrap_or(1);
-    let span = |row_len: usize, i: usize| (i * columns / row_len, (i + 1) * columns / row_len);
+    // A grid of columns: as many as the fullest row has shapes (or slots). A row with fewer
+    // shapes spreads them over the columns (one shape spans them all) unless it used empty
+    // slots to pick columns, and every shape is centred in the columns it spans, so shapes
+    // stacked in a column line up.
+    let columns = d
+        .rows
+        .iter()
+        .zip(&d.explicit)
+        .map(|(row, explicit)| explicit.unwrap_or(row.len()))
+        .max()
+        .unwrap_or(1);
+    let node_span: Vec<(usize, usize)> = d
+        .nodes
+        .iter()
+        .map(|n| match d.explicit[n.row] {
+            Some(_) => (n.slot, n.slot + 1),
+            None => {
+                let len = d.rows[n.row].len();
+                let i = d.rows[n.row]
+                    .iter()
+                    .position(|&m| d.nodes[m].slot == n.slot)
+                    .unwrap_or(0);
+                (i * columns / len, (i + 1) * columns / len)
+            }
+        })
+        .collect();
     let mut widths = vec![0usize; columns];
     // The gap between two columns widens to fit the label of a line drawn across it.
     let mut gaps = vec![ROW_GAP; columns.saturating_sub(1)];
@@ -263,24 +299,31 @@ fn layout(d: &mut Diagram) {
         if ia.abs_diff(ib) != 1 {
             continue;
         }
-        let (_, c1) = span(row.len(), ia.min(ib));
-        if let Some(gap) = gaps.get_mut(c1 - 1) {
+        let (left, right) = if ia < ib {
+            (e.from, e.to)
+        } else {
+            (e.to, e.from)
+        };
+        let (_, c1) = node_span[left];
+        if node_span[right].0 == c1
+            && let Some(gap) = gaps.get_mut(c1 - 1)
+        {
             *gap = (*gap).max(label.width() + 2);
         }
     }
     let gap_sum = |gaps: &[usize], c0: usize, c1: usize| gaps[c0..c1 - 1].iter().sum::<usize>();
     // Single-column shapes set the column widths; wider spanning shapes stretch their span.
     for row in &d.rows {
-        for (i, &n) in row.iter().enumerate() {
-            let (c0, c1) = span(row.len(), i);
+        for &n in row {
+            let (c0, c1) = node_span[n];
             if c1 - c0 == 1 {
                 widths[c0] = widths[c0].max(d.nodes[n].w);
             }
         }
     }
     for row in &d.rows {
-        for (i, &n) in row.iter().enumerate() {
-            let (c0, c1) = span(row.len(), i);
+        for &n in row {
+            let (c0, c1) = node_span[n];
             let have = widths[c0..c1].iter().sum::<usize>() + gap_sum(&gaps, c0, c1);
             if d.nodes[n].w > have {
                 let extra = d.nodes[n].w - have;
@@ -298,8 +341,8 @@ fn layout(d: &mut Diagram) {
         x += w + gaps.get(c).copied().unwrap_or(0);
     }
     for row in &d.rows {
-        for (i, &n) in row.iter().enumerate() {
-            let (c0, c1) = span(row.len(), i);
+        for &n in row {
+            let (c0, c1) = node_span[n];
             let left = starts[c0];
             let total = widths[c0..c1].iter().sum::<usize>() + gap_sum(&gaps, c0, c1);
             // Place by centre, not by left edge, so shapes of different widths in one
@@ -877,6 +920,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_slots_pick_the_column() {
+        let out = render("a[A], b[B], c[C]\n,, z(End)\n, y[Y]\nc --> z\nz --> y").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert_eq!(out[0].matches('┌').count(), 3, "three columns");
+        let arrow_col = out[4].chars().position(|c| c == '▼').unwrap();
+        let c_col = out[1].chars().position(|c| c == 'C').unwrap();
+        assert_eq!(arrow_col, c_col, "End sits straight under C");
+        assert!(text.contains("┘"), "z --> y crosses columns through a bus");
+    }
+
+    #[test]
     fn same_row_neighbours_join_horizontally() {
         let out = render("a[A], b[B]\na --> b").unwrap();
         assert_eq!(out[1], "│ A │───▶│ B │");
@@ -885,7 +940,10 @@ mod tests {
             render("a[A], b[B]\nc[C], d[D]\na --> b | a long label\na --> c\nb --> d").unwrap();
         let text = joined(&out);
         println!("{text}");
-        assert!(out[0].contains("┌───┐ a long label ┌───┐"), "label centred in the widened gap");
+        assert!(
+            out[0].contains("┌───┐ a long label ┌───┐"),
+            "label centred in the widened gap"
+        );
         assert!(out[1].contains("│ A │─────────────▶│ B │"));
         assert!(!text.contains('┬'), "the columns still line up");
     }
