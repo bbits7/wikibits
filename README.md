@@ -39,7 +39,7 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `v` | toggle between the rendered page and its Markdown source |
 | `/` | find in the page: matches highlight as you type, `Enter`/`Up` step through them |
 | `s` | search the wiki (all words must match): live list of pages, `Enter` opens one at the match |
-| `e` | edit the page in place; `N` creates a new page by path; `Enter` on a missing link offers to create it |
+| `e` | edit the page in place; `N` creates a new page by path (prefilled with the current folder); `C` creates a child of the current page; `Enter` on a missing link offers to create it |
 | `R` / `D` | rename (move) the page, updating links to it everywhere / move it to `.trash/`, after confirmation |
 | `w` | wiki report: broken links, orphan pages and recently changed pages (`Enter` opens one) |
 | `y` | copy a `[[link]]` to the current page to the clipboard |

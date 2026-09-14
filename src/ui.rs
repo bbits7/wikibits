@@ -914,7 +914,14 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ),
         ("y", "copy [[link]] to this page to the clipboard"),
         ("e", "edit this page"),
-        ("N", "new page (type folder/name)"),
+        (
+            "N",
+            "new page (type folder/name; starts in this page's folder)",
+        ),
+        (
+            "C",
+            "new child page of this page (starts with this page's path)",
+        ),
         ("R", "rename / move this page (links to it are updated)"),
         ("D", "delete this page (asks first)"),
         ("Enter on a red link", "offers to create that page"),

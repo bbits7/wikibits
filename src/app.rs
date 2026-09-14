@@ -2086,6 +2086,17 @@ impl App {
                     .map(|(folder, _)| format!("{folder}/"))
                     .unwrap_or_default();
             }
+            KeyCode::Char('C') if self.current.is_some() => {
+                // A child of the current page: its folder path is the page itself (or the
+                // folder, for a folder's index page).
+                self.prompt = Prompt::NewPage;
+                let parent = wiki::link_target_for(self.current.as_deref().unwrap_or(""));
+                self.new_page = if parent == "/" {
+                    String::new()
+                } else {
+                    format!("{parent}/")
+                };
+            }
             KeyCode::Char('R') if self.current.is_some() => {
                 self.prompt = Prompt::RenamePage;
                 self.new_page = self.current.clone().unwrap_or_default();
