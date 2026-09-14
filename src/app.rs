@@ -2078,7 +2078,13 @@ impl App {
             KeyCode::Char('e') => self.start_edit(),
             KeyCode::Char('N') => {
                 self.prompt = Prompt::NewPage;
-                self.new_page.clear();
+                // Start in the current page's folder; the user can delete it.
+                self.new_page = self
+                    .current
+                    .as_deref()
+                    .and_then(|id| id.rsplit_once('/'))
+                    .map(|(folder, _)| format!("{folder}/"))
+                    .unwrap_or_default();
             }
             KeyCode::Char('R') if self.current.is_some() => {
                 self.prompt = Prompt::RenamePage;
