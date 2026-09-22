@@ -53,6 +53,23 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 
 The mouse works too: click to open, wheel to scroll, right-click to go back.
 
+## Tables and images
+
+A table is drawn with its columns as wide as their widest cell. When that is wider than
+the page, the widest text columns are squeezed and their text wraps. An image in a table
+cell is drawn in the cell, the row grows to the picture's height, and the text in the other
+cells wraps beside it — a picture on the left and its details on the right:
+
+```markdown
+| Axe | Weapon · silver |
+|---|---|
+| ![Axe](assets/axe.png) | **Bonus:** +4 strength · *This weapon increases your strength by 4.* |
+```
+
+A picture in a cell is bounded to half the page width so there is always room for the text.
+A pipe inside a cell needs escaping (`\|`), so link from a cell with `[label](folder/page)`
+rather than `[[folder/page|label]]`.
+
 ## Diagrams
 
 A ```diaBits block draws a flowchart with box-drawing characters — no external tools:

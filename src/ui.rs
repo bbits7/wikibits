@@ -9,7 +9,7 @@ use ratatui_image::Image;
 use ratatui_image::sliced::SlicedImage;
 
 use crate::app::{App, Focus, Prompt, RelatedRow, ReportRow, TreeKind};
-use crate::markdown::{EXTERNAL_LINK, Item, MISSING_LINK, PAGE_LINK};
+use crate::markdown::{EXTERNAL_LINK, FRAME, Item, MISSING_LINK, PAGE_LINK};
 
 const ACCENT: Color = Color::Cyan;
 
@@ -248,13 +248,21 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
         }
         Some(Item::Image(i)) => {
             let slot = &rendered.images[*i];
+            // The frame is the span starting one column left of the image — the last span on
+            // the line for an image of its own, and somewhere in the middle for one in a table.
+            let frame_x = slot.x.saturating_sub(1) as usize;
             for line in slot.line..=slot.line + slot.height as usize + 1 {
                 if line >= scroll
-                    && let Some(s) = lines
-                        .get_mut(line - scroll)
-                        .and_then(|l| l.spans.last_mut())
+                    && let Some(l) = lines.get_mut(line - scroll)
                 {
-                    s.style = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
+                    let mut x = 0;
+                    for s in &mut l.spans {
+                        if x == frame_x && s.style == FRAME {
+                            s.style = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
+                            break;
+                        }
+                        x += s.width();
+                    }
                 }
             }
         }

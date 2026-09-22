@@ -193,10 +193,21 @@ struct Chunk {
     link: Option<usize>,
 }
 
+/// One table cell: inline text, and possibly an image (an index into the renderer's images)
+/// that is drawn in the cell with the rest of the row laid out beside it.
+#[derive(Default)]
+struct Cell {
+    chunks: Vec<Chunk>,
+    image: Option<usize>,
+}
+
 struct Table {
-    rows: Vec<Vec<Vec<Chunk>>>,
+    rows: Vec<Vec<Cell>>,
     header_rows: usize,
 }
+
+/// Narrowest a text column is squeezed to when a table is wider than the page.
+const MIN_TABLE_COLUMN: usize = 10;
 
 struct Renderer<'a> {
     width: usize,
@@ -342,7 +353,7 @@ impl Renderer<'_> {
         }
         if let Some(table) = &mut self.table {
             if let Some(cell) = table.rows.last_mut().and_then(|r| r.last_mut()) {
-                cell.push(Chunk {
+                cell.chunks.push(Chunk {
                     text: text.to_string(),
                     style,
                     link,
@@ -453,11 +464,15 @@ impl Renderer<'_> {
             return;
         };
         let x = self.prefix_width();
+        if self.table.is_some() {
+            self.table_image(path, &placeholder, x);
+            return;
+        }
         // Leave room for the one-cell frame around the image.
         let max_width = self.width.saturating_sub(x + 2).max(1) as u16;
         let max_height = self.height.saturating_sub(2).max(1);
         match self.ctx.image_size(&path, max_width, max_height) {
-            Some((width, height)) if self.table.is_none() => {
+            Some((width, height)) => {
                 self.finish_line();
                 self.images.push(ImageSlot {
                     path,
@@ -519,41 +534,193 @@ impl Renderer<'_> {
         self.newline();
     }
 
+    /// An image inside a table cell.
+    ///
+    /// Kept for `end_table` to lay out: the frame goes in the cell, the row grows to the frame's
+    /// height, and the text in the other cells wraps beside it — which is how a page puts a
+    /// picture on the left and its details on the right. The image is bounded to half the page
+    /// so there is always room for the text. Its slot is registered now, with the position filled
+    /// in when the table is drawn, so `n`/`p` reach it in document order.
+    fn table_image(&mut self, path: PathBuf, placeholder: &str, x: usize) {
+        let max_width = (self.width.saturating_sub(x) / 2).saturating_sub(2).max(1) as u16;
+        let max_height = self.height.saturating_sub(2).max(1);
+        let Some((width, height)) = self.ctx.image_size(&path, max_width, max_height) else {
+            self.write(placeholder);
+            return;
+        };
+        let cell = self
+            .table
+            .as_mut()
+            .and_then(|t| t.rows.last_mut())
+            .and_then(|r| r.last_mut());
+        match cell {
+            Some(cell) if cell.image.is_none() => {
+                self.images.push(ImageSlot {
+                    path,
+                    line: 0,
+                    x: 0,
+                    width,
+                    height,
+                    max_width,
+                    max_height,
+                });
+                self.items.push(Item::Image(self.images.len() - 1));
+                cell.image = Some(self.images.len() - 1);
+            }
+            // A second image in one cell, or no cell to put it in: say so rather than lose it.
+            _ => self.write(placeholder),
+        }
+    }
+
+    /// Word-wrap a cell's chunks into lines no wider than `width`, keeping each chunk's style
+    /// and link. A word longer than the width gets a line of its own.
+    fn wrap_cell(chunks: &[Chunk], width: usize) -> Vec<Vec<Chunk>> {
+        let mut lines: Vec<Vec<Chunk>> = vec![Vec::new()];
+        let mut used = 0usize;
+        for chunk in chunks {
+            for word in chunk.text.split_inclusive(' ') {
+                let w = word.trim_end().width();
+                if used > 0 && used + w > width {
+                    if let Some(last) = lines.last_mut().and_then(|l| l.last_mut()) {
+                        last.text = last.text.trim_end().to_string();
+                    }
+                    lines.push(Vec::new());
+                    used = 0;
+                }
+                if used == 0 && word.trim().is_empty() {
+                    continue;
+                }
+                let line = lines.last_mut().expect("a line is always open");
+                match line.last_mut() {
+                    Some(last) if last.style == chunk.style && last.link == chunk.link => {
+                        last.text.push_str(word);
+                    }
+                    _ => line.push(Chunk {
+                        text: word.to_string(),
+                        style: chunk.style,
+                        link: chunk.link,
+                    }),
+                }
+                used += word.width();
+            }
+        }
+        if let Some(last) = lines.last_mut().and_then(|l| l.last_mut()) {
+            last.text = last.text.trim_end().to_string();
+        }
+        lines
+    }
+
+    /// Draw the table: columns as wide as their widest cell, squeezed to the page and wrapped
+    /// when they would not fit, and rows as tall as their tallest cell — an image's frame, or
+    /// the wrapped text beside it.
     fn end_table(&mut self) {
         let Some(table) = self.table.take() else {
             return;
         };
         let columns = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+        if columns == 0 {
+            return;
+        }
+        // Natural widths: the widest text or image frame in each column.
         let mut widths = vec![0usize; columns];
+        let mut has_image = vec![false; columns];
         for row in &table.rows {
             for (i, cell) in row.iter().enumerate() {
-                let w: usize = cell.iter().map(|c| c.text.width()).sum();
+                let mut w: usize = cell.chunks.iter().map(|c| c.text.width()).sum();
+                if let Some(image) = cell.image {
+                    w = w.max(self.images[image].width as usize + 2);
+                    has_image[i] = true;
+                }
                 widths[i] = widths[i].max(w);
             }
         }
+        // Squeeze the widest text columns until the table fits the page. Image columns keep
+        // their width: a frame cannot wrap.
+        let available = self
+            .width
+            .saturating_sub(self.prefix_width() + 3 * (columns - 1));
+        loop {
+            let total: usize = widths.iter().sum();
+            if total <= available {
+                break;
+            }
+            let Some(widest) = (0..columns)
+                .filter(|&i| !has_image[i] && widths[i] > MIN_TABLE_COLUMN)
+                .max_by_key(|&i| widths[i])
+            else {
+                break;
+            };
+            widths[widest] = widths[widest]
+                .saturating_sub(total - available)
+                .max(MIN_TABLE_COLUMN);
+        }
+        let starts: Vec<usize> = (0..columns)
+            .map(|i| widths[..i].iter().sum::<usize>() + 3 * i)
+            .collect();
+
         for (r, row) in table.rows.iter().enumerate() {
-            for (i, width) in widths.iter().enumerate() {
-                if i > 0 {
-                    self.emit(" │ ", DIM, None);
-                }
-                let mut used = 0;
-                if let Some(cell) = row.get(i) {
-                    for chunk in cell {
-                        let style = if r < table.header_rows {
-                            chunk.style.add_modifier(Modifier::BOLD)
-                        } else {
-                            chunk.style
-                        };
-                        self.emit(&chunk.text, style, chunk.link);
-                        used += chunk.text.width();
-                    }
-                }
-                if used < *width {
-                    self.emit(&" ".repeat(width - used), Style::default(), None);
+            let wrapped: Vec<Vec<Vec<Chunk>>> = (0..columns)
+                .map(|i| match row.get(i) {
+                    Some(cell) if cell.image.is_none() => Self::wrap_cell(&cell.chunks, widths[i]),
+                    _ => Vec::new(),
+                })
+                .collect();
+            let mut rows_tall = wrapped.iter().map(Vec::len).max().unwrap_or(0).max(1);
+            let (top, left) = (self.lines.len(), self.prefix_width());
+            for (i, cell) in row.iter().enumerate() {
+                if let Some(image) = cell.image {
+                    let slot = &mut self.images[image];
+                    slot.line = top;
+                    slot.x = (left + starts[i] + 1) as u16;
+                    rows_tall = rows_tall.max(slot.height as usize + 2);
                 }
             }
-            self.at_line_start = false;
-            self.newline();
+            for k in 0..rows_tall {
+                for i in 0..columns {
+                    if i > 0 {
+                        self.emit(" │ ", DIM, None);
+                    }
+                    let mut used = 0;
+                    match row.get(i) {
+                        Some(cell) if cell.image.is_some() => {
+                            let slot = &self.images[cell.image.expect("checked")];
+                            let (w, h) = (slot.width as usize, slot.height as usize);
+                            let frame = if k == 0 {
+                                Some(format!("╭{}╮", "─".repeat(w)))
+                            } else if k <= h {
+                                Some(format!("│{}│", " ".repeat(w)))
+                            } else if k == h + 1 {
+                                Some(format!("╰{}╯", "─".repeat(w)))
+                            } else {
+                                None
+                            };
+                            if let Some(frame) = frame {
+                                self.emit(&frame, FRAME, None);
+                                used = w + 2;
+                            }
+                        }
+                        Some(_) => {
+                            if let Some(line) = wrapped[i].get(k) {
+                                for chunk in line {
+                                    let style = if r < table.header_rows {
+                                        chunk.style.add_modifier(Modifier::BOLD)
+                                    } else {
+                                        chunk.style
+                                    };
+                                    self.emit(&chunk.text, style, chunk.link);
+                                    used += chunk.text.width();
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                    if used < widths[i] {
+                        self.emit(&" ".repeat(widths[i] - used), Style::default(), None);
+                    }
+                }
+                self.at_line_start = false;
+                self.newline();
+            }
             if r + 1 == table.header_rows {
                 let rule = widths
                     .iter()
@@ -757,7 +924,7 @@ impl Renderer<'_> {
             }
             Tag::TableCell => {
                 if let Some(row) = self.table.as_mut().and_then(|t| t.rows.last_mut()) {
-                    row.push(Vec::new());
+                    row.push(Cell::default());
                 }
             }
             Tag::FootnoteDefinition(name) => {
@@ -1094,5 +1261,80 @@ mod tests {
     fn tables_line_up() {
         let r = render("| a | bb |\n|---|---|\n| ccc | d |", 80, 40, &mut Ctx);
         assert_eq!(text(&r), vec!["a   │ bb", "────┼───", "ccc │ d "]);
+    }
+
+    #[test]
+    fn a_table_wider_than_the_page_wraps_its_widest_column() {
+        let r = render(
+            "| k | v |\n|---|---|\n| key | one two three four five six |",
+            24,
+            40,
+            &mut Ctx,
+        );
+        // 24 columns minus the separator leaves 21: "key" keeps its 3, the value wraps in 18.
+        assert_eq!(
+            text(&r),
+            vec![
+                "k   │ v                 ",
+                "────┼───────────────────",
+                "key │ one two three four",
+                "    │ five six          ",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_image_in_a_cell_draws_beside_the_text_which_wraps() {
+        // Ctx makes every image 10 wide and 3 tall: a frame of 12 by 5.
+        let r = render(
+            "| pic | details |\n|---|---|\n| ![Axe](axe.png) | **Deck:** silver, a weapon that is worth a few words |",
+            40,
+            40,
+            &mut Ctx,
+        );
+        // 40 columns less the frame's 12 and the separator's 3 leaves 25 for the details.
+        assert_eq!(
+            text(&r),
+            vec![
+                "pic          │ details                  ",
+                "─────────────┼──────────────────────────",
+                "╭──────────╮ │ Deck: silver, a weapon   ",
+                "│          │ │ that is worth a few words",
+                "│          │ │                          ",
+                "│          │ │                          ",
+                "╰──────────╯ │                          ",
+            ]
+        );
+        let slot = &r.images[0];
+        assert_eq!((slot.line, slot.x, slot.width, slot.height), (2, 1, 10, 3));
+        assert_eq!(r.items, vec![Item::Image(0)]);
+    }
+
+    #[test]
+    fn a_row_taller_than_its_image_pads_the_frame_column() {
+        let r = render(
+            "| pic | words |\n|---|---|\n| ![](p.png) | a b c d e f g h i j k l m n o p q r s t u v w x y z a b c d e f g h |",
+            30,
+            40,
+            &mut Ctx,
+        );
+        let lines = text(&r);
+        // 30 minus the frame's 12 and the separator's 3 leaves 15 for the text: eight letters a
+        // line, so thirty-four letters take five lines — the frame's height — and the header
+        // and rule make seven.
+        assert_eq!(lines.len(), 7);
+        assert_eq!(lines[2], "╭──────────╮ │ a b c d e f g h");
+        assert_eq!(lines[6], "╰──────────╯ │ g h            ");
+
+        // A row taller than its frame pads the frame's column with spaces.
+        let r = render(
+            "| pic | words |\n|---|---|\n| ![](p.png) | a b c d e f g h i j k l m n o p q r s t u v w x y z a b c d e f g h i j k l m n o p |",
+            30,
+            40,
+            &mut Ctx,
+        );
+        let lines = text(&r);
+        assert_eq!(lines.len(), 8);
+        assert_eq!(lines[7], "             │ o p            ");
     }
 }
