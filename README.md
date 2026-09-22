@@ -67,6 +67,18 @@ cells wraps beside it — a picture on the left and its details on the right:
 ```
 
 A picture in a cell is bounded to half the page width so there is always room for the text.
+Markdown insists on a header row; leave it empty (`| | |`) and neither it nor the rule under
+it is drawn, so a table can be one row of picture and details.
+
+Cells can span. A cell holding only `^^` merges with the cell above it, and one holding only
+`<<` merges with the cell to its left — so a picture can sit beside two rows of text:
+
+```markdown
+| | |
+|---|---|
+| ![Axe](assets/axe.png) | **Weapon** · silver · **Bonus:** +4 strength |
+| ^^ | *This weapon increases your strength by 4.* |
+```
 A pipe inside a cell needs escaping (`\|`), so link from a cell with `[label](folder/page)`
 rather than `[[folder/page|label]]`.
 

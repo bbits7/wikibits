@@ -613,6 +613,11 @@ impl Renderer<'_> {
     /// Draw the table: columns as wide as their widest cell, squeezed to the page and wrapped
     /// when they would not fit, and rows as tall as their tallest cell — an image's frame, or
     /// the wrapped text beside it.
+    ///
+    /// Cells can span. A cell holding only `^^` is merged into the cell above it, and one
+    /// holding only `<<` into the cell to its left, so a picture can sit beside two rows of
+    /// text, or a heading run across the table. A marker with nothing to merge into is drawn
+    /// as an empty cell.
     fn end_table(&mut self) {
         let Some(table) = self.table.take() else {
             return;
@@ -621,17 +626,98 @@ impl Renderer<'_> {
         if columns == 0 {
             return;
         }
-        // Natural widths: the widest text or image frame in each column.
+        let rows = table.rows.len();
+        let marker = |cell: &Cell| -> Option<&'static str> {
+            if cell.image.is_some() {
+                return None;
+            }
+            let text: String = cell.chunks.iter().map(|c| c.text.as_str()).collect();
+            match text.trim() {
+                "^^" => Some("^^"),
+                "<<" => Some("<<"),
+                _ => None,
+            }
+        };
+        let empty = Cell::default();
+        let at = |r: usize, c: usize| table.rows[r].get(c).unwrap_or(&empty);
+
+        // Which cell owns each grid position, and how far each owning cell spans.
+        struct Placed {
+            row: usize,
+            col: usize,
+            rows: usize,
+            cols: usize,
+            /// A merge marker that found nothing to merge into: drawn as an empty cell.
+            blank: bool,
+        }
+        let mut placed: Vec<Placed> = Vec::new();
+        let mut owner: Vec<Vec<Option<usize>>> = vec![vec![None; columns]; rows];
+        for r in 0..rows {
+            for c in 0..columns {
+                if owner[r][c].is_some() {
+                    continue;
+                }
+                let mark = marker(at(r, c));
+                let merged = match mark {
+                    Some("<<") if c > 0 => owner[r][c - 1]
+                        .filter(|&o| placed[o].row == r)
+                        .map(|o| {
+                            placed[o].cols += 1;
+                            o
+                        }),
+                    Some("^^") if r > 0 => owner[r - 1][c]
+                        .filter(|&o| placed[o].col == c && placed[o].row + placed[o].rows == r)
+                        .map(|o| {
+                            placed[o].rows += 1;
+                            for cc in c..(c + placed[o].cols).min(columns) {
+                                owner[r][cc] = Some(o);
+                            }
+                            o
+                        }),
+                    _ => None,
+                };
+                if let Some(o) = merged {
+                    owner[r][c] = Some(o);
+                } else {
+                    placed.push(Placed {
+                        row: r,
+                        col: c,
+                        rows: 1,
+                        cols: 1,
+                        blank: mark.is_some(),
+                    });
+                    owner[r][c] = Some(placed.len() - 1);
+                }
+            }
+        }
+        let cell_of = |p: &Placed| if p.blank { &empty } else { at(p.row, p.col) };
+        let natural = |cell: &Cell| -> usize {
+            let text: usize = cell.chunks.iter().map(|c| c.text.width()).sum();
+            match cell.image {
+                Some(i) => text.max(self.images[i].width as usize + 2),
+                None => text,
+            }
+        };
+
+        // Column widths: the widest single-column cell, then widened where a spanning cell
+        // needs more than its columns give it.
         let mut widths = vec![0usize; columns];
         let mut has_image = vec![false; columns];
-        for row in &table.rows {
-            for (i, cell) in row.iter().enumerate() {
-                let mut w: usize = cell.chunks.iter().map(|c| c.text.width()).sum();
-                if let Some(image) = cell.image {
-                    w = w.max(self.images[image].width as usize + 2);
-                    has_image[i] = true;
-                }
-                widths[i] = widths[i].max(w);
+        for p in &placed {
+            let cell = cell_of(p);
+            if cell.image.is_some() {
+                has_image[p.col] = true;
+            }
+            if p.cols == 1 {
+                widths[p.col] = widths[p.col].max(natural(cell));
+            }
+        }
+        for p in placed.iter().filter(|p| p.cols > 1) {
+            let last = (p.col + p.cols).min(columns) - 1;
+            let have: usize = widths[p.col..=last].iter().sum::<usize>() + 3 * (last - p.col);
+            let need = natural(cell_of(p));
+            if need > have {
+                widths[last] += need - have;
             }
         }
         // Squeeze the widest text columns until the table fits the page. Image columns keep
@@ -657,71 +743,125 @@ impl Renderer<'_> {
         let starts: Vec<usize> = (0..columns)
             .map(|i| widths[..i].iter().sum::<usize>() + 3 * i)
             .collect();
+        let span_width = |p: &Placed| -> usize {
+            let last = (p.col + p.cols).min(columns) - 1;
+            widths[p.col..=last].iter().sum::<usize>() + 3 * (last - p.col)
+        };
 
-        for (r, row) in table.rows.iter().enumerate() {
-            let wrapped: Vec<Vec<Vec<Chunk>>> = (0..columns)
-                .map(|i| match row.get(i) {
-                    Some(cell) if cell.image.is_none() => Self::wrap_cell(&cell.chunks, widths[i]),
-                    _ => Vec::new(),
-                })
-                .collect();
-            let mut rows_tall = wrapped.iter().map(Vec::len).max().unwrap_or(0).max(1);
-            let (top, left) = (self.lines.len(), self.prefix_width());
-            for (i, cell) in row.iter().enumerate() {
-                if let Some(image) = cell.image {
-                    let slot = &mut self.images[image];
+        // Wrap every text cell at its span's width; an image cell is as tall as its frame.
+        let wrapped: Vec<Vec<Vec<Chunk>>> = placed
+            .iter()
+            .map(|p| {
+                let cell = cell_of(p);
+                if cell.image.is_some() {
+                    Vec::new()
+                } else {
+                    Self::wrap_cell(&cell.chunks, span_width(p))
+                }
+            })
+            .collect();
+        let tall = |i: usize| -> usize {
+            match cell_of(&placed[i]).image {
+                Some(img) => self.images[img].height as usize + 2,
+                None => wrapped[i].len(),
+            }
+        };
+        // Row heights: the tallest single-row cell, then stretched where a cell spanning rows
+        // needs more than its rows give it.
+        let mut heights = vec![1usize; rows];
+        for (i, p) in placed.iter().enumerate() {
+            if p.rows == 1 {
+                heights[p.row] = heights[p.row].max(tall(i));
+            }
+        }
+        for (i, p) in placed.iter().enumerate().filter(|(_, p)| p.rows > 1) {
+            let last = (p.row + p.rows).min(rows) - 1;
+            let have: usize = heights[p.row..=last].iter().sum();
+            let need = tall(i);
+            if need > have {
+                heights[last] += need - have;
+            }
+        }
+
+        // Markdown insists on a header row; a page that does not want one leaves it empty
+        // (`| | |`), and then neither the row nor the rule under it is drawn.
+        let header_rows = table.header_rows.min(rows);
+        let blank_header = (0..header_rows).all(|r| {
+            (0..columns).all(|c| {
+                let cell = at(r, c);
+                cell.image.is_none() && cell.chunks.iter().all(|ch| ch.text.trim().is_empty())
+            })
+        });
+
+        let left = self.prefix_width();
+        for r in 0..rows {
+            if blank_header && r < header_rows {
+                continue;
+            }
+            let top = self.lines.len();
+            for p in placed.iter().filter(|p| p.row == r) {
+                if let Some(img) = cell_of(p).image {
+                    let slot = &mut self.images[img];
                     slot.line = top;
-                    slot.x = (left + starts[i] + 1) as u16;
-                    rows_tall = rows_tall.max(slot.height as usize + 2);
+                    slot.x = (left + starts[p.col] + 1) as u16;
                 }
             }
-            for k in 0..rows_tall {
-                for i in 0..columns {
-                    if i > 0 {
+            for k in 0..heights[r] {
+                for c in 0..columns {
+                    let Some(o) = owner[r][c] else {
+                        if c > 0 {
+                            self.emit(" │ ", DIM, None);
+                        }
+                        self.emit(&" ".repeat(widths[c]), Style::default(), None);
+                        continue;
+                    };
+                    let p = &placed[o];
+                    if p.col != c {
+                        // Covered by a cell spanning columns: it drew across this one.
+                        continue;
+                    }
+                    if c > 0 {
                         self.emit(" │ ", DIM, None);
                     }
+                    // Which line of the cell this is: the rows above it in the span, then k.
+                    let line = heights[p.row..r].iter().sum::<usize>() + k;
+                    let width = span_width(p);
                     let mut used = 0;
-                    match row.get(i) {
-                        Some(cell) if cell.image.is_some() => {
-                            let slot = &self.images[cell.image.expect("checked")];
-                            let (w, h) = (slot.width as usize, slot.height as usize);
-                            let frame = if k == 0 {
-                                Some(format!("╭{}╮", "─".repeat(w)))
-                            } else if k <= h {
-                                Some(format!("│{}│", " ".repeat(w)))
-                            } else if k == h + 1 {
-                                Some(format!("╰{}╯", "─".repeat(w)))
+                    let cell = cell_of(p);
+                    if let Some(img) = cell.image {
+                        let (w, h) = (self.images[img].width as usize, self.images[img].height as usize);
+                        let frame = if line == 0 {
+                            Some(format!("╭{}╮", "─".repeat(w)))
+                        } else if line <= h {
+                            Some(format!("│{}│", " ".repeat(w)))
+                        } else if line == h + 1 {
+                            Some(format!("╰{}╯", "─".repeat(w)))
+                        } else {
+                            None
+                        };
+                        if let Some(frame) = frame {
+                            self.emit(&frame, FRAME, None);
+                            used = w + 2;
+                        }
+                    } else if let Some(chunks) = wrapped[o].get(line) {
+                        for chunk in chunks {
+                            let style = if r < header_rows {
+                                chunk.style.add_modifier(Modifier::BOLD)
                             } else {
-                                None
+                                chunk.style
                             };
-                            if let Some(frame) = frame {
-                                self.emit(&frame, FRAME, None);
-                                used = w + 2;
-                            }
+                            self.emit(&chunk.text, style, chunk.link);
+                            used += chunk.text.width();
                         }
-                        Some(_) => {
-                            if let Some(line) = wrapped[i].get(k) {
-                                for chunk in line {
-                                    let style = if r < table.header_rows {
-                                        chunk.style.add_modifier(Modifier::BOLD)
-                                    } else {
-                                        chunk.style
-                                    };
-                                    self.emit(&chunk.text, style, chunk.link);
-                                    used += chunk.text.width();
-                                }
-                            }
-                        }
-                        None => {}
                     }
-                    if used < widths[i] {
-                        self.emit(&" ".repeat(widths[i] - used), Style::default(), None);
+                    if used < width {
+                        self.emit(&" ".repeat(width - used), Style::default(), None);
                     }
                 }
                 self.at_line_start = false;
                 self.newline();
             }
-            if r + 1 == table.header_rows {
+            if r + 1 == header_rows && !blank_header {
                 let rule = widths
                     .iter()
                     .map(|w| "─".repeat(*w))
@@ -1261,6 +1401,53 @@ mod tests {
     fn tables_line_up() {
         let r = render("| a | bb |\n|---|---|\n| ccc | d |", 80, 40, &mut Ctx);
         assert_eq!(text(&r), vec!["a   │ bb", "────┼───", "ccc │ d "]);
+    }
+
+    #[test]
+    fn an_empty_header_row_is_not_drawn() {
+        let r = render("| | |\n|---|---|\n| a | b |\n| c | d |", 80, 40, &mut Ctx);
+        assert_eq!(text(&r), vec!["a │ b", "c │ d"]);
+    }
+
+    #[test]
+    fn a_cell_of_two_carets_merges_with_the_cell_above() {
+        let r = render("| | |\n|---|---|\n| x | one |\n| ^^ | two |", 80, 40, &mut Ctx);
+        assert_eq!(text(&r), vec!["x │ one", "  │ two"]);
+    }
+
+    #[test]
+    fn a_cell_of_two_chevrons_merges_with_the_cell_to_its_left() {
+        let r = render("| | | |\n|---|---|---|\n| p | q | r |\n| wide | << | c |", 80, 40, &mut Ctx);
+        assert_eq!(text(&r), vec!["p │ q │ r", "wide  │ c"]);
+    }
+
+    #[test]
+    fn a_marker_with_nothing_to_merge_into_is_an_empty_cell() {
+        let r = render("| | |\n|---|---|\n| ^^ | a |\n| << | b |", 80, 40, &mut Ctx);
+        assert_eq!(text(&r), vec![" │ a", " │ b"]);
+    }
+
+    #[test]
+    fn an_image_can_span_two_rows_of_text() {
+        // Ctx frames are 12 by 5: the facts row is one line, so the text row below is
+        // stretched to fill the rest of the frame.
+        let r = render(
+            "| | |\n|---|---|\n| ![](p.png) | facts |\n| ^^ | printed text |",
+            80,
+            40,
+            &mut Ctx,
+        );
+        assert_eq!(
+            text(&r),
+            vec![
+                "╭──────────╮ │ facts       ",
+                "│          │ │ printed text",
+                "│          │ │             ",
+                "│          │ │             ",
+                "╰──────────╯ │             ",
+            ]
+        );
+        assert_eq!((r.images[0].line, r.images[0].x), (0, 1));
     }
 
     #[test]
