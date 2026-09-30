@@ -930,6 +930,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("PgUp / PgDn  g / G", "a page up / down, top / bottom"),
         ("Enter", "open page / fold folder"),
         ("h / l", "collapse / expand"),
+        (
+            "J / K",
+            "move the selected page or folder down / up (the current page elsewhere)",
+        ),
         ("", ""),
         ("Related column", ""),
         (

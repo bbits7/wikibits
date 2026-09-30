@@ -246,6 +246,9 @@ pub struct App {
     pub new_page: String,
     /// Clear the terminal before the next draw (an image may be left on screen).
     pub repaint: bool,
+    /// Pages were reordered with Shift+J/K since the last commit; the run of moves is
+    /// committed together at the next other key.
+    reordered: bool,
 }
 
 impl App {
@@ -294,6 +297,7 @@ impl App {
             pending_create: None,
             new_page: String::new(),
             repaint: false,
+            reordered: false,
         };
         // Only the root is open at first: top-level folders show collapsed, and opening a
         // page expands the folders above it (see `reveal_in_tree`).
@@ -905,6 +909,52 @@ impl App {
             self.tree_sel = i;
         }
         self.focus = Focus::Tree;
+    }
+
+    /// The folder and name of what Shift+J/K moves: the selected row in the pages column,
+    /// else the current page (a folder's index page stands for its folder).
+    fn reorder_target(&self) -> Option<(String, String)> {
+        let item = match self.tree.get(self.tree_sel) {
+            Some(row) if self.focus == Focus::Tree => match &row.kind {
+                TreeKind::Page { id } => id.clone(),
+                TreeKind::Folder { path, .. } => path.clone(),
+            },
+            _ => wiki::link_target_for(self.current.as_deref()?),
+        };
+        if item.is_empty() || item == "/" {
+            return None;
+        }
+        let (folder, name) = item.rsplit_once('/').unwrap_or(("", &item));
+        Some((folder.to_string(), name.to_string()))
+    }
+
+    /// Move the selected row (or the current page) up or down among its siblings.
+    fn reorder(&mut self, delta: isize) {
+        let Some((folder, name)) = self.reorder_target() else {
+            return;
+        };
+        match self.wiki.move_in_order(&folder, &name, delta) {
+            Ok(true) => {
+                let item = if folder.is_empty() {
+                    name
+                } else {
+                    format!("{folder}/{name}")
+                };
+                self.rebuild_tree();
+                if let Some(i) = self.tree.iter().position(|r| match &r.kind {
+                    TreeKind::Page { id } => *id == item,
+                    TreeKind::Folder { path, .. } => *path == item,
+                }) {
+                    self.tree_sel = i;
+                }
+                self.reordered = true;
+            }
+            Ok(false) => {
+                let end = if delta < 0 { "first" } else { "last" };
+                self.status = format!("Already {end} in its folder");
+            }
+            Err(err) => self.status = format!("{err:#}"),
+        }
     }
 
     fn tree_move(&mut self, delta: isize) {
@@ -1628,6 +1678,13 @@ impl App {
         self.commit(&format!("Create {id}"));
     }
 
+    /// Commit a run of Shift+J/K moves, if there was one.
+    pub fn commit_reorder(&mut self) {
+        if std::mem::take(&mut self.reordered) {
+            self.wiki.git_commit("Reorder pages");
+        }
+    }
+
     /// Record the wiki's state in git when the wiki folder is a repository.
     fn commit(&mut self, message: &str) {
         match self.wiki.git_commit(message) {
@@ -2164,6 +2221,9 @@ impl App {
     // ----- input -----------------------------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if !matches!(key.code, KeyCode::Char('J' | 'K')) {
+            self.commit_reorder();
+        }
         if self.show_help {
             self.show_help = false;
             return;
@@ -2228,6 +2288,8 @@ impl App {
                 self.new_page = self.current.clone().unwrap_or_default();
             }
             KeyCode::Char('D') if self.current.is_some() => self.prompt = Prompt::DeletePage,
+            KeyCode::Char('J') => self.reorder(1),
+            KeyCode::Char('K') => self.reorder(-1),
             KeyCode::Char('/') => self.start_find(""),
             KeyCode::Char('w') => self.open_report(),
             KeyCode::Char('y') if self.select.is_some() => {

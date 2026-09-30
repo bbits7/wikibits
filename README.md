@@ -26,6 +26,10 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
   opening the folder shows it, and `[[/projects]]` links to it. The root `index.md` is the
   wiki's home page (`[[/]]`). Index pages are only linked through their folder: a direct
   `[[projects/index]]` shows as a missing link, and `[[` completion offers the folder path.
+- The pages column sorts each folder alphabetically by title until you reorder it with
+  `J` / `K`. The order is kept in a hidden `.order` file in that folder: one page or
+  subfolder name per line (`backlog`, without `.md` or `/`). Names it leaves out follow,
+  alphabetically; renames, moves and deletes keep it up to date.
 
 ## Keys
 
@@ -45,6 +49,7 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `y` | copy a `[[link]]` to the current page to the clipboard (or the selected text) |
 | `V` | select text with the keyboard: arrows move, `Shift`+arrows extend, `y` copies, `Esc` ends; dragging with the mouse selects and copies too |
 | `h` / `l` | collapse / expand a folder |
+| `J` / `K` | move the selected page or folder down / up within its folder (outside the pages column: the current page) |
 | `b`, `Backspace` / `f` | back / forward |
 | `H` | home page |
 | `r` | reload |

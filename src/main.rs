@@ -8,7 +8,7 @@ mod ui;
 mod wiki;
 
 use std::io::stdout;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -236,8 +236,10 @@ fn run(
         app.refresh_font_size();
         let mut changed = false;
         while let Ok(res) = rx.try_recv() {
+            // Hidden files (git's, the order files wikiBits writes itself) change no page.
             if let Ok(ev) = res
                 && !matches!(ev.kind, EventKind::Access(_))
+                && ev.paths.iter().any(|p| !in_hidden(&root, p))
             {
                 changed = true;
             }
@@ -246,5 +248,12 @@ fn run(
             app.reload();
         }
     }
+    app.commit_reorder();
     Ok(())
+}
+
+/// Whether `path` lies in, or is, a hidden file or folder under `root`.
+fn in_hidden(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(|rel| rel.iter().any(|c| c.to_string_lossy().starts_with('.')))
 }

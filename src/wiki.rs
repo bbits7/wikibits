@@ -56,6 +56,11 @@ pub enum TreeNode {
     },
 }
 
+/// Hidden file in a folder listing its pages and subfolders by name (`backlog`, never
+/// `backlog.md` or `backlog/`), one per line, in the order the tree shows them. Names it leaves
+/// out follow, sorted by title, so a folder without one sorts alphabetically.
+pub const ORDER_FILE: &str = ".order";
+
 /// Image file extensions the page renderer can show.
 pub const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
@@ -64,6 +69,8 @@ pub struct Wiki {
     pub pages: BTreeMap<String, Page>,
     /// Page id -> ids of pages linking to it, in id order.
     pub backlinks: HashMap<String, Vec<String>>,
+    /// Folder path (`""` for the root) -> the names in its order file.
+    pub orders: HashMap<String, Vec<String>>,
 }
 
 impl Wiki {
@@ -75,6 +82,7 @@ impl Wiki {
             root,
             pages: BTreeMap::new(),
             backlinks: HashMap::new(),
+            orders: HashMap::new(),
         };
         wiki.reload()?;
         Ok(wiki)
@@ -82,6 +90,7 @@ impl Wiki {
 
     pub fn reload(&mut self) -> Result<()> {
         let mut pages = BTreeMap::new();
+        let mut orders = HashMap::new();
         let walker = WalkDir::new(&self.root)
             .follow_links(true)
             .sort_by_file_name()
@@ -89,6 +98,14 @@ impl Wiki {
             .filter_entry(|e| !is_hidden(e.file_name()));
         for entry in walker.filter_map(|e| e.ok()) {
             let path = entry.path();
+            if entry.file_type().is_dir() {
+                if let Some(folder) = self.folder_for(path)
+                    && let Some(names) = read_order(path)
+                {
+                    orders.insert(folder, names);
+                }
+                continue;
+            }
             if !entry.file_type().is_file() || path.extension().is_none_or(|e| e != "md") {
                 continue;
             }
@@ -108,6 +125,7 @@ impl Wiki {
             );
         }
         self.pages = pages;
+        self.orders = orders;
 
         let mut backlinks: HashMap<String, Vec<String>> = HashMap::new();
         for page in self.pages.values() {
@@ -136,6 +154,17 @@ impl Wiki {
             .collect::<Vec<_>>()
             .join("/");
         (!id.is_empty()).then_some(id)
+    }
+
+    /// Folder path (`""` for the root) for a directory under the root.
+    fn folder_for(&self, dir: &Path) -> Option<String> {
+        let rel = dir.strip_prefix(&self.root).ok()?;
+        Some(
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
     }
 
     pub fn title(&self, id: &str) -> String {
@@ -255,7 +284,7 @@ impl Wiki {
 
     /// Move the images no page mentions into `.trash/` under the root, where the wiki does
     /// not look. Returns the moved file names.
-    pub fn trash_unreferenced_images(&self) -> Result<Vec<String>> {
+    pub fn trash_unreferenced_images(&mut self) -> Result<Vec<String>> {
         let unused = self.unreferenced_images();
         if unused.is_empty() {
             return Ok(Vec::new());
@@ -384,6 +413,7 @@ impl Wiki {
                 continue;
             }
             fs::rename(&entries[0], folder.with_extension("md"))?;
+            let _ = fs::remove_file(folder.join(ORDER_FILE));
             let _ = fs::remove_dir(&folder);
             if let Some(id) = self.id_for(&folder.with_extension("md")) {
                 let parent = id.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
@@ -444,7 +474,9 @@ impl Wiki {
         }
         fs::rename(&page.path, &target)
             .with_context(|| format!("cannot move {} to .trash", page.path.display()))?;
-        self.remove_empty_folders(page.path.parent());
+        let old_path = page.path.clone();
+        self.follow_in_order(id, None)?;
+        self.remove_empty_folders(old_path.parent());
         self.reload()
     }
 
@@ -519,7 +551,9 @@ impl Wiki {
                 target.display()
             )
         })?;
-        self.remove_empty_folders(page.path.parent());
+        let old_path = page.path.clone();
+        self.follow_in_order(old, Some(new))?;
+        self.remove_empty_folders(old_path.parent());
         let from_dir = old.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         let to_dir = new.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         self.rebase_page_links(&target, from_dir, to_dir)?;
@@ -548,17 +582,24 @@ impl Wiki {
         Ok(updated)
     }
 
-    /// Remove `folder` and its parents while they are empty, stopping at the root.
-    fn remove_empty_folders(&self, folder: Option<&Path>) {
+    /// Remove `folder` and its parents while they are empty (an order file alone counts as
+    /// empty), stopping at the root; removed folders leave their parent's order file.
+    fn remove_empty_folders(&mut self, folder: Option<&Path>) {
         let mut current = folder;
         while let Some(dir) = current {
             if dir == self.root
                 || fs::read_dir(dir)
-                    .map(|mut d| d.next().is_some())
+                    .map(|mut d| d.any(|e| e.is_ok_and(|e| e.file_name() != ORDER_FILE)))
                     .unwrap_or(true)
-                || fs::remove_dir(dir).is_err()
             {
                 break;
+            }
+            let _ = fs::remove_file(dir.join(ORDER_FILE));
+            if fs::remove_dir(dir).is_err() {
+                break;
+            }
+            if let Some(path) = self.folder_for(dir) {
+                let _ = self.follow_in_order(&path, None);
             }
             current = dir.parent();
         }
@@ -610,9 +651,131 @@ impl Wiki {
             insert_into_tree(&mut root, "", &page.id, page);
         }
         fold_indexes(&mut root);
-        sort_tree(&mut root);
+        sort_tree(&mut root, "", &self.orders);
         root
     }
+
+    /// Move the page or subfolder `name` of `folder` one place up (`delta` -1) or down (+1)
+    /// among its siblings, writing the folder's order file. The first move in a folder writes
+    /// out the whole current order. Returns false when it is already first or last.
+    pub fn move_in_order(&mut self, folder: &str, name: &str, delta: isize) -> Result<bool> {
+        let mut names = self.sibling_names(folder);
+        let Some(at) = names.iter().position(|n| n == name) else {
+            anyhow::bail!("{name} is not in {}", display_folder(folder));
+        };
+        let to = at as isize + delta;
+        if to < 0 || to >= names.len() as isize {
+            return Ok(false);
+        }
+        names.swap(at, to as usize);
+        self.write_order(folder, names)?;
+        Ok(true)
+    }
+
+    /// Names of the pages and subfolders of `folder` in tree order (the root `index` page,
+    /// which always leads, left out).
+    fn sibling_names(&self, folder: &str) -> Vec<String> {
+        let mut nodes = self.tree();
+        let mut depth = 0;
+        while depth < folder.len() {
+            // Step into the child folder whose path is the next prefix of `folder`.
+            let next = folder[depth..]
+                .find('/')
+                .map_or(folder.len(), |i| depth + i);
+            let Some(children) = nodes.into_iter().find_map(|n| match n {
+                TreeNode::Folder { path, children, .. } if path == folder[..next] => Some(children),
+                _ => None,
+            }) else {
+                return Vec::new();
+            };
+            nodes = children;
+            depth = next + 1;
+        }
+        nodes
+            .iter()
+            .filter_map(|n| match n {
+                TreeNode::Page { id, .. } if id == "index" => None,
+                TreeNode::Page { id, .. } => Some(last_segment(id).to_string()),
+                TreeNode::Folder { path, .. } => Some(last_segment(path).to_string()),
+            })
+            .collect()
+    }
+
+    /// Replace `folder`'s order file with `names`, or remove it when there are none.
+    fn write_order(&mut self, folder: &str, names: Vec<String>) -> Result<()> {
+        let file = self.root.join(folder).join(ORDER_FILE);
+        if names.is_empty() {
+            if file.exists() {
+                fs::remove_file(&file)?;
+            }
+            self.orders.remove(folder);
+        } else {
+            fs::write(&file, names.join("\n") + "\n")
+                .with_context(|| format!("cannot write {}", file.display()))?;
+            self.orders.insert(folder.to_string(), names);
+        }
+        Ok(())
+    }
+
+    /// Keep the order files in step with a page moving from `old` to `new`: renamed within
+    /// its folder it keeps its place; moved to another folder it leaves the old folder's list
+    /// (unless a folder of that name is still there).
+    fn follow_in_order(&mut self, old: &str, new: Option<&str>) -> Result<()> {
+        let (old_dir, old_name) = split_id(old);
+        let Some(mut names) = self.orders.get(old_dir).cloned() else {
+            return Ok(());
+        };
+        let Some(at) = names.iter().position(|n| n == old_name) else {
+            return Ok(());
+        };
+        match new.map(split_id) {
+            Some((new_dir, new_name)) if new_dir == old_dir => {
+                names.retain(|n| n != new_name);
+                let at = names.iter().position(|n| n == old_name).unwrap_or(at);
+                names[at] = new_name.to_string();
+            }
+            _ => {
+                let base = self.root.join(old_dir).join(old_name);
+                if base.is_dir() || base.with_extension("md").is_file() {
+                    return Ok(());
+                }
+                names.remove(at);
+            }
+        }
+        if self.root.join(old_dir).is_dir() {
+            self.write_order(old_dir, names)?;
+        }
+        Ok(())
+    }
+}
+
+/// The folder and the last segment of an id or path (`""` folder at the root).
+fn split_id(id: &str) -> (&str, &str) {
+    id.rsplit_once('/').unwrap_or(("", id))
+}
+
+fn last_segment(path: &str) -> &str {
+    split_id(path).1
+}
+
+fn display_folder(folder: &str) -> &str {
+    if folder.is_empty() {
+        "the top folder"
+    } else {
+        folder
+    }
+}
+
+/// Names listed in a folder's order file, if it has one.
+fn read_order(dir: &Path) -> Option<Vec<String>> {
+    let text = fs::read_to_string(dir.join(ORDER_FILE)).ok()?;
+    Some(
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// Whether an id names an index page (`index` or `folder/index`).
@@ -696,16 +859,19 @@ fn insert_into_tree(nodes: &mut Vec<TreeNode>, prefix: &str, rest: &str, page: &
     }
 }
 
-/// Folders and pages together, by displayed name ignoring case; the root `index` page leads.
-fn sort_tree(nodes: &mut [TreeNode]) {
+/// Folders and pages together: the root `index` page leads, then the names in the folder's
+/// order file, then the rest by displayed name ignoring case.
+fn sort_tree(nodes: &mut [TreeNode], folder: &str, orders: &HashMap<String, Vec<String>>) {
+    let order = orders.get(folder).map(Vec::as_slice).unwrap_or(&[]);
+    let rank = |name: &str| order.iter().position(|n| n == name).unwrap_or(usize::MAX);
     nodes.sort_by_cached_key(|n| match n {
-        TreeNode::Page { id, .. } if id == "index" => (0, String::new()),
-        TreeNode::Folder { name, .. } => (1, name.to_lowercase()),
-        TreeNode::Page { title, .. } => (1, title.to_lowercase()),
+        TreeNode::Page { id, .. } if id == "index" => (0, 0, String::new()),
+        TreeNode::Folder { name, path, .. } => (1, rank(last_segment(path)), name.to_lowercase()),
+        TreeNode::Page { id, title } => (1, rank(last_segment(id)), title.to_lowercase()),
     });
     for node in nodes {
-        if let TreeNode::Folder { children, .. } = node {
-            sort_tree(children);
+        if let TreeNode::Folder { path, children, .. } = node {
+            sort_tree(children, path, orders);
         }
     }
 }
@@ -1147,6 +1313,92 @@ mod tests {
     }
 
     #[test]
+    fn order_files_put_pages_in_a_chosen_order() {
+        let dir = std::env::temp_dir().join(format!("wikibits-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("notes")).unwrap();
+        for name in [
+            "index",
+            "apple",
+            "banana",
+            "cherry",
+            "notes/one",
+            "notes/two",
+        ] {
+            fs::write(dir.join(format!("{name}.md")), "").unwrap();
+        }
+        let mut wiki = Wiki::load(&dir).unwrap();
+        assert_eq!(
+            wiki.sibling_names(""),
+            ["apple", "banana", "cherry", "notes"],
+            "no order file: alphabetical"
+        );
+        assert!(!dir.join(ORDER_FILE).exists());
+
+        assert!(wiki.move_in_order("", "cherry", -1).unwrap());
+        assert_eq!(
+            wiki.sibling_names(""),
+            ["apple", "cherry", "banana", "notes"]
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(ORDER_FILE)).unwrap(),
+            "apple\ncherry\nbanana\nnotes\n",
+            "the first move writes out the whole folder"
+        );
+        assert!(
+            !wiki.move_in_order("", "apple", -1).unwrap(),
+            "already first"
+        );
+        assert!(wiki.move_in_order("notes", "one", 1).unwrap());
+        assert_eq!(wiki.sibling_names("notes"), ["two", "one"]);
+
+        // Unlisted pages follow the listed ones; the order survives a reload.
+        fs::write(dir.join("aardvark.md"), "").unwrap();
+        wiki.reload().unwrap();
+        assert_eq!(
+            wiki.sibling_names(""),
+            ["apple", "cherry", "banana", "notes", "aardvark"]
+        );
+
+        // A rename in place keeps the spot; a move to another folder leaves the list.
+        wiki.rename_page("cherry", "date").unwrap();
+        assert_eq!(
+            wiki.sibling_names(""),
+            ["apple", "date", "banana", "notes", "aardvark"]
+        );
+        wiki.rename_page("date", "notes/date").unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join(ORDER_FILE)).unwrap(),
+            "apple\nbanana\nnotes\n"
+        );
+        assert_eq!(wiki.sibling_names("notes"), ["two", "one", "date"]);
+
+        // Becoming a folder and back again keeps the place: the name does not change.
+        wiki.rename_page("apple", "banana/apple").unwrap();
+        assert_eq!(wiki.sibling_names(""), ["banana", "notes", "aardvark"]);
+        assert!(dir.join("banana/index.md").is_file());
+        wiki.rename_page("banana/apple", "zebra").unwrap();
+        wiki.demote_lonely_folders().unwrap();
+        assert!(dir.join("banana.md").is_file() && !dir.join("banana").exists());
+        assert_eq!(
+            wiki.sibling_names(""),
+            ["banana", "notes", "aardvark", "zebra"]
+        );
+
+        // A folder left with only its order file is removed.
+        for id in ["notes/one", "notes/two", "notes/date"] {
+            wiki.delete_page(id).unwrap();
+        }
+        assert!(!dir.join("notes").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join(ORDER_FILE)).unwrap(),
+            "banana\n",
+            "deleted names leave the list"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn unreferenced_images_go_to_trash() {
         let dir = std::env::temp_dir().join(format!("wikibits-images-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1156,7 +1408,7 @@ mod tests {
         fs::write(dir.join("assets/used.png"), b"x").unwrap();
         fs::write(dir.join("assets/unused.png"), b"x").unwrap();
         fs::write(dir.join("old/stale.jpg"), b"x").unwrap();
-        let wiki = Wiki::load(&dir).unwrap();
+        let mut wiki = Wiki::load(&dir).unwrap();
         let mut moved = wiki.trash_unreferenced_images().unwrap();
         moved.sort();
         assert_eq!(moved, vec!["stale.jpg", "unused.png"]);
