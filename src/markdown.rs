@@ -573,12 +573,17 @@ impl Renderer<'_> {
     }
 
     /// Word-wrap a cell's chunks into lines no wider than `width`, keeping each chunk's style
-    /// and link. A word longer than the width gets a line of its own.
+    /// and link. A word longer than the width is broken across lines, so the column stays
+    /// straight.
     fn wrap_cell(chunks: &[Chunk], width: usize) -> Vec<Vec<Chunk>> {
         let mut lines: Vec<Vec<Chunk>> = vec![Vec::new()];
         let mut used = 0usize;
         for chunk in chunks {
-            for word in chunk.text.split_inclusive(' ') {
+            for word in chunk
+                .text
+                .split_inclusive(' ')
+                .flat_map(|word| Self::break_word(word, width))
+            {
                 let w = word.trim_end().width();
                 if used > 0 && used + w > width {
                     if let Some(last) = lines.last_mut().and_then(|l| l.last_mut()) {
@@ -608,6 +613,23 @@ impl Renderer<'_> {
             last.text = last.text.trim_end().to_string();
         }
         lines
+    }
+
+    /// A word as pieces no wider than `width` (its trailing space rides on the last piece).
+    fn break_word(word: &str, width: usize) -> Vec<&str> {
+        use unicode_width::UnicodeWidthChar;
+        let mut pieces = Vec::new();
+        let (mut start, mut used) = (0, 0);
+        for (i, ch) in word.trim_end().char_indices() {
+            let w = ch.width().unwrap_or(0);
+            if used > 0 && used + w > width {
+                pieces.push(&word[start..i]);
+                (start, used) = (i, 0);
+            }
+            used += w;
+        }
+        pieces.push(&word[start..]);
+        pieces
     }
 
     /// Draw the table: columns as wide as their widest cell, squeezed to the page and wrapped
@@ -720,25 +742,39 @@ impl Renderer<'_> {
                 widths[last] += need - have;
             }
         }
+        // The longest word in each column: squeezed narrower than that, a word would be broken.
+        let mut longest_word = vec![0usize; columns];
+        for p in placed.iter().filter(|p| p.cols == 1) {
+            let text: String = cell_of(p).chunks.iter().map(|c| c.text.as_str()).collect();
+            let longest = text.split(' ').map(|w| w.width()).max().unwrap_or(0);
+            longest_word[p.col] = longest_word[p.col].max(longest);
+        }
         // Squeeze the widest text columns until the table fits the page. Image columns keep
-        // their width: a frame cannot wrap.
+        // their width: a frame cannot wrap. Columns first keep room for their longest word;
+        // only when the page is too narrow even for that do they go down to MIN_TABLE_COLUMN,
+        // breaking the words that no longer fit.
         let available = self
             .width
             .saturating_sub(self.prefix_width() + 3 * (columns - 1));
-        loop {
-            let total: usize = widths.iter().sum();
-            if total <= available {
-                break;
+        let whole_words: Vec<usize> = (0..columns)
+            .map(|i| longest_word[i].max(MIN_TABLE_COLUMN))
+            .collect();
+        for floors in [whole_words, vec![MIN_TABLE_COLUMN; columns]] {
+            loop {
+                let total: usize = widths.iter().sum();
+                if total <= available {
+                    break;
+                }
+                let Some(widest) = (0..columns)
+                    .filter(|&i| !has_image[i] && widths[i] > floors[i])
+                    .max_by_key(|&i| widths[i])
+                else {
+                    break;
+                };
+                widths[widest] = widths[widest]
+                    .saturating_sub(total - available)
+                    .max(floors[widest]);
             }
-            let Some(widest) = (0..columns)
-                .filter(|&i| !has_image[i] && widths[i] > MIN_TABLE_COLUMN)
-                .max_by_key(|&i| widths[i])
-            else {
-                break;
-            };
-            widths[widest] = widths[widest]
-                .saturating_sub(total - available)
-                .max(MIN_TABLE_COLUMN);
         }
         let starts: Vec<usize> = (0..columns)
             .map(|i| widths[..i].iter().sum::<usize>() + 3 * i)
@@ -1466,6 +1502,64 @@ mod tests {
                 "────┼───────────────────",
                 "key │ one two three four",
                 "    │ five six          ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_squeezed_column_keeps_room_for_its_longest_word() {
+        let r = render(
+            "| # | Region | Seal |\n|---|---|---|\n| 6 | Port Scuttlebutt (south-east) | Honesty |",
+            30,
+            40,
+            &mut Ctx,
+        );
+        // 30 less two separators leaves 24: "#" keeps 1 and "Seal" its 7, so "Region" gets 16
+        // and wraps between words.
+        assert_eq!(
+            text(&r),
+            vec![
+                "# │ Region           │ Seal   ",
+                "──┼──────────────────┼────────",
+                "6 │ Port Scuttlebutt │ Honesty",
+                "  │ (south-east)     │        ",
+            ]
+        );
+
+        // Too narrow for the old ten-column floor: "(south-east)" needs 12, and gets it.
+        let r = render(
+            "| # | Region | Taught in |\n|---|---|---|\n| 6 | Port Scuttlebutt (south-east) | the deep archive under Grudgehold |",
+            30,
+            40,
+            &mut Ctx,
+        );
+        assert_eq!(
+            text(&r),
+            vec![
+                "# │ Region        │ Taught in ",
+                "──┼───────────────┼───────────",
+                "6 │ Port          │ the deep  ",
+                "  │ Scuttlebutt   │ archive   ",
+                "  │ (south-east)  │ under     ",
+                "  │               │ Grudgehold",
+            ]
+        );
+
+        let r = render(
+            "| # | Region |\n|---|---|\n| 6 | Scuttlebutt-and-then-some |",
+            20,
+            40,
+            &mut Ctx,
+        );
+        // 20 less the separator leaves 17: "#" keeps 1 and the region squeezes to 16, too
+        // narrow for its one word, which is broken rather than pushing the divider out.
+        assert_eq!(
+            text(&r),
+            vec![
+                "# │ Region          ",
+                "──┼─────────────────",
+                "6 │ Scuttlebutt-and-",
+                "  │ then-some       ",
             ]
         );
     }
