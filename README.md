@@ -158,6 +158,22 @@ with `n`/`p` (or click it) and press `Enter` to see it at full size in a pop-up,
 size, `wikibits --probe` prints what the terminal reports about protocol and cell size. Inside
 tmux, images are drawn with block characters.
 
+## Web viewer
+
+`viewer/wikibits-viewer.html` is a read-only viewer for a wiki kept in a GitHub repository:
+one self-contained file, no server or build step. Open it in a browser and paste the link to
+the wiki's folder (`https://github.com/owner/repo/tree/main/wiki`), or open it as
+`wikibits-viewer.html?wiki=<that link>` to go straight there; `#/folder/page` after it opens
+a page. It shows the same three columns (tree, page, outline / links / backlinks) and follows
+the same rules: titles, `[[links]]`, index pages, `.order`, spanning table cells and diaBits
+diagrams. `s` searches, `v` shows the source, `w` the wiki report, `?` the keys.
+
+A private repository needs a fine-grained GitHub token with read-only Contents access (it is
+sent only to `api.github.com`); a token also lifts GitHub's limit of 60 requests an hour for
+anonymous use. Pages are cached in the browser, so reopening an unchanged wiki costs one
+request. "Open a folder on this computer" reads a local wiki folder instead. Raw HTML in pages
+is shown as text, so a wiki cannot run scripts in the viewer.
+
 ## Install
 
 **Prebuilt (Linux x86_64):** download `wikibits-<version>-x86_64-linux.tar.gz` from the
