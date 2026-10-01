@@ -1773,6 +1773,14 @@ function highlight(root, words) {
   return first;
 }
 
+// The home page (the root index.md) heads the tree, with every other page and folder nested
+// under it, so the whole wiki reads as one tree under its name.
+function nestUnderHome(nodes) {
+  if (!nodes.length || nodes[0].type !== "page" || nodes[0].id !== "index") return nodes;
+  const [home, ...rest] = nodes;
+  return [{ type: "folder", name: home.title, path: "", index: "index", children: rest }];
+}
+
 function drawTree() {
   const wiki = state.wiki;
   const cur = state.current || "";
@@ -1782,7 +1790,7 @@ function drawTree() {
   while (f) { ancestors.add(f); f = dirOf(f); }
   if (cur.endsWith("/index")) ancestors.add(cur.slice(0, -6));
   const openAll = wiki.pages.size <= 40;
-  const isOpen = (path) => state.open.has(path) || ancestors.has(path) || (openAll && !state.open.has("!" + path));
+  const isOpen = (path) => (path === "" && !state.open.has("!")) || state.open.has(path) || ancestors.has(path) || (openAll && !state.open.has("!" + path));
   const build = (nodes) => {
     const ul = document.createElement("ul");
     for (const n of nodes) {
@@ -1834,7 +1842,7 @@ function drawTree() {
   };
   const aside = $("tree");
   const scroll = aside.scrollTop;
-  aside.replaceChildren(Object.assign(document.createElement("h3"), { textContent: "Pages" }), build(wiki.tree()));
+  aside.replaceChildren(Object.assign(document.createElement("h3"), { textContent: "Pages" }), build(nestUnderHome(wiki.tree())));
   aside.scrollTop = scroll;
 }
 
