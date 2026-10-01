@@ -982,8 +982,10 @@ class Wiki {
     if (!target) return { kind: "missing", raw };
     if (target.endsWith(".md")) target = target.slice(0, -3);
     target = target.replace(/^\/+|\/+$/g, "");
-    // Index pages are reached through their folder; a direct [[folder/index]] stays red.
-    if (isIndexId(target)) return { kind: "missing", raw };
+    // A link to a folder's index page is a link to the folder: [[folder/index]], [[folder]]
+    // and [folder](folder/index.md) all open the same page and show the same title. (The
+    // terminal app shows a direct index link as missing; the viewer just follows it.)
+    if (isIndexId(target)) target = target === "index" ? "" : target.slice(0, -6);
     const fromDir = dirOf(from);
     for (const candidate of [normalize(target), normalize(fromDir + "/" + target)]) {
       const id = this.findPage(candidate);
