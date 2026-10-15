@@ -642,6 +642,47 @@ impl Renderer<'_> {
         lines
     }
 
+    /// How many lines `wrap_cell` would wrap the chunks to, without building them.
+    fn cell_lines(chunks: &[Chunk], width: usize) -> usize {
+        use unicode_width::UnicodeWidthChar;
+        let (mut lines, mut used) = (1, 0);
+        for chunk in chunks {
+            for (i, segment) in chunk.text.split('\n').enumerate() {
+                if i > 0 {
+                    (lines, used) = (lines + 1, 0);
+                }
+                for word in segment.split_inclusive(' ') {
+                    // Pieces of a word too long for the width, as `break_word` cuts it.
+                    let body = word.trim_end();
+                    let mut pieces = Vec::new();
+                    let mut piece = 0;
+                    for ch in body.chars() {
+                        let w = ch.width().unwrap_or(0);
+                        if piece > 0 && piece + w > width {
+                            pieces.push(piece);
+                            piece = 0;
+                        }
+                        piece += w;
+                    }
+                    let trailing = word.width() - body.width();
+                    let last = pieces.len();
+                    pieces.push(piece);
+                    for (n, w) in pieces.into_iter().enumerate() {
+                        let full = if n == last { w + trailing } else { w };
+                        if used > 0 && used + w > width {
+                            (lines, used) = (lines + 1, 0);
+                        }
+                        if used == 0 && w == 0 {
+                            continue;
+                        }
+                        used += full;
+                    }
+                }
+            }
+        }
+        lines
+    }
+
     /// A word as pieces no wider than `width` (its trailing space rides on the last piece).
     fn break_word(word: &str, width: usize) -> Vec<&str> {
         use unicode_width::UnicodeWidthChar;
@@ -781,73 +822,166 @@ impl Renderer<'_> {
                 .unwrap_or(0);
             longest_word[p.col] = longest_word[p.col].max(longest);
         }
-        // Squeeze the widest text columns until the table fits the page. Image columns keep
-        // their width: a frame cannot wrap. Columns first keep room for their longest word;
-        // only when the page is too narrow even for that do they go down to MIN_TABLE_COLUMN,
-        // breaking the words that no longer fit.
+        // Fit the table to the page. Image columns keep their width: a frame cannot wrap.
+        // Text columns first keep room for their longest word; only when the page is too
+        // narrow even for that do they go down to MIN_TABLE_COLUMN, breaking the words that
+        // no longer fit.
         let available = self
             .width
             .saturating_sub(self.prefix_width() + 3 * (columns - 1));
-        let whole_words: Vec<usize> = (0..columns)
-            .map(|i| longest_word[i].max(MIN_TABLE_COLUMN))
-            .collect();
-        for floors in [whole_words, vec![MIN_TABLE_COLUMN; columns]] {
-            loop {
-                let total: usize = widths.iter().sum();
-                if total <= available {
-                    break;
-                }
-                let Some(widest) = (0..columns)
-                    .filter(|&i| !has_image[i] && widths[i] > floors[i])
-                    .max_by_key(|&i| widths[i])
-                else {
-                    break;
-                };
-                widths[widest] = widths[widest]
-                    .saturating_sub(total - available)
-                    .max(floors[widest]);
-            }
-        }
-        let starts: Vec<usize> = (0..columns)
-            .map(|i| widths[..i].iter().sum::<usize>() + 3 * i)
-            .collect();
-        let span_width = |p: &Placed| -> usize {
+        let floors_for = |least: &dyn Fn(usize) -> usize| -> Vec<usize> {
+            (0..columns)
+                .map(|i| {
+                    if has_image[i] {
+                        widths[i]
+                    } else {
+                        widths[i].min(least(i))
+                    }
+                })
+                .collect()
+        };
+        let whole_words = floors_for(&|i| longest_word[i].max(MIN_TABLE_COLUMN));
+        let floors = if whole_words.iter().sum::<usize>() <= available {
+            whole_words
+        } else {
+            floors_for(&|_| MIN_TABLE_COLUMN)
+        };
+
+        let span_width = |widths: &[usize], p: &Placed| -> usize {
             let last = (p.col + p.cols).min(columns) - 1;
             widths[p.col..=last].iter().sum::<usize>() + 3 * (last - p.col)
         };
-
-        // Wrap every text cell at its span's width; an image cell is as tall as its frame.
-        let wrapped: Vec<Vec<Vec<Chunk>>> = placed
-            .iter()
-            .map(|p| {
-                let cell = cell_of(p);
-                if cell.image.is_some() {
-                    Vec::new()
-                } else {
-                    Self::wrap_cell(&cell.chunks, span_width(p))
-                }
-            })
-            .collect();
-        let tall = |i: usize| -> usize {
-            match cell_of(&placed[i]).image {
-                Some(img) => self.images[img].height as usize + 2,
-                None => wrapped[i].len(),
+        // How many lines a text cell wraps to at a width; remembered, as the layout below
+        // tries many widths.
+        let wrapped_lines = std::cell::RefCell::new(vec![Vec::<usize>::new(); placed.len()]);
+        let tall = |o: usize, width: usize| -> usize {
+            let cell = cell_of(&placed[o]);
+            if let Some(img) = cell.image {
+                return self.images[img].height as usize + 2;
             }
+            let mut known = wrapped_lines.borrow_mut();
+            let known = &mut known[o];
+            if known.len() <= width {
+                known.resize(width + 1, 0);
+            }
+            if known[width] == 0 {
+                known[width] = Self::cell_lines(&cell.chunks, width);
+            }
+            known[width]
         };
         // Row heights: the tallest single-row cell, then stretched where a cell spanning rows
-        // needs more than its rows give it.
-        let mut heights = vec![1usize; rows];
-        for (i, p) in placed.iter().enumerate() {
-            if p.rows == 1 {
-                heights[p.row] = heights[p.row].max(tall(i));
+        // needs more than its rows (and the blank lines between them) give it.
+        let row_heights = |widths: &[usize], gaps: bool| -> Vec<usize> {
+            let mut heights = vec![1usize; rows];
+            for (i, p) in placed.iter().enumerate() {
+                if p.rows == 1 {
+                    heights[p.row] = heights[p.row].max(tall(i, span_width(widths, p)));
+                }
             }
-        }
-        for (i, p) in placed.iter().enumerate().filter(|(_, p)| p.rows > 1) {
-            let last = (p.row + p.rows).min(rows) - 1;
-            let have: usize = heights[p.row..=last].iter().sum();
-            let need = tall(i);
-            if need > have {
-                heights[last] += need - have;
+            for (i, p) in placed.iter().enumerate().filter(|(_, p)| p.rows > 1) {
+                let last = (p.row + p.rows).min(rows) - 1;
+                let between = if gaps { last - p.row } else { 0 };
+                let have: usize = heights[p.row..=last].iter().sum::<usize>() + between;
+                let need = tall(i, span_width(widths, p));
+                if need > have {
+                    heights[last] += need - have;
+                }
+            }
+            heights
+        };
+        let total = |widths: &[usize]| -> usize { row_heights(widths, false).iter().sum() };
+
+        if widths.iter().sum::<usize>() > available {
+            // Too wide: start every column at its floor, then hand out the spare width where
+            // it saves the most lines per column of width, so the table is as short as it can
+            // be rather than squeezing whichever column happens to be widest.
+            let natural = std::mem::replace(&mut widths, floors);
+            let mut spare = available.saturating_sub(widths.iter().sum());
+            let mut height = total(&widths);
+            while spare > 0 {
+                let mut best: Option<(usize, usize, usize)> = None; // (column, extra, lines)
+                for i in 0..columns {
+                    let room = natural[i].saturating_sub(widths[i]).min(spare);
+                    let mut trial = widths.clone();
+                    for extra in 1..=room {
+                        trial[i] = widths[i] + extra;
+                        // The table only gets shorter where a cell in this column does.
+                        let shrinks = placed.iter().enumerate().any(|(o, p)| {
+                            (p.col..p.col + p.cols).contains(&i)
+                                && tall(o, span_width(&trial, p)) < tall(o, span_width(&widths, p))
+                        });
+                        if !shrinks {
+                            continue;
+                        }
+                        let h = total(&trial);
+                        if h < height {
+                            let saved = height - h;
+                            // Most lines saved per column given.
+                            if best.is_none_or(|(_, e, s)| saved * e > s * extra) {
+                                best = Some((i, extra, saved));
+                            }
+                            break;
+                        }
+                    }
+                }
+                // A row held up by more than one cell only gets shorter when they all widen
+                // together: try taking each row a line shorter.
+                let mut best_row: Option<(Vec<usize>, usize, usize)> = None; // (widths, extra, lines)
+                let shorter = row_heights(&widths, false);
+                let mut tried = std::collections::HashSet::new();
+                for (r, &h) in shorter.iter().enumerate().filter(|&(_, &h)| h > 1) {
+                    let mut trial = widths.clone();
+                    let fits = placed
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| p.row == r && p.rows == 1 && p.cols == 1)
+                        .all(|(o, p)| {
+                            let c = p.col;
+                            let Some(w) = (widths[c]..=natural[c]).find(|&w| tall(o, w) < h) else {
+                                return false;
+                            };
+                            trial[c] = trial[c].max(w);
+                            true
+                        });
+                    let extra = trial.iter().sum::<usize>() - widths.iter().sum::<usize>();
+                    if !fits || extra == 0 || extra > spare || !tried.insert(trial.clone()) {
+                        continue;
+                    }
+                    let h = total(&trial);
+                    if h < height {
+                        let saved = height - h;
+                        if best_row
+                            .as_ref()
+                            .is_none_or(|(_, e, s)| saved * e > s * extra)
+                        {
+                            best_row = Some((trial, extra, saved));
+                        }
+                    }
+                }
+                let (trial, extra, saved) = match (best, best_row) {
+                    (Some((_, e, s)), Some((t, re, rs))) if rs * e > s * re => (t, re, rs),
+                    (Some((i, e, s)), _) => {
+                        let mut t = widths.clone();
+                        t[i] += e;
+                        (t, e, s)
+                    }
+                    (None, Some(row)) => row,
+                    (None, None) => break,
+                };
+                widths = trial;
+                spare -= extra;
+                height -= saved;
+            }
+            // Width that saves no lines goes to the columns furthest from their natural width.
+            while spare > 0 {
+                let Some(i) = (0..columns)
+                    .filter(|&i| widths[i] < natural[i])
+                    .max_by_key(|&i| natural[i] - widths[i])
+                else {
+                    break;
+                };
+                widths[i] += 1;
+                spare -= 1;
             }
         }
 
@@ -860,79 +994,118 @@ impl Renderer<'_> {
                 cell.image.is_none() && cell.chunks.iter().all(|ch| ch.text.trim().is_empty())
             })
         });
+        // When any cell of the body takes more than one line, a blank line between rows shows
+        // where one ends and the next begins.
+        let gaps = placed.iter().enumerate().any(|(i, p)| {
+            p.row >= header_rows && p.rows == 1 && tall(i, span_width(&widths, p)) > 1
+        });
+        let heights = row_heights(&widths, gaps);
+        let starts: Vec<usize> = (0..columns)
+            .map(|i| widths[..i].iter().sum::<usize>() + 3 * i)
+            .collect();
 
-        let left = self.prefix_width();
-        for r in 0..rows {
+        // Wrap every text cell at its span's width; an image cell is drawn as its frame.
+        let wrapped: Vec<Vec<Vec<Chunk>>> = placed
+            .iter()
+            .map(|p| {
+                let cell = cell_of(p);
+                if cell.image.is_some() {
+                    Vec::new()
+                } else {
+                    Self::wrap_cell(&cell.chunks, span_width(&widths, p))
+                }
+            })
+            .collect();
+
+        // The lines to draw: each row's own lines, `None` for a blank line after a row.
+        let mut drawn: Vec<(usize, Option<usize>)> = Vec::new();
+        for (r, &height) in heights.iter().enumerate() {
             if blank_header && r < header_rows {
                 continue;
             }
-            let top = self.lines.len();
-            for p in placed.iter().filter(|p| p.row == r) {
-                if let Some(img) = cell_of(p).image {
-                    let slot = &mut self.images[img];
-                    slot.line = top;
-                    slot.x = (left + starts[p.col] + 1) as u16;
+            drawn.extend((0..height).map(|k| (r, Some(k))));
+            if gaps && r >= header_rows && r + 1 < rows {
+                drawn.push((r, None));
+            }
+        }
+        let left = self.prefix_width();
+        // The table line each cell starts on.
+        let mut first_line = vec![0usize; placed.len()];
+        for (n, &(r, k)) in drawn.iter().enumerate() {
+            if k == Some(0) {
+                let top = self.lines.len();
+                for (o, p) in placed.iter().enumerate().filter(|(_, p)| p.row == r) {
+                    first_line[o] = n;
+                    if let Some(img) = cell_of(p).image {
+                        let slot = &mut self.images[img];
+                        slot.line = top;
+                        slot.x = (left + starts[p.col] + 1) as u16;
+                    }
                 }
             }
-            for k in 0..heights[r] {
-                for c in 0..columns {
-                    let Some(o) = owner[r][c] else {
-                        if c > 0 {
-                            self.emit(" │ ", DIM, None);
-                        }
-                        self.emit(&" ".repeat(widths[c]), Style::default(), None);
-                        continue;
-                    };
-                    let p = &placed[o];
-                    if p.col != c {
-                        // Covered by a cell spanning columns: it drew across this one.
-                        continue;
+            for c in 0..columns {
+                // A blank line between rows is still crossed by a cell spanning both.
+                let owner = match k {
+                    Some(_) => owner[r][c],
+                    None => {
+                        owner[r][c].filter(|&o| owner.get(r + 1).is_some_and(|n| n[c] == Some(o)))
                     }
+                };
+                let Some(o) = owner else {
                     if c > 0 {
                         self.emit(" │ ", DIM, None);
                     }
-                    // Which line of the cell this is: the rows above it in the span, then k.
-                    let line = heights[p.row..r].iter().sum::<usize>() + k;
-                    let width = span_width(p);
-                    let mut used = 0;
-                    let cell = cell_of(p);
-                    if let Some(img) = cell.image {
-                        let (w, h) = (
-                            self.images[img].width as usize,
-                            self.images[img].height as usize,
-                        );
-                        let frame = if line == 0 {
-                            Some(format!("╭{}╮", "─".repeat(w)))
-                        } else if line <= h {
-                            Some(format!("│{}│", " ".repeat(w)))
-                        } else if line == h + 1 {
-                            Some(format!("╰{}╯", "─".repeat(w)))
-                        } else {
-                            None
-                        };
-                        if let Some(frame) = frame {
-                            self.emit(&frame, FRAME, None);
-                            used = w + 2;
-                        }
-                    } else if let Some(chunks) = wrapped[o].get(line) {
-                        for chunk in chunks {
-                            let style = if r < header_rows {
-                                chunk.style.add_modifier(Modifier::BOLD)
-                            } else {
-                                chunk.style
-                            };
-                            self.emit(&chunk.text, style, chunk.link);
-                            used += chunk.text.width();
-                        }
+                    self.emit(&" ".repeat(widths[c]), Style::default(), None);
+                    continue;
+                };
+                let p = &placed[o];
+                if p.col != c {
+                    // Covered by a cell spanning columns: it drew across this one.
+                    continue;
+                }
+                if c > 0 {
+                    self.emit(" │ ", DIM, None);
+                }
+                let line = n - first_line[o];
+                let width = span_width(&widths, p);
+                let mut used = 0;
+                let cell = cell_of(p);
+                if let Some(img) = cell.image {
+                    let (w, h) = (
+                        self.images[img].width as usize,
+                        self.images[img].height as usize,
+                    );
+                    let frame = if line == 0 {
+                        Some(format!("╭{}╮", "─".repeat(w)))
+                    } else if line <= h {
+                        Some(format!("│{}│", " ".repeat(w)))
+                    } else if line == h + 1 {
+                        Some(format!("╰{}╯", "─".repeat(w)))
+                    } else {
+                        None
+                    };
+                    if let Some(frame) = frame {
+                        self.emit(&frame, FRAME, None);
+                        used = w + 2;
                     }
-                    if used < width {
-                        self.emit(&" ".repeat(width - used), Style::default(), None);
+                } else if let Some(chunks) = wrapped[o].get(line) {
+                    for chunk in chunks {
+                        let style = if r < header_rows {
+                            chunk.style.add_modifier(Modifier::BOLD)
+                        } else {
+                            chunk.style
+                        };
+                        self.emit(&chunk.text, style, chunk.link);
+                        used += chunk.text.width();
                     }
                 }
-                self.at_line_start = false;
-                self.newline();
+                if used < width {
+                    self.emit(&" ".repeat(width - used), Style::default(), None);
+                }
             }
-            if r + 1 == header_rows && !blank_header {
+            self.at_line_start = false;
+            self.newline();
+            if r + 1 == header_rows && k == Some(heights[r] - 1) && !blank_header {
                 let rule = widths
                     .iter()
                     .map(|w| "─".repeat(*w))
@@ -1503,6 +1676,64 @@ mod tests {
     }
 
     #[test]
+    fn width_goes_where_it_saves_the_most_lines() {
+        // Squeezing the widest column would wrap the note into a narrow ribbon; the short
+        // hints column gives way instead, and the rows wrapping get a blank line between them.
+        let r = render(
+            "| Note | Hints |\n|---|---|\n\
+             | one two three four five six seven eight nine ten | go: north, look: door |\n\
+             | short | ask: plate |",
+            40,
+            40,
+            &mut Ctx,
+        );
+        assert_eq!(
+            text(&r),
+            vec![
+                "Note                        │ Hints     ",
+                "────────────────────────────┼───────────",
+                "one two three four five six │ go: north,",
+                "seven eight nine ten        │ look: door",
+                "                            │           ",
+                "short                       │ ask: plate",
+            ]
+        );
+    }
+
+    #[test]
+    fn counting_a_cells_lines_agrees_with_wrapping_it() {
+        let texts = [
+            "a bb ccc dddd eeeee",
+            "superlongwordhere and more",
+            "  lead and trail  ",
+            "x\ny z\n\nw",
+            "日本語のテキスト です",
+            "",
+        ];
+        for text in texts {
+            let chunks = [
+                Chunk {
+                    text: text.into(),
+                    style: Style::default(),
+                    link: None,
+                },
+                Chunk {
+                    text: " more words".into(),
+                    style: DIM,
+                    link: None,
+                },
+            ];
+            for width in 1..30 {
+                assert_eq!(
+                    Renderer::cell_lines(&chunks, width),
+                    Renderer::wrap_cell(&chunks, width).len(),
+                    "{text:?} at {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn an_empty_header_row_is_not_drawn() {
         let r = render("| | |\n|---|---|\n| a | b |\n| c | d |", 80, 40, &mut Ctx);
         assert_eq!(text(&r), vec!["a │ b", "c │ d"]);
@@ -1609,12 +1840,12 @@ mod tests {
         assert_eq!(
             text(&r),
             vec![
-                "# │ Region        │ Taught in ",
-                "──┼───────────────┼───────────",
-                "6 │ Port          │ the deep  ",
-                "  │ Scuttlebutt   │ archive   ",
-                "  │ (south-east)  │ under     ",
-                "  │               │ Grudgehold",
+                "# │ Region       │ Taught in  ",
+                "──┼──────────────┼────────────",
+                "6 │ Port         │ the deep   ",
+                "  │ Scuttlebutt  │ archive    ",
+                "  │ (south-east) │ under      ",
+                "  │              │ Grudgehold ",
             ]
         );
 
