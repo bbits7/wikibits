@@ -4,6 +4,7 @@ set -eu
 # Install wikiBits for the current user: the binary in ~/.local/bin, plus a launcher entry
 # and icon so it shows up in the app launcher. Works from a source checkout (builds with
 # cargo) and from a release tarball (which ships the binary next to this script).
+# (`command -p install`: this script is itself called install, and its folder may be on PATH.)
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
@@ -15,8 +16,8 @@ else
     BINARY="$ROOT/target/release/wikibits"
 fi
 
-install -Dm755 "$BINARY" "$PREFIX/bin/wikibits"
-install -Dm644 "$ROOT/data/wikibits.svg" "$PREFIX/share/icons/hicolor/scalable/apps/wikibits.svg"
+command -p install -Dm755 "$BINARY" "$PREFIX/bin/wikibits"
+command -p install -Dm644 "$ROOT/data/wikibits.svg" "$PREFIX/share/icons/hicolor/scalable/apps/wikibits.svg"
 mkdir -p "$PREFIX/share/applications"
 sed "s|@BINDIR@|$PREFIX/bin|" "$ROOT/data/wikibits.desktop" \
     > "$PREFIX/share/applications/wikibits.desktop"
