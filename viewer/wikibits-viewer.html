@@ -1116,7 +1116,8 @@ class Wiki {
 // ======================================================================================
 // Markdown: marked with wikiBits additions ([[wiki links]], diaBits blocks, cells that
 // span with ^^ and <<, an empty header row left undrawn). Raw HTML is shown as text, as in
-// the terminal, which also keeps a wiki's content from running scripts in this page.
+// the terminal, which also keeps a wiki's content from running scripts in this page —
+// except <br>, which breaks the line there too.
 // ======================================================================================
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -1134,8 +1135,19 @@ const wikiLinkExtension = {
   renderer(token) { return render.wikiLink(token); },
 };
 
+// A literal \n in the text breaks the line, as <br> does (code spans keep it as written).
+const newlineExtension = {
+  name: "backslashN",
+  level: "inline",
+  start(src) { const i = src.indexOf("\\n"); return i < 0 ? undefined : i; },
+  tokenizer(src) {
+    if (src.startsWith("\\n")) return { type: "br", raw: "\\n" };
+    return undefined;
+  },
+};
+
 const md = new marked.Marked({ gfm: true });
-md.use({ extensions: [wikiLinkExtension] });
+md.use({ extensions: [wikiLinkExtension, newlineExtension] });
 
 // Every link target in the document, in order, without duplicates.
 function extractLinks(text) {
@@ -1246,6 +1258,7 @@ md.use({
       return `<pre>${label}<code>${esc(token.text)}</code></pre>\n`;
     },
     html(token) {
+      if (!token.block && /^<br\s*\/?>$/i.test(token.text.trim())) return "<br>";
       return token.block ? `<p>${esc(token.text)}</p>\n` : esc(token.text);
     },
     listitem(item) {

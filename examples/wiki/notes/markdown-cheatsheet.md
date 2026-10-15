@@ -9,6 +9,8 @@ Headings: `#` and `##` draw as a full-width band, `###` and deeper are underline
 Plain, *emphasis*, **strong**, ~~struck~~ and `inline code`. A long paragraph wraps at the
 column width, keeping words whole.
 
+A `<br>` or a literal `\n` breaks the line<br>like this,\nor this.
+
 ## Lists
 
 - Bullets
@@ -42,6 +44,7 @@ fn main() {
 |--------|---------|
 | Pages | the folder tree |
 | Related | outline, links and backlinks |
+| Breaks | `<br>` or `\n` start<br>a new line\nin a cell |
 
 ## Diagrams
 

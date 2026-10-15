@@ -206,6 +206,13 @@ struct Table {
     header_rows: usize,
 }
 
+/// Whether an inline HTML tag is a line break: `<br>`, `<br/>` or `<br />`, any case.
+fn is_br(html: &str) -> bool {
+    let tag = html.trim().to_ascii_lowercase();
+    let tag = tag.strip_suffix('>').and_then(|t| t.strip_prefix("<br"));
+    tag.is_some_and(|rest| rest.trim_end().trim_end_matches('/').trim().is_empty())
+}
+
 /// Narrowest a text column is squeezed to when a table is wider than the page.
 const MIN_TABLE_COLUMN: usize = 10;
 
@@ -392,6 +399,18 @@ impl Renderer<'_> {
         }
     }
 
+    /// Start a new line within the paragraph, or within the table cell being written.
+    fn line_break(&mut self) {
+        if self.table.is_some() {
+            let style = self.style();
+            self.emit("\n", style, None);
+            return;
+        }
+        self.trim_trailing_space();
+        self.at_line_start = false;
+        self.newline();
+    }
+
     fn trim_trailing_space(&mut self) {
         if let Some(last) = self.cur.last_mut() {
             let trimmed = last.content.trim_end().to_string();
@@ -574,39 +593,47 @@ impl Renderer<'_> {
 
     /// Word-wrap a cell's chunks into lines no wider than `width`, keeping each chunk's style
     /// and link. A word longer than the width is broken across lines, so the column stays
-    /// straight.
+    /// straight, and a `\n` (from `<br>`) always starts a new line.
     fn wrap_cell(chunks: &[Chunk], width: usize) -> Vec<Vec<Chunk>> {
         let mut lines: Vec<Vec<Chunk>> = vec![Vec::new()];
         let mut used = 0usize;
         for chunk in chunks {
-            for word in chunk
-                .text
-                .split_inclusive(' ')
-                .flat_map(|word| Self::break_word(word, width))
-            {
-                let w = word.trim_end().width();
-                if used > 0 && used + w > width {
+            for (i, segment) in chunk.text.split('\n').enumerate() {
+                if i > 0 {
                     if let Some(last) = lines.last_mut().and_then(|l| l.last_mut()) {
                         last.text = last.text.trim_end().to_string();
                     }
                     lines.push(Vec::new());
                     used = 0;
                 }
-                if used == 0 && word.trim().is_empty() {
-                    continue;
-                }
-                let line = lines.last_mut().expect("a line is always open");
-                match line.last_mut() {
-                    Some(last) if last.style == chunk.style && last.link == chunk.link => {
-                        last.text.push_str(word);
+                for word in segment
+                    .split_inclusive(' ')
+                    .flat_map(|word| Self::break_word(word, width))
+                {
+                    let w = word.trim_end().width();
+                    if used > 0 && used + w > width {
+                        if let Some(last) = lines.last_mut().and_then(|l| l.last_mut()) {
+                            last.text = last.text.trim_end().to_string();
+                        }
+                        lines.push(Vec::new());
+                        used = 0;
                     }
-                    _ => line.push(Chunk {
-                        text: word.to_string(),
-                        style: chunk.style,
-                        link: chunk.link,
-                    }),
+                    if used == 0 && word.trim().is_empty() {
+                        continue;
+                    }
+                    let line = lines.last_mut().expect("a line is always open");
+                    match line.last_mut() {
+                        Some(last) if last.style == chunk.style && last.link == chunk.link => {
+                            last.text.push_str(word);
+                        }
+                        _ => line.push(Chunk {
+                            text: word.to_string(),
+                            style: chunk.style,
+                            link: chunk.link,
+                        }),
+                    }
+                    used += word.width();
                 }
-                used += word.width();
             }
         }
         if let Some(last) = lines.last_mut().and_then(|l| l.last_mut()) {
@@ -714,7 +741,8 @@ impl Renderer<'_> {
         }
         let cell_of = |p: &Placed| if p.blank { &empty } else { at(p.row, p.col) };
         let natural = |cell: &Cell| -> usize {
-            let text: usize = cell.chunks.iter().map(|c| c.text.width()).sum();
+            let text: String = cell.chunks.iter().map(|c| c.text.as_str()).collect();
+            let text = text.split('\n').map(|l| l.width()).max().unwrap_or(0);
             match cell.image {
                 Some(i) => text.max(self.images[i].width as usize + 2),
                 None => text,
@@ -746,7 +774,11 @@ impl Renderer<'_> {
         let mut longest_word = vec![0usize; columns];
         for p in placed.iter().filter(|p| p.cols == 1) {
             let text: String = cell_of(p).chunks.iter().map(|c| c.text.as_str()).collect();
-            let longest = text.split(' ').map(|w| w.width()).max().unwrap_or(0);
+            let longest = text
+                .split([' ', '\n'])
+                .map(|w| w.width())
+                .max()
+                .unwrap_or(0);
             longest_word[p.col] = longest_word[p.col].max(longest);
         }
         // Squeeze the widest text columns until the table fits the page. Image columns keep
@@ -865,7 +897,10 @@ impl Renderer<'_> {
                     let mut used = 0;
                     let cell = cell_of(p);
                     if let Some(img) = cell.image {
-                        let (w, h) = (self.images[img].width as usize, self.images[img].height as usize);
+                        let (w, h) = (
+                            self.images[img].width as usize,
+                            self.images[img].height as usize,
+                        );
                         let frame = if line == 0 {
                             Some(format!("╭{}╮", "─".repeat(w)))
                         } else if line <= h {
@@ -925,7 +960,13 @@ impl Renderer<'_> {
                 } else if self.in_code_block {
                     self.write_code_block(&text);
                 } else if !self.skip_text {
-                    self.write(&text);
+                    // A literal `\n` in the text breaks the line, as `<br>` does.
+                    for (i, piece) in text.split("\\n").enumerate() {
+                        if i > 0 {
+                            self.line_break();
+                        }
+                        self.write(piece);
+                    }
                 }
             }
             Event::Code(code) => {
@@ -939,11 +980,7 @@ impl Renderer<'_> {
                 self.emit(&text, style, link);
             }
             Event::SoftBreak => self.write(" "),
-            Event::HardBreak => {
-                self.trim_trailing_space();
-                self.at_line_start = false;
-                self.newline();
-            }
+            Event::HardBreak => self.line_break(),
             Event::Rule => {
                 self.start_block();
                 let rule = "─".repeat(self.width.saturating_sub(self.prefix_width()));
@@ -969,6 +1006,7 @@ impl Renderer<'_> {
                 });
                 self.items.push(Item::Task(self.tasks.len() - 1));
             }
+            Event::InlineHtml(html) if is_br(&html) => self.line_break(),
             Event::Html(html) | Event::InlineHtml(html) => {
                 let style = self.style().patch(DIM);
                 let link = self.cur_link;
@@ -1440,6 +1478,31 @@ mod tests {
     }
 
     #[test]
+    fn br_and_backslash_n_break_lines() {
+        let r = render("one<br>two\\nthree<BR />four `a\\nb`", 80, 40, &mut Ctx);
+        assert_eq!(text(&r), vec!["one", "two", "three", "four a\\nb"]);
+    }
+
+    #[test]
+    fn br_and_backslash_n_break_lines_in_table_cells() {
+        let r = render(
+            "| a | b |\n|---|---|\n| one<br/>two | x\\nlonger y |",
+            80,
+            40,
+            &mut Ctx,
+        );
+        assert_eq!(
+            text(&r),
+            vec![
+                "a   │ b       ",
+                "────┼─────────",
+                "one │ x       ",
+                "two │ longer y"
+            ]
+        );
+    }
+
+    #[test]
     fn an_empty_header_row_is_not_drawn() {
         let r = render("| | |\n|---|---|\n| a | b |\n| c | d |", 80, 40, &mut Ctx);
         assert_eq!(text(&r), vec!["a │ b", "c │ d"]);
@@ -1447,13 +1510,23 @@ mod tests {
 
     #[test]
     fn a_cell_of_two_carets_merges_with_the_cell_above() {
-        let r = render("| | |\n|---|---|\n| x | one |\n| ^^ | two |", 80, 40, &mut Ctx);
+        let r = render(
+            "| | |\n|---|---|\n| x | one |\n| ^^ | two |",
+            80,
+            40,
+            &mut Ctx,
+        );
         assert_eq!(text(&r), vec!["x │ one", "  │ two"]);
     }
 
     #[test]
     fn a_cell_of_two_chevrons_merges_with_the_cell_to_its_left() {
-        let r = render("| | | |\n|---|---|---|\n| p | q | r |\n| wide | << | c |", 80, 40, &mut Ctx);
+        let r = render(
+            "| | | |\n|---|---|---|\n| p | q | r |\n| wide | << | c |",
+            80,
+            40,
+            &mut Ctx,
+        );
         assert_eq!(text(&r), vec!["p │ q │ r", "wide  │ c"]);
     }
 
