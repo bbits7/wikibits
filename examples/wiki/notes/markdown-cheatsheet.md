@@ -26,6 +26,13 @@ A `<br>` or a literal `\n` breaks the line<br>like this,\nor this.
 - [x] A finished task
 - [ ] An open task — select it with `n` and press `x` to tick it
 
+## Links to a place on a page
+
+`[[getting-started#Keys]]` opens a page at a heading (its text, or its slug `#keys`), and
+`[[#Table]]` jumps within this page. A hidden `{#name}` anchor marks a line without drawing
+anything: this paragraph carries one {#anchor-demo}, so `[[notes/markdown-cheatsheet#anchor-demo]]`
+lands here even though it has no heading.
+
 ## Quote
 
 > Wikis are the original hypertext for people who just want to write.

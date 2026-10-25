@@ -203,6 +203,10 @@ impl Wiki {
         }
         let mut target = raw.split('#').next().unwrap_or("").trim();
         if target.is_empty() {
+            // `[[#Heading]]`: a place on this page.
+            if link_anchor(raw).is_some() {
+                return LinkTarget::Page(from.to_string());
+            }
             return LinkTarget::Missing(raw.to_string());
         }
         if let Some(stripped) = target.strip_suffix(".md") {
@@ -1039,7 +1043,8 @@ fn extract_links(text: &str) -> Vec<String> {
                 dest_url,
                 ..
             }) => {
-                if !matches!(link_type, LinkType::Email) {
+                // A link to a place on this page is not a link to another page.
+                if !matches!(link_type, LinkType::Email) && !dest_url.starts_with('#') {
                     add(wiki_dest(link_type, &dest_url).to_string());
                 }
             }
@@ -1114,6 +1119,32 @@ pub fn wiki_dest(link_type: LinkType, dest: &str) -> &str {
     }
 }
 
+/// The heading or anchor a link points at: what follows `#` in `[[page#Heading]]`.
+pub fn link_anchor(raw: &str) -> Option<String> {
+    let (_, anchor) = raw.split_once('#')?;
+    let anchor = anchor.trim();
+    (!anchor.is_empty()).then(|| anchor.to_string())
+}
+
+/// A heading's text as a slug, so `[[page#my-heading]]` finds "My Heading": lower case,
+/// punctuation dropped, spaces as dashes (the same rule as the web viewer's heading ids).
+pub fn heading_slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut space = false;
+    for c in text.trim().chars() {
+        if c.is_whitespace() {
+            space = true;
+        } else if c.is_alphanumeric() || c == '-' {
+            if space && !out.is_empty() {
+                out.push('-');
+            }
+            space = false;
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
 /// A byte offset into the text `escape_link_pipes` returned, as an offset into its source.
 pub fn source_offset(added: &[usize], offset: usize) -> usize {
     offset - added.iter().filter(|&&a| a < offset).count()
@@ -1161,6 +1192,20 @@ mod tests {
     fn slugs_become_readable() {
         assert_eq!(prettify("my-wiki-page"), "My wiki page");
         assert_eq!(prettify("projects/calc_bits"), "Calc bits");
+    }
+
+    #[test]
+    fn anchors_and_slugs() {
+        assert_eq!(link_anchor("a/b#My Heading").as_deref(), Some("My Heading"));
+        assert_eq!(link_anchor("a/b#"), None);
+        assert_eq!(link_anchor("a/b"), None);
+        assert_eq!(heading_slug("My  Heading: Two!"), "my-heading-two");
+        assert_eq!(
+            heading_slug(" Übung macht den Meister "),
+            "übung-macht-den-meister"
+        );
+        let links = extract_links("[[a/b#Sec]] [[#here]] [x](#here) [y](c.md#top)");
+        assert_eq!(links, vec!["a/b#Sec", "c.md#top"]);
     }
 
     #[test]
@@ -1229,6 +1274,19 @@ mod tests {
         assert_eq!(
             wiki.resolve("projects/index", "calc"),
             LinkTarget::Page("projects/calc".into())
+        );
+        // A heading on another page, or on this one.
+        assert_eq!(
+            wiki.resolve("projects/index", "calc#Usage"),
+            LinkTarget::Page("projects/calc".into())
+        );
+        assert_eq!(
+            wiki.resolve("projects/calc", "#Usage"),
+            LinkTarget::Page("projects/calc".into())
+        );
+        assert_eq!(
+            wiki.resolve("projects/calc", "#"),
+            LinkTarget::Missing("#".into())
         );
         assert_eq!(
             wiki.resolve("index", "projects/index"),

@@ -8,7 +8,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::wiki::{LinkTarget, escape_link_pipes, parser_options, source_offset, wiki_dest};
+use crate::wiki::{
+    LinkTarget, escape_link_pipes, link_anchor, parser_options, source_offset, wiki_dest,
+};
 
 pub struct Rendered {
     pub lines: Vec<Line<'static>>,
@@ -19,6 +21,8 @@ pub struct Rendered {
     /// Headings in document order, for the table of contents.
     pub headings: Vec<Heading>,
     pub tasks: Vec<TaskSlot>,
+    /// Hidden anchors (`{#name}`), each with the line it marks.
+    pub anchors: Vec<(String, usize)>,
 }
 
 pub struct Heading {
@@ -51,6 +55,8 @@ pub struct TaskSlot {
 
 pub struct Link {
     pub target: LinkTarget,
+    /// The heading or anchor after `#` in the link, to scroll to once the page is open.
+    pub anchor: Option<String>,
     /// `(line index, span index)` of every span that belongs to this link.
     pub spans: Vec<(usize, usize)>,
 }
@@ -113,6 +119,10 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         skip_text: false,
         hiding_title: false,
         table: None,
+        anchors: Vec::new(),
+        pending_anchors: Vec::new(),
+        block_start: 0,
+        block_blank: false,
     };
     r.start_line();
     // `[[page|label]]` keeps its pipe out of the table parser; source ranges (task boxes)
@@ -133,6 +143,7 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         items: r.items,
         headings: r.headings,
         tasks: r.tasks,
+        anchors: r.anchors,
     }
 }
 
@@ -176,6 +187,7 @@ pub fn render_raw(text: &str, width: u16) -> Rendered {
         items: Vec::new(),
         headings,
         tasks: Vec::new(),
+        anchors: Vec::new(),
     }
 }
 
@@ -208,6 +220,35 @@ struct Cell {
 struct Table {
     rows: Vec<Vec<Cell>>,
     header_rows: usize,
+}
+
+/// `text` without its `{#name}` anchors, and the names taken out.
+fn strip_anchors(text: &str) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(text.len());
+    let mut names = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("{#") {
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end)
+                if end > 0 && !after[..end].chars().any(|c| c.is_whitespace() || c == '{') =>
+            {
+                out.push_str(&rest[..start]);
+                names.push(after[..end].to_string());
+                rest = &after[end + 1..];
+                // Not two spaces where the anchor sat between words.
+                if (out.is_empty() || out.ends_with(' ')) && rest.starts_with(' ') {
+                    rest = &rest[1..];
+                }
+            }
+            _ => {
+                out.push_str(&rest[..start + 2]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    (out, names)
 }
 
 /// Whether an inline HTML tag is a line break: `<br>`, `<br/>` or `<br />`, any case.
@@ -260,6 +301,14 @@ struct Renderer<'a> {
     /// breadcrumbs already show it.
     hiding_title: bool,
     table: Option<Table>,
+    anchors: Vec<(String, usize)>,
+    /// Anchors read but not yet placed: they mark the next line something is written on.
+    pending_anchors: Vec<String>,
+    /// `lines.len()` when the current block began, and whether `start_block` put a blank
+    /// line before it (a block that then draws nothing, like a lone `{#anchor}`, takes it
+    /// back so the page does not get a double gap).
+    block_start: usize,
+    block_blank: bool,
 }
 
 pub const PAGE_LINK: Style = Style::new()
@@ -345,21 +394,31 @@ impl Renderer<'_> {
     /// Called before a block element: separates it from the previous block.
     fn start_block(&mut self) {
         self.finish_line();
-        if self.need_blank && !self.lines.is_empty() {
+        self.block_blank = self.need_blank && !self.lines.is_empty();
+        if self.block_blank {
             self.blank_line();
         }
+        self.block_start = self.lines.len();
         self.need_blank = false;
         self.start_line();
     }
 
     fn end_block(&mut self) {
         self.finish_line();
+        if self.block_blank && self.at_line_start && self.lines.len() == self.block_start {
+            // Nothing was drawn for the block: no gap for it either.
+            self.lines.pop();
+        }
+        self.block_blank = false;
         self.need_blank = true;
     }
 
     fn emit(&mut self, text: &str, style: Style, link: Option<usize>) {
         if text.is_empty() {
             return;
+        }
+        for name in self.pending_anchors.drain(..) {
+            self.anchors.push((name, self.lines.len()));
         }
         if let Some((_, _, heading_text)) = &mut self.heading {
             heading_text.push_str(text);
@@ -480,6 +539,7 @@ impl Renderer<'_> {
         let show_title = matches!(link_type, LinkType::WikiLink { has_pothole: false });
         self.links.push(Link {
             target: target.clone(),
+            anchor: link_anchor(dest),
             spans: Vec::new(),
         });
         self.cur_link = Some(self.links.len() - 1);
@@ -585,7 +645,11 @@ impl Renderer<'_> {
     /// private-use character (a different one per link) as wide as the text it shows, so
     /// the diagram is laid out around the text without ever parsing it. Returns the marked
     /// source and, per link, its text and target; `diagram_line` swaps the runs back.
-    fn mark_diagram_links(&self, source: &str) -> (String, Vec<(String, LinkTarget)>) {
+    #[allow(clippy::type_complexity)]
+    fn mark_diagram_links(
+        &self,
+        source: &str,
+    ) -> (String, Vec<(String, LinkTarget, Option<String>)>) {
         let mut out = String::with_capacity(source.len());
         let mut links = Vec::new();
         let mut rest = source;
@@ -608,7 +672,7 @@ impl Renderer<'_> {
                 };
                 let mark = char::from_u32(DIAGRAM_LINK_MARK + links.len() as u32).unwrap();
                 out.extend(std::iter::repeat_n(mark, text.width().max(1)));
-                links.push((text, target));
+                links.push((text, target, link_anchor(raw)));
                 rest = &inner[close + 2..];
             } else {
                 let c = rest.chars().next().unwrap();
@@ -624,7 +688,7 @@ impl Renderer<'_> {
     fn diagram_line(
         &mut self,
         line: &str,
-        links: &[(String, LinkTarget)],
+        links: &[(String, LinkTarget, Option<String>)],
         indices: &mut [Option<usize>],
     ) {
         let mut plain = String::new();
@@ -640,10 +704,11 @@ impl Renderer<'_> {
             }
             self.emit(&plain, DIAGRAM, None);
             plain.clear();
-            let (text, target) = &links[k];
+            let (text, target, anchor) = &links[k];
             let index = *indices[k].get_or_insert_with(|| {
                 self.links.push(Link {
                     target: target.clone(),
+                    anchor: anchor.clone(),
                     spans: Vec::new(),
                 });
                 self.items.push(Item::Link(self.links.len() - 1));
@@ -1233,6 +1298,8 @@ impl Renderer<'_> {
             Event::End(tag) => self.end(tag),
             Event::Text(text) => {
                 if self.hiding_title {
+                    let (text, names) = strip_anchors(&text);
+                    self.pending_anchors.extend(names);
                     if let Some((_, _, heading)) = &mut self.heading {
                         heading.push_str(&text);
                     }
@@ -1243,6 +1310,9 @@ impl Renderer<'_> {
                 } else if self.in_code_block {
                     self.write_code_block(&text);
                 } else if !self.skip_text {
+                    // A hidden `{#anchor}` marks the line and is not drawn.
+                    let (text, names) = strip_anchors(&text);
+                    self.pending_anchors.extend(names);
                     // A literal `\n` in the text breaks the line, as `<br>` does.
                     for (i, piece) in text.split("\\n").enumerate() {
                         if i > 0 {
@@ -1506,7 +1576,7 @@ mod tests {
     struct Ctx;
     impl Context for Ctx {
         fn resolve(&self, raw: &str) -> LinkTarget {
-            match raw {
+            match raw.split('#').next().unwrap_or(raw) {
                 "a/b" => LinkTarget::Page("a/b".into()),
                 r if r.contains("://") => LinkTarget::External(r.into()),
                 r => LinkTarget::Missing(r.into()),
@@ -1605,6 +1675,42 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("diaBits: line 2: no shape named 'nope'"))
         );
+    }
+
+    #[test]
+    fn links_carry_their_heading_and_hidden_anchors_mark_a_line() {
+        let src = "# Title {#top}\n\nSee [[a/b#Usage]] and [x](a/b#set-up).\n\n{#middle}\n\nA paragraph {#here} with an anchor.\n\n## Later {#later}\n\n{#x}";
+        let r = render(src, 80, 40, &mut Ctx);
+        let lines = text(&r);
+        println!("{}", lines.join("\n"));
+        assert_eq!(
+            lines,
+            vec![
+                "See Page B and x.",
+                "",
+                "A paragraph with an anchor.",
+                "",
+                " Later                                                                          ",
+            ]
+        );
+        assert_eq!(r.links[0].anchor.as_deref(), Some("Usage"));
+        assert_eq!(r.links[1].anchor.as_deref(), Some("set-up"));
+        assert_eq!(r.headings[0].text, "Title");
+        assert_eq!(r.headings[1].text, "Later");
+        assert_eq!(
+            r.anchors,
+            vec![
+                ("top".to_string(), 0),
+                ("middle".to_string(), 2),
+                ("here".to_string(), 2),
+                ("later".to_string(), 4),
+            ]
+        );
+        assert_eq!(
+            strip_anchors("a {#b c} d {# } {#ok}e").0,
+            "a {#b c} d {# } e"
+        );
+        assert_eq!(strip_anchors("{#a} b {#c} d {#e}").0, "b d ");
     }
 
     #[test]

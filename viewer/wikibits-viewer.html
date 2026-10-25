@@ -1183,7 +1183,8 @@ class Wiki {
     raw = raw.trim();
     if (raw.includes("://") || raw.startsWith("mailto:")) return { kind: "external", url: raw };
     let target = raw.split("#")[0].trim();
-    if (!target) return { kind: "missing", raw };
+    // [[#Heading]]: a place on this page.
+    if (!target) return raw.startsWith("#") && raw.slice(1).trim() ? { kind: "page", id: from, anchor: raw.slice(1).trim() } : { kind: "missing", raw };
     if (target.endsWith(".md")) target = target.slice(0, -3);
     target = target.replace(/^\/+|\/+$/g, "");
     // A link to a folder's index page is a link to the folder: [[folder/index]], [[folder]]
@@ -1351,7 +1352,19 @@ const newlineExtension = {
 };
 
 const md = new marked.Marked({ gfm: true });
-md.use({ extensions: [wikiLinkExtension, newlineExtension] });
+// A hidden anchor {#name}: not drawn, but [[page#name]] scrolls to it.
+const anchorExtension = {
+  name: "anchor",
+  level: "inline",
+  start(src) { const i = src.indexOf("{#"); return i < 0 ? undefined : i; },
+  tokenizer(src) {
+    const m = /^\{#([^\s{}]+)\}/.exec(src);
+    return m ? { type: "anchor", raw: m[0], name: m[1] } : undefined;
+  },
+  renderer(token) { return `<a id="h-${esc(render.slug(token.name))}" class="anchor"></a>`; },
+};
+
+md.use({ extensions: [wikiLinkExtension, newlineExtension, anchorExtension] });
 
 // Every link target in the document, in order, without duplicates.
 function extractLinks(text) {
@@ -1360,8 +1373,9 @@ function extractLinks(text) {
   let tokens;
   try { tokens = md.lexer(parsable(text)); } catch { return links; }
   md.walkTokens(tokens, (t) => {
-    if (t.type === "wikilink") add(t.target.trim());
-    else if (t.type === "link" && !/^mailto:/i.test(t.href) && !(t.text && t.href === "mailto:" + t.text)) add(decodeHref(t.href));
+    // A link to a place on this page is not a link to another page.
+    if (t.type === "wikilink") { if (!t.target.trim().startsWith("#")) add(t.target.trim()); }
+    else if (t.type === "link" && !t.href.startsWith("#") && !/^mailto:/i.test(t.href) && !(t.text && t.href === "mailto:" + t.text)) add(decodeHref(t.href));
     else if (t.type === "code" && /^diabits$/i.test((t.lang || "").trim().split(/\s+/)[0] || "")) {
       // The [[links]] written in a diagram's labels.
       for (const m of t.text.matchAll(/\[\[([^\[\]\n]+?)\]\]/g)) {
@@ -1449,6 +1463,8 @@ md.use({
     paragraph(token) {
       const t = token.tokens || [];
       const only = t.filter((x) => !(x.type === "text" && !x.raw.trim()));
+      // A paragraph of nothing but hidden anchors takes no room.
+      if (only.length && only.every((x) => x.type === "anchor")) return this.parser.parseInline(only);
       if (only.length === 1 && only[0].type === "image") {
         const alt = only[0].text || "";
         return `<figure>${render.imageHtml(only[0].href || "", alt, only[0].title)}${alt ? `<figcaption>${esc(alt)}</figcaption>` : ""}</figure>\n`;
@@ -1457,7 +1473,7 @@ md.use({
     },
     heading(token) {
       const inner = this.parser.parseInline(token.tokens);
-      const plain = token.text.replace(/\[\[([^\]|]+)\|?([^\]]*)\]\]/g, (_, a, b) => b || a);
+      const plain = token.text.replace(/\[\[([^\]|]+)\|?([^\]]*)\]\]/g, (_, a, b) => b || a).replace(/\{#[^\s{}]+\}/g, "").trim();
       const id = render.slug(plain);
       render.headings.push({ depth: token.depth, text: plain.replace(/[*_`~]/g, ""), id });
       return `<h${token.depth} id="h-${esc(id)}">${inner}</h${token.depth}>\n`;

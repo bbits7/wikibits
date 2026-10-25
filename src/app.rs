@@ -813,8 +813,12 @@ impl App {
             .and_then(|i| self.rendered.as_ref()?.items.get(i).copied());
         match item {
             Some(Item::Link(l)) => {
-                let target = self.rendered.as_ref().unwrap().links[l].target.clone();
+                let link = &self.rendered.as_ref().unwrap().links[l];
+                let (target, anchor) = (link.target.clone(), link.anchor.clone());
                 self.follow(&target);
+                if let (LinkTarget::Page(_), Some(anchor)) = (&target, anchor) {
+                    self.jump_to_anchor(&anchor);
+                }
             }
             Some(Item::Image(i)) => self.open_image(i),
             Some(Item::Task(t)) => self.toggle_task(t),
@@ -1985,6 +1989,32 @@ impl App {
         } else {
             "Could not reach the clipboard (wl-copy)".into()
         };
+    }
+
+    /// Scroll to the heading (by text or slug) or hidden `{#anchor}` a link names.
+    fn jump_to_anchor(&mut self, name: &str) {
+        let Some(rendered) = &self.rendered else {
+            return;
+        };
+        let slug = wiki::heading_slug(name);
+        let matches =
+            |text: &str| text.eq_ignore_ascii_case(name) || wiki::heading_slug(text) == slug;
+        let line = rendered
+            .headings
+            .iter()
+            .find(|h| matches(&h.text))
+            .map(|h| h.line)
+            .or_else(|| {
+                rendered
+                    .anchors
+                    .iter()
+                    .find(|(n, _)| matches(n))
+                    .map(|(_, line)| *line)
+            });
+        match line {
+            Some(line) => self.scroll = line.min(self.max_scroll()),
+            None => self.status = format!("No heading or anchor '{name}' on this page"),
+        }
     }
 
     /// Put the current page's path (as shown at the bottom right) on the clipboard.
