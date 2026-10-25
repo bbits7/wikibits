@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::wiki::{LinkTarget, parser_options};
+use crate::wiki::{LinkTarget, escape_link_pipes, parser_options, source_offset, wiki_dest};
 
 pub struct Rendered {
     pub lines: Vec<Line<'static>>,
@@ -115,7 +115,11 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         table: None,
     };
     r.start_line();
-    for (event, range) in Parser::new_ext(markdown, parser_options()).into_offset_iter() {
+    // `[[page|label]]` keeps its pipe out of the table parser; source ranges (task boxes)
+    // are mapped back to the Markdown as written.
+    let (markdown, added) = escape_link_pipes(markdown);
+    for (event, range) in Parser::new_ext(&markdown, parser_options()).into_offset_iter() {
+        let range = source_offset(&added, range.start)..source_offset(&added, range.end);
         r.event(event, range);
     }
     r.finish_line();
@@ -469,6 +473,7 @@ impl Renderer<'_> {
     }
 
     fn start_link(&mut self, link_type: LinkType, dest: &str) {
+        let dest = wiki_dest(link_type, dest);
         let target = self.ctx.resolve(dest);
         let style = Self::link_style(&target);
         let is_wiki = matches!(link_type, LinkType::WikiLink { .. });
@@ -1600,6 +1605,25 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("diaBits: line 2: no shape named 'nope'"))
         );
+    }
+
+    #[test]
+    fn piped_links_work_in_table_cells() {
+        let src = "| H | I |\n|---|---|\n| [[a/b|that]] | see [[a/b|that]] |\n\n- [ ] [[a/b|x]] [[a/b]]\n- [ ] two";
+        let r = render(src, 80, 40, &mut Ctx);
+        let lines = text(&r);
+        println!("{}", lines.join("\n"));
+        assert_eq!(lines[2].trim_end(), "that │ see that");
+        assert_eq!(r.links.len(), 4);
+        assert!(
+            r.links
+                .iter()
+                .all(|l| l.target == LinkTarget::Page("a/b".into()))
+        );
+        // Task boxes still point at the right bytes of the source as written.
+        assert_eq!(&src[r.tasks[0].source.clone()], "[ ]");
+        assert_eq!(&src[r.tasks[1].source.clone()], "[ ]");
+        assert_eq!(r.tasks[1].source.start, src.rfind("[ ]").unwrap());
     }
 
     #[test]

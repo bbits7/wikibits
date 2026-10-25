@@ -84,8 +84,8 @@ Cells can span. A cell holding only `^^` merges with the cell above it, and one 
 | ![Axe](assets/axe.png) | **Weapon** · silver · **Bonus:** +4 strength |
 | ^^ | *This weapon increases your strength by 4.* |
 ```
-A pipe inside a cell needs escaping (`\|`), so link from a cell with `[label](folder/page)`
-rather than `[[folder/page|label]]`.
+A `[[folder/page|label]]` link works in a cell: the pipe in a link never splits the cell. Any
+other pipe inside a cell needs escaping (`\|`).
 
 ## Diagrams
 

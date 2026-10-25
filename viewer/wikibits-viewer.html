@@ -1070,6 +1070,24 @@ function stripFrontMatter(text) {
   return m ? text.slice(m[0].length) : text;
 }
 
+// The pipe of a [[page|label]] link would split a table cell, so on a table row (a line
+// starting or ending with |, outside a fenced code block) every such pipe is escaped (\|)
+// before the Markdown is parsed: the table keeps its cells and the link still parses (the
+// wikilink tokenizer drops the backslash).
+function escapeLinkPipes(text) {
+  let inFence = false;
+  return text.split("\n").map((line) => {
+    const trimmed = line.trim();
+    if (/^(```|~~~)/.test(trimmed)) inFence = !inFence;
+    const tableRow = trimmed.startsWith("|") || trimmed.endsWith("|");
+    if (inFence || !tableRow || !line.includes("[[")) return line;
+    return line.replace(/\[\[([^\[\]]+?)\]\]/g, (m, body) => "[[" + body.replace(/(^|[^\\])\|/g, "$1\\|") + "]]");
+  }).join("\n");
+}
+
+// What a page is parsed from: its text past the front matter, link pipes escaped.
+const parsable = (text) => escapeLinkPipes(stripFrontMatter(text));
+
 // The first `# Heading` in the file, skipping YAML front matter.
 function extractTitle(text) {
   const lines = text.split(/\r?\n/);
@@ -1315,7 +1333,7 @@ const wikiLinkExtension = {
   tokenizer(src) {
     const m = /^\[\[([^\[\]\n]+?)\]\]/.exec(src);
     if (!m) return undefined;
-    const body = m[1], bar = body.indexOf("|");
+    const body = m[1].replace(/\\\|/g, "|"), bar = body.indexOf("|");
     return { type: "wikilink", raw: m[0], target: bar < 0 ? body : body.slice(0, bar), label: bar < 0 ? null : body.slice(bar + 1) };
   },
   renderer(token) { return render.wikiLink(token); },
@@ -1340,7 +1358,7 @@ function extractLinks(text) {
   const links = [];
   const add = (t) => { if (!links.includes(t)) links.push(t); };
   let tokens;
-  try { tokens = md.lexer(stripFrontMatter(text)); } catch { return links; }
+  try { tokens = md.lexer(parsable(text)); } catch { return links; }
   md.walkTokens(tokens, (t) => {
     if (t.type === "wikilink") add(t.target.trim());
     else if (t.type === "link" && !/^mailto:/i.test(t.href) && !(t.text && t.href === "mailto:" + t.text)) add(decodeHref(t.href));
@@ -1601,7 +1619,7 @@ function renderPage(wiki, source, id) {
   render.headings = [];
   render.links = [];
   render.slugs = new Map();
-  let tokens = md.lexer(stripFrontMatter(page.text));
+  let tokens = md.lexer(parsable(page.text));
   // The first thing on the page is its title heading: shown above the page instead.
   const first = tokens.findIndex((t) => t.type !== "space");
   let titleId = null;

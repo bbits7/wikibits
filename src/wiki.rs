@@ -1031,7 +1031,8 @@ fn extract_links(text: &str) -> Vec<String> {
         }
     };
     let mut in_diagram = false;
-    for event in Parser::new_ext(text, parser_options()) {
+    let (text, _) = escape_link_pipes(text);
+    for event in Parser::new_ext(&text, parser_options()) {
         match event {
             Event::Start(Tag::Link {
                 link_type,
@@ -1039,7 +1040,7 @@ fn extract_links(text: &str) -> Vec<String> {
                 ..
             }) => {
                 if !matches!(link_type, LinkType::Email) {
-                    add(dest_url.to_string());
+                    add(wiki_dest(link_type, &dest_url).to_string());
                 }
             }
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang))) => {
@@ -1055,6 +1056,67 @@ fn extract_links(text: &str) -> Vec<String> {
         }
     }
     links
+}
+
+/// The pipe of a `[[page|label]]` link would split a table cell, so on a table row (a line
+/// starting or ending with `|`, outside a fenced code block) every such pipe is escaped
+/// (`\|`) before the Markdown is parsed: the table keeps its cells and the link still parses.
+/// Returns the text and the byte offsets (in that text) of the backslashes added, for
+/// `source_offset` to map offsets back.
+pub fn escape_link_pipes(text: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(text.len());
+    let mut added = Vec::new();
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        }
+        let table_row = trimmed.starts_with('|') || trimmed.ends_with('|');
+        if in_fence || !table_row || !line.contains("[[") {
+            out.push_str(line);
+            continue;
+        }
+        let mut rest = line;
+        while !rest.is_empty() {
+            if let Some(inner) = rest.strip_prefix("[[")
+                && !inner.starts_with('[')
+                && let Some(close) = inner.find("]]")
+            {
+                out.push_str("[[");
+                let mut escaped = false;
+                for c in inner[..close].chars() {
+                    if c == '|' && !escaped {
+                        added.push(out.len());
+                        out.push('\\');
+                    }
+                    out.push(c);
+                    escaped = c == '\\';
+                }
+                out.push_str("]]");
+                rest = &inner[close + 2..];
+            } else {
+                let c = rest.chars().next().unwrap();
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    (out, added)
+}
+
+/// A link's destination as written: outside a table the parser keeps the backslash of an
+/// escaped pipe (`[[page\|label]]`) on the end of a wiki link's target.
+pub fn wiki_dest<'a>(link_type: LinkType, dest: &'a str) -> &'a str {
+    match link_type {
+        LinkType::WikiLink { .. } => dest.strip_suffix('\\').unwrap_or(dest),
+        _ => dest,
+    }
+}
+
+/// A byte offset into the text `escape_link_pipes` returned, as an offset into its source.
+pub fn source_offset(added: &[usize], offset: usize) -> usize {
+    offset - added.iter().filter(|&&a| a < offset).count()
 }
 
 /// The targets of the `[[page]]` / `[[page|label]]` links in a diagram's source.
@@ -1099,6 +1161,21 @@ mod tests {
     fn slugs_become_readable() {
         assert_eq!(prettify("my-wiki-page"), "My wiki page");
         assert_eq!(prettify("projects/calc_bits"), "Calc bits");
+    }
+
+    #[test]
+    fn link_pipes_are_escaped_outside_code() {
+        let (text, added) =
+            escape_link_pipes("| [[a|b]] | x |\n```\n| [[c|d]] |\n```\n- [ ] [[e\\|f]] [[g|h]]");
+        assert_eq!(
+            text,
+            "| [[a\\|b]] | x |\n```\n| [[c|d]] |\n```\n- [ ] [[e\\|f]] [[g|h]]"
+        );
+        assert_eq!(added, vec![5]);
+        assert_eq!(source_offset(&added, 5), 5);
+        assert_eq!(source_offset(&added, 10), 9);
+        let links = extract_links("| h |\n|---|\n| [[a/b|that]] and [[c|d]] |\n\n[[e\\|f]]");
+        assert_eq!(links, vec!["a/b", "c", "e"]);
     }
 
     #[test]
