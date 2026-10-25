@@ -766,7 +766,7 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(editor) = &app.editor {
         let line = if let Some(find) = &editor.find {
             match &find.replace {
@@ -914,12 +914,15 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let right = app.current.clone().unwrap_or_default();
     let right_width = unicode_width::UnicodeWidthStr::width(right.as_str()) as u16;
     f.render_widget(Paragraph::new(Line::from(left)), area);
+    // The page's path; a click on it copies it.
+    app.rects.page_id = Rect::default();
     if right_width + 2 < area.width {
         let right_area = Rect {
             x: area.x + area.width - right_width - 1,
             width: right_width,
             ..area
         };
+        app.rects.page_id = right_area;
         f.render_widget(Paragraph::new(right).dim(), right_area);
     }
 }
@@ -973,6 +976,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         (
             "y",
             "copy [[link]] to this page (or the selected text) to the clipboard",
+        ),
+        (
+            "Y",
+            "copy this page's path (clicking it at the bottom right does too)",
         ),
         (
             "V",

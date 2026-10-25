@@ -179,6 +179,8 @@ pub struct Rects {
     pub crumbs: Rect,
     pub content: Rect,
     pub related: Rect,
+    /// The page's path at the right end of the status bar.
+    pub page_id: Rect,
 }
 
 pub struct Crumb {
@@ -1985,6 +1987,18 @@ impl App {
         };
     }
 
+    /// Put the current page's path (as shown at the bottom right) on the clipboard.
+    fn copy_page_id(&mut self) {
+        let Some(id) = self.current.clone() else {
+            return;
+        };
+        self.status = if clipboard_copy(&id) {
+            format!("Copied {id}")
+        } else {
+            "Could not reach the clipboard (wl-copy)".into()
+        };
+    }
+
     fn delete_current(&mut self) {
         let Some(id) = self.current.clone() else {
             return;
@@ -2345,6 +2359,7 @@ impl App {
                 self.select = None;
             }
             KeyCode::Char('y') => self.copy_link(),
+            KeyCode::Char('Y') => self.copy_page_id(),
             KeyCode::Char('V') => self.start_keyboard_select(),
             KeyCode::Esc if self.select.is_some() => self.select = None,
             KeyCode::Char('s') => {
@@ -2546,6 +2561,8 @@ impl App {
                     {
                         self.crumb_activate(i);
                     }
+                } else if rects.page_id.contains((x, y).into()) {
+                    self.copy_page_id();
                 } else if rects.content.contains((x, y).into()) {
                     // Decided on release: a drag selects text, a plain click activates.
                     self.focus = Focus::Content;
