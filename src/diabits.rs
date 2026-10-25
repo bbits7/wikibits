@@ -393,6 +393,11 @@ fn layout(d: &mut Diagram) {
             d.nodes[n].x = centre - d.nodes[n].w / 2;
         }
     }
+    // Lines routed down the left side need a margin for their channels.
+    let margin = side_plan(d).left_margin();
+    for n in &mut d.nodes {
+        n.x += margin;
+    }
     // Vertical positions: each gap between rows is as tall as its edges need.
     let mut y = 0;
     for r in 0..d.rows.len() {
@@ -531,6 +536,192 @@ fn region_plan(d: &Diagram, r: usize) -> RegionPlan {
     }
 }
 
+// ----- side channels ------------------------------------------------------------------
+
+/// A line routed down a channel beside the diagram.
+#[derive(Clone, Copy, Debug)]
+struct Route {
+    edge: usize,
+    left: bool,
+    /// Which channel on that side, counting out from the shapes.
+    channel: usize,
+    /// An end without an arrow head attaches at the shape's corner (the bottom corner of
+    /// the upper shape, the top corner of the lower one) instead of the middle of its side,
+    /// because another line's arrow head arrives at that side of the shape.
+    upper_corner: bool,
+    lower_corner: bool,
+}
+
+struct SidePlan {
+    routes: Vec<Route>,
+    /// Channels and widest label on each side.
+    left_channels: usize,
+    right_channels: usize,
+    left_label: usize,
+    right_label: usize,
+}
+
+impl SidePlan {
+    /// Columns the shapes move right to make room for the channels on the left.
+    fn left_margin(&self) -> usize {
+        if self.left_channels == 0 {
+            return 0;
+        }
+        let labels = if self.left_label > 0 {
+            self.left_label + 2
+        } else {
+            0
+        };
+        3 + (self.left_channels - 1) * (3 + self.left_label) + labels
+    }
+
+    /// Column of channel `k` on the left (`margin` as `left_margin`) or the right of a
+    /// diagram whose shapes end at `content`.
+    fn column(&self, route: &Route, margin: usize, content: usize) -> usize {
+        if route.left {
+            margin - 3 - route.channel * (3 + self.left_label)
+        } else {
+            content + 2 + route.channel * (3 + self.right_label)
+        }
+    }
+
+    fn width(&self, margin: usize, content: usize) -> usize {
+        if self.right_channels == 0 {
+            return content;
+        }
+        let outermost = Route {
+            edge: 0,
+            left: false,
+            channel: self.right_channels - 1,
+            upper_corner: false,
+            lower_corner: false,
+        };
+        self.column(&outermost, margin, content) + 1 + self.right_label
+    }
+}
+
+/// Plan the lines that run down the sides. Each takes the side where it crosses fewer of
+/// the lines placed before it (the right when it makes no difference; a line between two
+/// shapes of one row always the right), then the innermost channel on that side no line
+/// sharing any of its rows is using — so a line nests inside the longer ones around it,
+/// and lines that share no rows share a channel.
+fn side_plan(d: &Diagram) -> SidePlan {
+    let rows = |e: usize| {
+        let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
+        (d.nodes[u].row, d.nodes[l].row)
+    };
+    let crosses = |e: usize, f: usize| {
+        let ((a, b), (c, dd)) = (rows(e), rows(f));
+        (a < c && c < b && b < dd) || (c < a && a < dd && dd < b)
+    };
+    let overlaps = |e: usize, f: usize| {
+        let ((a, b), (c, dd)) = (rows(e), rows(f));
+        !(b < c || dd < a)
+    };
+    let mut side: Vec<usize> = (0..d.edges.len())
+        .filter(|&e| goes_sideways(d, e))
+        .collect();
+    // Whether edge `e` has an arrow head at shape `n`.
+    let headed = |e: usize, n: usize| {
+        let (u, l, au, al) = d.edges[e].vertical(&d.nodes);
+        (u == n && au) || (l == n && al)
+    };
+    // Shapes where one of the edges arrives with an arrow head and the other just leaves:
+    // on one side they would meet at the same point.
+    let conflicts = |e: usize, f: usize| {
+        let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
+        let (fu, fl, _, _) = d.edges[f].vertical(&d.nodes);
+        [u, l]
+            .iter()
+            .filter(|&&n| (n == fu || n == fl) && headed(e, n) != headed(f, n))
+            .count()
+    };
+    // Longest lines pick their side first: the shorter ones then nest around them. Meeting
+    // another line at a shape counts for less than crossing one.
+    side.sort_by_key(|&e| {
+        let (a, b) = rows(e);
+        std::cmp::Reverse(b - a)
+    });
+    let mut left_of = vec![false; d.edges.len()];
+    let mut placed: Vec<usize> = Vec::new();
+    for &e in &side {
+        let (a, b) = rows(e);
+        if a != b {
+            let cost = |left: bool| {
+                placed
+                    .iter()
+                    .filter(|&&f| left_of[f] == left)
+                    .map(|&f| 2 * usize::from(crosses(e, f)) + conflicts(e, f))
+                    .sum::<usize>()
+            };
+            left_of[e] = cost(true) < cost(false);
+        }
+        placed.push(e);
+    }
+    side.sort_by_key(|&e| {
+        let (a, b) = rows(e);
+        b - a
+    });
+    let mut routes: Vec<Route> = Vec::new();
+    for &e in &side {
+        let left = left_of[e];
+        let mut channel = 0;
+        while routes
+            .iter()
+            .any(|r| r.left == left && r.channel == channel && overlaps(e, r.edge))
+        {
+            channel += 1;
+        }
+        routes.push(Route {
+            edge: e,
+            left,
+            channel,
+            upper_corner: false,
+            lower_corner: false,
+        });
+    }
+    // Whether some other line on that side arrives at shape `n` with an arrow head.
+    let headed_at = |routes: &[Route], i: usize, n: usize| {
+        routes.iter().enumerate().any(|(j, r)| {
+            let (c, dd) = rows(r.edge);
+            j != i && r.left == routes[i].left && c != dd && headed(r.edge, n)
+        })
+    };
+    for i in 0..routes.len() {
+        let (u, l, au, al) = d.edges[routes[i].edge].vertical(&d.nodes);
+        let (a, b) = rows(routes[i].edge);
+        if a == b {
+            continue;
+        }
+        routes[i].upper_corner = !au && headed_at(&routes, i, u);
+        routes[i].lower_corner = !al && headed_at(&routes, i, l);
+    }
+    routes.sort_by_key(|r| r.edge);
+    let label = |left: bool| {
+        routes
+            .iter()
+            .filter(|r| r.left == left)
+            .filter_map(|r| d.edges[r.edge].label.as_deref().map(UnicodeWidthStr::width))
+            .max()
+            .unwrap_or(0)
+    };
+    let channels = |left: bool| {
+        routes
+            .iter()
+            .filter(|r| r.left == left)
+            .map(|r| r.channel + 1)
+            .max()
+            .unwrap_or(0)
+    };
+    SidePlan {
+        left_channels: channels(true),
+        right_channels: channels(false),
+        left_label: label(true),
+        right_label: label(false),
+        routes,
+    }
+}
+
 // ----- drawing ------------------------------------------------------------------------
 
 struct Grid {
@@ -558,6 +749,9 @@ impl Grid {
         let cell = &mut self.cells[y][x];
         *cell = match (*cell, c) {
             ('─', '│') | ('│', '─') => '┼',
+            // A line running on through a corner makes a junction.
+            ('┐' | '┌', '─') | ('─', '┐' | '┌') => '┬',
+            ('┘' | '└', '─') | ('─', '┘' | '└') => '┴',
             (' ', c) => c,
             (_, c) if c != '─' && c != '│' => c,
             (old, _) => old,
@@ -583,23 +777,11 @@ impl Grid {
 fn draw(d: &Diagram) -> Vec<String> {
     let content = d.nodes.iter().map(|n| n.x + n.w).max().unwrap_or(0);
     let height = d.nodes.iter().map(|n| n.y + n.h).max().unwrap_or(0);
-    // Edges that skip rows, or join non-neighbouring shapes of a row, use channels on the
-    // right; each gets its own column.
-    let side: Vec<usize> = (0..d.edges.len())
-        .filter(|&e| goes_sideways(d, e))
-        .collect();
-    let label_room = side
-        .iter()
-        .filter_map(|&e| d.edges[e].label.as_deref().map(UnicodeWidthStr::width))
-        .max()
-        .unwrap_or(0);
-    let channel = |k: usize| content + 2 + k * (3 + label_room);
-    let width = if side.is_empty() {
-        content
-    } else {
-        channel(side.len() - 1) + 1 + label_room
-    };
-    let mut g = Grid::new(width, height);
+    // Edges that skip rows, or join non-neighbouring shapes of a row, use channels down
+    // the sides.
+    let plan = side_plan(d);
+    let margin = plan.left_margin();
+    let mut g = Grid::new(plan.width(margin, content), height);
 
     for n in &d.nodes {
         draw_shape(&mut g, n.x, n.y, n.w, n.shape, &n.label);
@@ -613,8 +795,8 @@ fn draw(d: &Diagram) -> Vec<String> {
             draw_same_row(&mut g, d, u, l, au, al, d.edges[e].label.as_deref());
         }
     }
-    for (k, &e) in side.iter().enumerate() {
-        draw_side(&mut g, d, e, channel(k));
+    for route in &plan.routes {
+        draw_side(&mut g, d, route, plan.column(route, margin, content));
     }
     g.lines()
 }
@@ -795,40 +977,72 @@ fn draw_same_row(
     }
 }
 
-/// An edge routed down (or up) a channel on the right of the diagram.
-fn draw_side(g: &mut Grid, d: &Diagram, e: usize, col: usize) {
-    let (u, l, au, al) = d.edges[e].vertical(&d.nodes);
+/// An edge routed down (or up) a channel beside the diagram.
+fn draw_side(g: &mut Grid, d: &Diagram, route: &Route, col: usize) {
+    let (u, l, au, al) = d.edges[route.edge].vertical(&d.nodes);
     let (upper, lower) = (&d.nodes[u], &d.nodes[l]);
-    let (uy, ly) = (upper.middle(), lower.middle());
-    for x in upper.x + upper.w..col {
-        g.put(x, uy, '─');
-    }
-    for x in lower.x + lower.w..col {
-        g.put(x, ly, '─');
-    }
+    let left = route.left;
+    let uy = if route.upper_corner {
+        upper.y + upper.h - 1
+    } else {
+        upper.middle()
+    };
+    let ly = if route.lower_corner {
+        lower.y
+    } else {
+        lower.middle()
+    };
+    // The arm from the shape to the channel, joined to a box's corner when it starts there
+    // (a diamond's top and bottom rows start with a blank cell before its edge).
+    let arm = |g: &mut Grid, n: &Node, y: usize, corner: Option<char>| {
+        let xs = if left { col + 1..n.x } else { n.x + n.w..col };
+        for x in xs {
+            g.put(x, y, '─');
+        }
+        match (corner, n.shape) {
+            (None, _) => {}
+            (Some(_), Shape::Diamond) => {
+                if left {
+                    g.put(n.x, y, '─');
+                }
+            }
+            (Some(c), _) => g.put(if left { n.x } else { n.x + n.w - 1 }, y, c),
+        }
+    };
+    arm(g, upper, uy, route.upper_corner.then_some('┴'));
+    arm(g, lower, ly, route.lower_corner.then_some('┬'));
     if uy == ly {
         // Same row, not neighbours: loop out and back on the row below.
-        let y = uy + 2;
-        for yy in uy..=y {
-            g.put(col, yy, '│');
-        }
         g.put(col, uy, '┐');
-        g.put(col, y, '┘');
+        g.put(col, uy + 1, '│');
+        g.put(col, uy + 2, '┘');
         return;
     }
     for y in uy + 1..ly {
         g.put(col, y, '│');
     }
-    g.put(col, uy, '┐');
-    g.put(col, ly, '┘');
+    g.put(col, uy, if left { '┌' } else { '┐' });
+    g.put(col, ly, if left { '└' } else { '┘' });
+    let head = |g: &mut Grid, n: &Node, y: usize| {
+        if left {
+            g.put(n.x - 1, y, '▶');
+        } else {
+            g.put(n.x + n.w, y, '◀');
+        }
+    };
     if au {
-        g.put(upper.x + upper.w, uy, '◀');
+        head(g, upper, uy);
     }
     if al {
-        g.put(lower.x + lower.w, ly, '◀');
+        head(g, lower, ly);
     }
-    if let Some(label) = &d.edges[e].label {
-        g.text(col + 2, (uy + ly) / 2, label);
+    if let Some(label) = &d.edges[route.edge].label {
+        let y = (uy + ly) / 2;
+        if left {
+            g.text(col - 1 - label.width(), y, label);
+        } else {
+            g.text(col + 2, y, label);
+        }
     }
 }
 
@@ -1060,6 +1274,43 @@ mod tests {
                 .unwrap_err()
                 .contains("a tree has no lines")
         );
+    }
+
+    #[test]
+    fn side_lines_take_both_sides_and_nest() {
+        // A decision ladder: the long line goes right, the one it would cross goes left, the
+        // short one nests inside; nothing crosses and no two lines share a point.
+        let src = "a(Start)\nb<Gates?>\nc[Step]\nd<Scan?>\ne[Divert]\nf[Chores]\ng(Advance)\na --> b\nb --> c | ok\nb --> d | blocked\nd --> e | found\nd --> f | none\nc --> g";
+        let out = render(src).unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(!text.contains('┼'), "no crossings");
+        assert!(
+            text.contains("┌──") && text.contains("▶⟨"),
+            "a line down the left"
+        );
+        assert!(text.contains("blocked") && text.contains("none"));
+        let chores = out.iter().position(|l| l.contains("Chores")).unwrap();
+        let advance = out.iter().position(|l| l.contains("Advance")).unwrap();
+        assert!(
+            out[chores].contains("│◀──┘") && out[advance].contains("│◀────────┘"),
+            "both arrive from the right, the inner line nested"
+        );
+
+        // Fan-outs from one shape share a bus of junctions; a line leaving a shape where
+        // another arrives takes the other side.
+        let out = render("a[A]\nb[B]\nc[C]\nd[D]\ne[E]\na --> b --> c --> d --> e\na --> c | ac\na --> d | ad\na --> e\nc --> e | ce").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(text.contains("│ A │──┬────┬────┐"));
+        assert!(text.contains("┌──│ C │◀─┘") && text.contains("└─▶│ E │"));
+        assert!(!text.contains('┼'));
+
+        // Opposite lines between the same two shapes: the leaving end moves to the corner.
+        let out = render("a[A]\nb[B]\nc[C]\na --> b --> c\na --> c\nc --> a | back").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(text.contains("┌─▶│ A │──┐") && text.contains("└──│ C │◀─┘"));
     }
 
     #[test]

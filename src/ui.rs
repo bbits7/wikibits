@@ -217,6 +217,8 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let scroll = app.scroll.min(app.max_scroll());
     app.scroll = scroll;
+    let hscroll = app.hscroll.min(app.max_hscroll());
+    app.hscroll = hscroll;
     let mut lines: Vec<Line> = rendered
         .lines
         .iter()
@@ -302,23 +304,32 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
                 );
             }
         }
-        if sel.keyboard && sel.cursor.0 >= scroll && sel.cursor.0 < scroll + body.height as usize {
+        if sel.keyboard
+            && sel.cursor.0 >= scroll
+            && sel.cursor.0 < scroll + body.height as usize
+            && sel.cursor.1 as usize >= hscroll
+        {
+            let col = sel.cursor.1 - hscroll as u16;
             f.set_cursor_position(ratatui::layout::Position {
-                x: body.x + sel.cursor.1.min(body.width.saturating_sub(1)),
+                x: body.x + col.min(body.width.saturating_sub(1)),
                 y: body.y + (sel.cursor.0 - scroll) as u16,
             });
         }
     }
-    f.render_widget(Paragraph::new(Text::from(lines)), body);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((0, hscroll as u16)),
+        body,
+    );
 
     for slot in &rendered.images {
         // The image sits one row below the frame's top line.
         let y = slot.line as i32 + 1 - scroll as i32;
-        if y + slot.height as i32 <= 0 || y >= body.height as i32 {
+        if y + slot.height as i32 <= 0 || y >= body.height as i32 || (slot.x as usize) < hscroll {
             continue;
         }
+        let x = slot.x as usize - hscroll;
         if let Some(proto) = app.image(slot) {
-            let image = SlicedImage::new(&proto, (slot.x as i16, y as i16).into());
+            let image = SlicedImage::new(&proto, (x as i16, y as i16).into());
             f.render_widget(image, body);
         }
     }
@@ -891,7 +902,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         _ if app.select.is_some() => "Selected: y copy  Esc clear",
         Focus::Tree => "j/k move  Enter open  h/l fold  Tab pane  b back  ? help  q quit",
         Focus::Content => {
-            "j/k scroll  n/p link  Enter follow  x tick  v source  Tab pane  b back  ? help  q quit"
+            "j/k h/l scroll  n/p link  Enter follow  x tick  v source  Tab pane  b back  ? help  q quit"
         }
         Focus::Related => "j/k move  Enter open  h/l fold  Tab pane  b back  ? help  q quit",
     };
@@ -945,6 +956,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("", ""),
         ("Page", ""),
         ("j / k  PgUp / PgDn", "scroll"),
+        (
+            "h / l  ← / →",
+            "scroll sideways when a line is wider than the page",
+        ),
         ("g / G", "top / bottom"),
         ("n / p", "next / previous link, image or task"),
         ("x", "tick / untick the selected task (Enter does too)"),

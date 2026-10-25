@@ -626,12 +626,96 @@ const diaBits = (() => {
       const centre = starts[c0] + Math.floor(total / 2);
       d.nodes[n].x = centre - Math.floor(d.nodes[n].w / 2);
     }
+    // Lines routed down the left side need a margin for their channels.
+    const margin = leftMargin(sidePlan(d));
+    for (const n of d.nodes) n.x += margin;
     let y = 0;
     for (let r = 0; r < d.rows.length; r++) {
       for (const n of d.rows[r]) d.nodes[n].y = y;
       y += 3;
       if (r + 1 < d.rows.length) y += regionPlan(d, r).height;
     }
+  }
+
+  // ----- side channels -----
+  // Plan the lines that run down the sides. Each takes the side where it crosses fewer of
+  // the lines placed before it (the right when it makes no difference; a line between two
+  // shapes of one row always the right), then the innermost channel on that side no line
+  // sharing any of its rows is using — so a line nests inside the longer ones around it,
+  // and lines that share no rows share a channel.
+  function sidePlan(d) {
+    const rows = (e) => { const [u, l] = vertical(d, e); return [d.nodes[u].row, d.nodes[l].row]; };
+    const crosses = (e, f) => {
+      const [a, b] = rows(e), [c, dd] = rows(f);
+      return (a < c && c < b && b < dd) || (c < a && a < dd && dd < b);
+    };
+    const overlaps = (e, f) => { const [a, b] = rows(e), [c, dd] = rows(f); return !(b < c || dd < a); };
+    // Whether edge e has an arrow head at shape n.
+    const headed = (e, n) => { const [u, l, au, al] = vertical(d, e); return (u === n && au) || (l === n && al); };
+    // Shapes where one of the edges arrives with an arrow head and the other just leaves.
+    const conflicts = (e, f) => {
+      const [u, l] = vertical(d, e), [fu, fl] = vertical(d, f);
+      return [u, l].filter((n) => (n === fu || n === fl) && headed(e, n) !== headed(f, n)).length;
+    };
+    const side = [];
+    for (let e = 0; e < d.edges.length; e++) if (goesSideways(d, e)) side.push(e);
+    const length = (e) => { const [a, b] = rows(e); return b - a; };
+    // Longest lines pick their side first (a stable sort keeps the written order otherwise).
+    side.sort((e, f) => length(f) - length(e));
+    const leftOf = new Array(d.edges.length).fill(false);
+    const placed = [];
+    for (const e of side) {
+      const [a, b] = rows(e);
+      if (a !== b) {
+        const cost = (left) => sum(placed.filter((f) => leftOf[f] === left).map((f) => 2 * (crosses(e, f) ? 1 : 0) + conflicts(e, f)));
+        leftOf[e] = cost(true) < cost(false);
+      }
+      placed.push(e);
+    }
+    side.sort((e, f) => length(e) - length(f));
+    const routes = [];
+    for (const e of side) {
+      const left = leftOf[e];
+      let channel = 0;
+      while (routes.some((r) => r.left === left && r.channel === channel && overlaps(e, r.edge))) channel++;
+      routes.push({ edge: e, left, channel, upperCorner: false, lowerCorner: false });
+    }
+    // An end without an arrow head attaches at the shape's corner when another line on
+    // that side arrives at the shape with one.
+    const headedAt = (i, n) => routes.some((r, j) => {
+      const [c, dd] = rows(r.edge);
+      return j !== i && r.left === routes[i].left && c !== dd && headed(r.edge, n);
+    });
+    routes.forEach((route, i) => {
+      const [u, l, au, al] = vertical(d, route.edge);
+      const [a, b] = rows(route.edge);
+      if (a === b) return;
+      route.upperCorner = !au && headedAt(i, u);
+      route.lowerCorner = !al && headedAt(i, l);
+    });
+    routes.sort((a, b) => a.edge - b.edge);
+    const label = (left) => Math.max(0, ...routes.filter((r) => r.left === left).map((r) => (d.edges[r.edge].label != null ? width(d.edges[r.edge].label) : 0)));
+    const channels = (left) => Math.max(0, ...routes.filter((r) => r.left === left).map((r) => r.channel + 1));
+    return { routes, leftChannels: channels(true), rightChannels: channels(false), leftLabel: label(true), rightLabel: label(false) };
+  }
+
+  // Columns the shapes move right to make room for the channels on the left.
+  function leftMargin(plan) {
+    if (plan.leftChannels === 0) return 0;
+    const labels = plan.leftLabel > 0 ? plan.leftLabel + 2 : 0;
+    return 3 + (plan.leftChannels - 1) * (3 + plan.leftLabel) + labels;
+  }
+
+  // Column of a route's channel, left of the margin or right of the shapes' content.
+  function channelColumn(plan, route, margin, content) {
+    return route.left
+      ? margin - 3 - route.channel * (3 + plan.leftLabel)
+      : content + 2 + route.channel * (3 + plan.rightLabel);
+  }
+
+  function diagramWidth(plan, margin, content) {
+    if (plan.rightChannels === 0) return content;
+    return channelColumn(plan, { left: false, channel: plan.rightChannels - 1 }, margin, content) + 1 + plan.rightLabel;
   }
 
   // Plan the edges between row r and row r + 1: straight lines and buses.
@@ -716,6 +800,9 @@ const diaBits = (() => {
       const old = this.cells[y][x];
       let next;
       if ((old === "─" && c === "│") || (old === "│" && c === "─")) next = "┼";
+      // A line running on through a corner makes a junction.
+      else if (((old === "┐" || old === "┌") && c === "─") || (old === "─" && (c === "┐" || c === "┌"))) next = "┬";
+      else if (((old === "┘" || old === "└") && c === "─") || (old === "─" && (c === "┘" || c === "└"))) next = "┴";
       else if (old === " ") next = c;
       else if (c !== "─" && c !== "│") next = c;
       else next = old;
@@ -730,20 +817,17 @@ const diaBits = (() => {
   function draw(d) {
     const content = Math.max(0, ...d.nodes.map((n) => n.x + n.w));
     const height = Math.max(0, ...d.nodes.map((n) => n.y + n.h));
-    // Edges that skip rows, or join non-neighbouring shapes of a row, use channels on the right.
-    const side = [];
-    for (let e = 0; e < d.edges.length; e++) if (goesSideways(d, e)) side.push(e);
-    const labelRoom = Math.max(0, ...side.map((e) => (d.edges[e].label != null ? width(d.edges[e].label) : 0)));
-    const channel = (k) => content + 2 + k * (3 + labelRoom);
-    const w = side.length ? channel(side.length - 1) + 1 + labelRoom : content;
-    const g = new Grid(w, height);
+    // Edges that skip rows, or join non-neighbouring shapes of a row, use channels down the sides.
+    const plan = sidePlan(d);
+    const margin = leftMargin(plan);
+    const g = new Grid(diagramWidth(plan, margin, content), height);
     for (const n of d.nodes) drawShape(g, n.x, n.y, n.w, n.shape, n.label);
     for (let r = 0; r + 1 < d.rows.length; r++) drawRegion(g, d, r);
     for (let e = 0; e < d.edges.length; e++) {
       const [u, l, au, al] = vertical(d, e);
       if (d.nodes[u].row === d.nodes[l].row && neighbours(d, u, l)) drawSameRow(g, d, u, l, au, al, d.edges[e].label);
     }
-    side.forEach((e, k) => drawSide(g, d, e, channel(k)));
+    for (const route of plan.routes) drawSide(g, d, route, channelColumn(plan, route, margin, content));
     return g.cells.map((row) => row.join("").replace(/\s+$/, ""));
   }
 
@@ -841,27 +925,43 @@ const diaBits = (() => {
     }
   }
 
-  // An edge routed down (or up) a channel on the right of the diagram.
-  function drawSide(g, d, e, col) {
-    const [u, l, au, al] = vertical(d, e);
+  // An edge routed down (or up) a channel beside the diagram.
+  function drawSide(g, d, route, col) {
+    const [u, l, au, al] = vertical(d, route.edge);
     const upper = d.nodes[u], lower = d.nodes[l];
-    const uy = middle(upper), ly = middle(lower);
-    for (let x = upper.x + upper.w; x < col; x++) g.put(x, uy, "─");
-    for (let x = lower.x + lower.w; x < col; x++) g.put(x, ly, "─");
+    const left = route.left;
+    const uy = route.upperCorner ? upper.y + upper.h - 1 : middle(upper);
+    const ly = route.lowerCorner ? lower.y : middle(lower);
+    // The arm from the shape to the channel, joined to a box's corner when it starts there
+    // (a diamond's top and bottom rows start with a blank cell before its edge).
+    const arm = (n, y, corner) => {
+      if (left) for (let x = col + 1; x < n.x; x++) g.put(x, y, "─");
+      else for (let x = n.x + n.w; x < col; x++) g.put(x, y, "─");
+      if (!corner) return;
+      if (n.shape === "diamond") { if (left) g.put(n.x, y, "─"); }
+      else g.put(left ? n.x : n.x + n.w - 1, y, corner);
+    };
+    arm(upper, uy, route.upperCorner ? "┴" : null);
+    arm(lower, ly, route.lowerCorner ? "┬" : null);
     if (uy === ly) {
       // Same row, not neighbours: loop out and back on the row below.
-      const y = uy + 2;
-      for (let yy = uy; yy <= y; yy++) g.put(col, yy, "│");
       g.put(col, uy, "┐");
-      g.put(col, y, "┘");
+      g.put(col, uy + 1, "│");
+      g.put(col, uy + 2, "┘");
       return;
     }
     for (let y = uy + 1; y < ly; y++) g.put(col, y, "│");
-    g.put(col, uy, "┐");
-    g.put(col, ly, "┘");
-    if (au) g.put(upper.x + upper.w, uy, "◀");
-    if (al) g.put(lower.x + lower.w, ly, "◀");
-    if (d.edges[e].label != null) g.text(col + 2, Math.floor((uy + ly) / 2), d.edges[e].label);
+    g.put(col, uy, left ? "┌" : "┐");
+    g.put(col, ly, left ? "└" : "┘");
+    const head = (n, y) => { if (left) g.put(n.x - 1, y, "▶"); else g.put(n.x + n.w, y, "◀"); };
+    if (au) head(upper, uy);
+    if (al) head(lower, ly);
+    const label = d.edges[route.edge].label;
+    if (label != null) {
+      const y = Math.floor((uy + ly) / 2);
+      if (left) g.text(col - 1 - width(label), y, label);
+      else g.text(col + 2, y, label);
+    }
   }
 
   // ----- trees -----

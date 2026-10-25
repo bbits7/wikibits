@@ -72,8 +72,13 @@ stacked in a column line up. Empty slots pick a column instead: `,, z(End)` puts
 third column. `id[label]`
 is a box, `id(label)` a rounded pill, `id<label>` a diamond. Lines join ids with `-->`,
 `<--`, `<->` or `---`, can be chained, and take a label after `|`. Lines between neighbouring
-rows go straight down (fanning out and merging as needed); lines that skip rows run down a
-channel on the right. A block that does not parse shows its source with the problem.
+rows go straight down (fanning out and merging as needed); lines that skip rows run down
+channels beside the diagram: each takes the side where it crosses fewer other lines, nests
+inside the longer lines around it, and shares a channel with lines it shares no rows with. A
+line that leaves a shape on a side where another line arrives leaves from the shape's corner,
+so the two never meet at one point. A block that does not parse shows its source with the
+problem. A diagram wider than the page scrolls sideways (`h` / `l`, the arrows, or a sideways
+wheel).
 
 `diaType: tree` draws a tree instead: one shape per line, with leading dots saying how deep
 it sits (one more than its parent), and the lines from a parent down and across to its

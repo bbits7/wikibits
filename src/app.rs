@@ -202,6 +202,8 @@ pub struct App {
     render_width: u16,
     render_height: u16,
     pub scroll: usize,
+    /// Columns scrolled sideways when a line (a diagram, a code block) is wider than the page.
+    pub hscroll: usize,
     /// Selected entry of `rendered.items`.
     pub sel: Option<usize>,
     pub content_height: usize,
@@ -266,6 +268,7 @@ impl App {
             render_width: 0,
             render_height: 0,
             scroll: 0,
+            hscroll: 0,
             sel: None,
             content_height: 0,
             popup: None,
@@ -347,6 +350,7 @@ impl App {
         }
         self.current = Some(id.to_string());
         self.scroll = 0;
+        self.hscroll = 0;
         self.sel = None;
         self.related_sel = 0;
         self.related_scroll = 0;
@@ -662,6 +666,42 @@ impl App {
         self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
     }
 
+    /// How far the page can scroll sideways: its widest line less the page width.
+    pub fn max_hscroll(&self) -> usize {
+        let widest = self
+            .rendered
+            .as_ref()
+            .map(|r| r.lines.iter().map(|l| l.width()).max().unwrap_or(0))
+            .unwrap_or(0);
+        widest.saturating_sub(self.rects.content.width as usize)
+    }
+
+    pub fn hscroll_by(&mut self, delta: isize) {
+        let max = self.max_hscroll() as isize;
+        self.hscroll = (self.hscroll as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// Column an item starts at (a link's first span, an image's frame, a task's box).
+    fn item_column(&self, index: usize) -> Option<usize> {
+        let rendered = self.rendered.as_ref()?;
+        let span_column = |line: usize, span: usize| {
+            rendered.lines[line]
+                .spans
+                .iter()
+                .take(span)
+                .map(|s| s.width())
+                .sum::<usize>()
+        };
+        match *rendered.items.get(index)? {
+            Item::Link(l) => rendered.links[l]
+                .spans
+                .first()
+                .map(|&(line, span)| span_column(line, span)),
+            Item::Image(i) => Some(rendered.images[i].x as usize),
+            Item::Task(t) => Some(span_column(rendered.tasks[t].line, rendered.tasks[t].span)),
+        }
+    }
+
     /// First line of an item (link or image).
     fn item_line(&self, index: usize) -> Option<usize> {
         let rendered = self.rendered.as_ref()?;
@@ -753,6 +793,14 @@ impl App {
         {
             let target = line.saturating_sub(self.content_height / 3);
             self.scroll = target.min(self.max_scroll());
+        }
+        // Bring it into view sideways too (a link in a wide diagram).
+        let width = self.rects.content.width as usize;
+        if let Some(col) = self.item_column(index)
+            && (col < self.hscroll || col >= self.hscroll + width.max(1))
+        {
+            let target = col.saturating_sub(width / 3);
+            self.hscroll = target.min(self.max_hscroll());
         }
     }
 
@@ -1741,7 +1789,7 @@ impl App {
         }
         let last = self.rendered.as_ref()?.lines.len().checked_sub(1)?;
         let line = ((y - body.y) as usize + self.scroll).min(last);
-        Some((line, x - body.x))
+        Some((line, x - body.x + self.hscroll as u16))
     }
 
     fn selected_text(&self) -> Option<String> {
@@ -2379,6 +2427,8 @@ impl App {
             KeyCode::PageUp => self.scroll_by(-(page - 1)),
             KeyCode::Char('g') | KeyCode::Home => self.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => self.scroll = self.max_scroll(),
+            KeyCode::Char('h') | KeyCode::Left => self.hscroll_by(-4),
+            KeyCode::Char('l') | KeyCode::Right => self.hscroll_by(4),
             KeyCode::Char('n') => self.next_item(),
             KeyCode::Char('p') => self.prev_item(),
             KeyCode::Enter => self.activate_selected(),
@@ -2543,6 +2593,17 @@ impl App {
                 } else {
                     self.scroll_by(delta * 3);
                 }
+            }
+            // A sideways wheel (or a trackpad) scrolls a wide page sideways.
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                if rects.content.contains((x, y).into()) =>
+            {
+                let delta = if mouse.kind == MouseEventKind::ScrollRight {
+                    4
+                } else {
+                    -4
+                };
+                self.hscroll_by(delta);
             }
             _ => {}
         }
