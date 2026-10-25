@@ -24,7 +24,9 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 - `[[folder/page#Heading]]` opens the page scrolled to that heading (its text, any case, or
   its slug: `#my-heading`); `[[#Heading]]` jumps within the current page. `{#name}` anywhere
   in a page is a hidden anchor: it is not drawn, and `[[folder/page#name]]` scrolls to the
-  line it sits on — so a link can point at a paragraph that has no heading.
+  line it sits on — so a link can point at a paragraph that has no heading. `{#name|text}`
+  draws its text in place. In a table cell an anchor marks the row, and a cell can hold
+  links to headings and anchors like any other text.
 - Ordinary Markdown links to `.md` files work too; `http(s)` links open in the browser.
 - A folder's `index.md` stands for the folder: the folder takes its title in the tree,
   opening the folder shows it, and `[[/projects]]` links to it. The root `index.md` is the

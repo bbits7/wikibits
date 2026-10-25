@@ -1063,11 +1063,11 @@ fn extract_links(text: &str) -> Vec<String> {
     links
 }
 
-/// The pipe of a `[[page|label]]` link would split a table cell, so on a table row (a line
-/// starting or ending with `|`, outside a fenced code block) every such pipe is escaped
-/// (`\|`) before the Markdown is parsed: the table keeps its cells and the link still parses.
-/// Returns the text and the byte offsets (in that text) of the backslashes added, for
-/// `source_offset` to map offsets back.
+/// The pipe of a `[[page|label]]` link or a `{#anchor|text}` would split a table cell, so on
+/// a table row (a line starting or ending with `|`, outside a fenced code block) every such
+/// pipe is escaped (`\|`) before the Markdown is parsed: the table keeps its cells and the
+/// link still parses. Returns the text and the byte offsets (in that text) of the
+/// backslashes added, for `source_offset` to map offsets back.
 pub fn escape_link_pipes(text: &str) -> (String, Vec<usize>) {
     let mut out = String::with_capacity(text.len());
     let mut added = Vec::new();
@@ -1078,10 +1078,21 @@ pub fn escape_link_pipes(text: &str) -> (String, Vec<usize>) {
             in_fence = !in_fence;
         }
         let table_row = trimmed.starts_with('|') || trimmed.ends_with('|');
-        if in_fence || !table_row || !line.contains("[[") {
+        if in_fence || !table_row || !(line.contains("[[") || line.contains("{#")) {
             out.push_str(line);
             continue;
         }
+        let mut escape = |out: &mut String, body: &str| {
+            let mut escaped = false;
+            for c in body.chars() {
+                if c == '|' && !escaped {
+                    added.push(out.len());
+                    out.push('\\');
+                }
+                out.push(c);
+                escaped = c == '\\';
+            }
+        };
         let mut rest = line;
         while !rest.is_empty() {
             if let Some(inner) = rest.strip_prefix("[[")
@@ -1089,17 +1100,17 @@ pub fn escape_link_pipes(text: &str) -> (String, Vec<usize>) {
                 && let Some(close) = inner.find("]]")
             {
                 out.push_str("[[");
-                let mut escaped = false;
-                for c in inner[..close].chars() {
-                    if c == '|' && !escaped {
-                        added.push(out.len());
-                        out.push('\\');
-                    }
-                    out.push(c);
-                    escaped = c == '\\';
-                }
+                escape(&mut out, &inner[..close]);
                 out.push_str("]]");
                 rest = &inner[close + 2..];
+            } else if let Some(inner) = rest.strip_prefix("{#")
+                && let Some(close) = inner.find('}')
+                && !inner[..close].contains('{')
+            {
+                out.push_str("{#");
+                escape(&mut out, &inner[..close]);
+                out.push('}');
+                rest = &inner[close + 1..];
             } else {
                 let c = rest.chars().next().unwrap();
                 out.push(c);
@@ -1210,13 +1221,14 @@ mod tests {
 
     #[test]
     fn link_pipes_are_escaped_outside_code() {
-        let (text, added) =
-            escape_link_pipes("| [[a|b]] | x |\n```\n| [[c|d]] |\n```\n- [ ] [[e\\|f]] [[g|h]]");
+        let (text, added) = escape_link_pipes(
+            "| [[a|b]] | x {#n|shown} |\n```\n| [[c|d]] |\n```\n- [ ] [[e\\|f]] [[g|h]] {#i|j}",
+        );
         assert_eq!(
             text,
-            "| [[a\\|b]] | x |\n```\n| [[c|d]] |\n```\n- [ ] [[e\\|f]] [[g|h]]"
+            "| [[a\\|b]] | x {#n\\|shown} |\n```\n| [[c|d]] |\n```\n- [ ] [[e\\|f]] [[g|h]] {#i|j}"
         );
-        assert_eq!(added, vec![5]);
+        assert_eq!(added, vec![5, 18]);
         assert_eq!(source_offset(&added, 5), 5);
         assert_eq!(source_offset(&added, 10), 9);
         let links = extract_links("| h |\n|---|\n| [[a/b|that]] and [[c|d]] |\n\n[[e\\|f]]");

@@ -1080,8 +1080,11 @@ function escapeLinkPipes(text) {
     const trimmed = line.trim();
     if (/^(```|~~~)/.test(trimmed)) inFence = !inFence;
     const tableRow = trimmed.startsWith("|") || trimmed.endsWith("|");
-    if (inFence || !tableRow || !line.includes("[[")) return line;
-    return line.replace(/\[\[([^\[\]]+?)\]\]/g, (m, body) => "[[" + body.replace(/(^|[^\\])\|/g, "$1\\|") + "]]");
+    if (inFence || !tableRow || !(line.includes("[[") || line.includes("{#"))) return line;
+    const escapePipes = (body) => body.replace(/(^|[^\\])\|/g, "$1\\|");
+    return line
+      .replace(/\[\[([^\[\]]+?)\]\]/g, (m, body) => "[[" + escapePipes(body) + "]]")
+      .replace(/\{#([^{}]+?)\}/g, (m, body) => "{#" + escapePipes(body) + "}");
   }).join("\n");
 }
 
@@ -1352,16 +1355,17 @@ const newlineExtension = {
 };
 
 const md = new marked.Marked({ gfm: true });
-// A hidden anchor {#name}: not drawn, but [[page#name]] scrolls to it.
+// A hidden anchor {#name}: not drawn, but [[page#name]] scrolls to it. {#name|text} shows
+// its text in place.
 const anchorExtension = {
   name: "anchor",
   level: "inline",
   start(src) { const i = src.indexOf("{#"); return i < 0 ? undefined : i; },
   tokenizer(src) {
-    const m = /^\{#([^\s{}]+)\}/.exec(src);
-    return m ? { type: "anchor", raw: m[0], name: m[1] } : undefined;
+    const m = /^\{#([^\s{}|]+)(?:\|([^{}]*))?\}/.exec(src);
+    return m ? { type: "anchor", raw: m[0], name: m[1], text: m[2] || "" } : undefined;
   },
-  renderer(token) { return `<a id="h-${esc(render.slug(token.name))}" class="anchor"></a>`; },
+  renderer(token) { return `<a id="h-${esc(render.slug(token.name))}" class="anchor">${esc(token.text)}</a>`; },
 };
 
 md.use({ extensions: [wikiLinkExtension, newlineExtension, anchorExtension] });
@@ -1464,7 +1468,7 @@ md.use({
       const t = token.tokens || [];
       const only = t.filter((x) => !(x.type === "text" && !x.raw.trim()));
       // A paragraph of nothing but hidden anchors takes no room.
-      if (only.length && only.every((x) => x.type === "anchor")) return this.parser.parseInline(only);
+      if (only.length && only.every((x) => x.type === "anchor" && !x.text)) return this.parser.parseInline(only);
       if (only.length === 1 && only[0].type === "image") {
         const alt = only[0].text || "";
         return `<figure>${render.imageHtml(only[0].href || "", alt, only[0].title)}${alt ? `<figcaption>${esc(alt)}</figcaption>` : ""}</figure>\n`;
@@ -1473,7 +1477,7 @@ md.use({
     },
     heading(token) {
       const inner = this.parser.parseInline(token.tokens);
-      const plain = token.text.replace(/\[\[([^\]|]+)\|?([^\]]*)\]\]/g, (_, a, b) => b || a).replace(/\{#[^\s{}]+\}/g, "").trim();
+      const plain = token.text.replace(/\[\[([^\]|]+)\|?([^\]]*)\]\]/g, (_, a, b) => b || a).replace(/\{#[^\s{}|]+(?:\|([^{}]*))?\}/g, (_, t) => t || "").trim();
       const id = render.slug(plain);
       render.headings.push({ depth: token.depth, text: plain.replace(/[*_`~]/g, ""), id });
       return `<h${token.depth} id="h-${esc(id)}">${inner}</h${token.depth}>\n`;

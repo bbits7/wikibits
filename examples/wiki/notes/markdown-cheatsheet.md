@@ -31,7 +31,8 @@ A `<br>` or a literal `\n` breaks the line<br>like this,\nor this.
 `[[getting-started#Keys]]` opens a page at a heading (its text, or its slug `#keys`), and
 `[[#Table]]` jumps within this page. A hidden `{#name}` anchor marks a line without drawing
 anything: this paragraph carries one {#anchor-demo}, so `[[notes/markdown-cheatsheet#anchor-demo]]`
-lands here even though it has no heading.
+lands here even though it has no heading. {#shown-demo|An anchor with text} draws its text
+and can be linked to as `#shown-demo`.
 
 ## Quote
 

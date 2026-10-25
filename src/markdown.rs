@@ -121,6 +121,7 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         table: None,
         anchors: Vec::new(),
         pending_anchors: Vec::new(),
+        held: None,
         block_start: 0,
         block_blank: false,
     };
@@ -131,6 +132,9 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
     for (event, range) in Parser::new_ext(&markdown, parser_options()).into_offset_iter() {
         let range = source_offset(&added, range.start)..source_offset(&added, range.end);
         r.event(event, range);
+    }
+    if let Some(held) = r.held.take() {
+        r.text(&held);
     }
     r.finish_line();
     while r.lines.last().is_some_and(|l| l.width() == 0) {
@@ -215,6 +219,8 @@ struct Chunk {
 struct Cell {
     chunks: Vec<Chunk>,
     image: Option<usize>,
+    /// Hidden anchors written in the cell: they mark the row's first line.
+    anchors: Vec<String>,
 }
 
 struct Table {
@@ -222,23 +228,37 @@ struct Table {
     header_rows: usize,
 }
 
-/// `text` without its `{#name}` anchors, and the names taken out.
+/// `text` with its `{#name}` anchors taken out (a `{#name|text}` leaves its text in place),
+/// and the names.
 fn strip_anchors(text: &str) -> (String, Vec<String>) {
     let mut out = String::with_capacity(text.len());
     let mut names = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find("{#") {
         let after = &rest[start + 2..];
-        match after.find('}') {
-            Some(end)
-                if end > 0 && !after[..end].chars().any(|c| c.is_whitespace() || c == '{') =>
-            {
+        let anchor = after.find('}').and_then(|end| {
+            let body = &after[..end];
+            let (name, shown) = body
+                .split_once('|')
+                .map_or((body, None), |(n, t)| (n, Some(t)));
+            let valid = !name.is_empty()
+                && !name.chars().any(|c| c.is_whitespace() || c == '{')
+                && !body.contains('{');
+            valid.then_some((end, name, shown))
+        });
+        match anchor {
+            Some((end, name, shown)) => {
                 out.push_str(&rest[..start]);
-                names.push(after[..end].to_string());
+                names.push(name.to_string());
                 rest = &after[end + 1..];
-                // Not two spaces where the anchor sat between words.
-                if (out.is_empty() || out.ends_with(' ')) && rest.starts_with(' ') {
-                    rest = &rest[1..];
+                match shown {
+                    Some(shown) => out.push_str(shown),
+                    // Not two spaces where the anchor sat between words.
+                    None => {
+                        if (out.is_empty() || out.ends_with(' ')) && rest.starts_with(' ') {
+                            rest = &rest[1..];
+                        }
+                    }
                 }
             }
             _ => {
@@ -304,6 +324,8 @@ struct Renderer<'a> {
     anchors: Vec<(String, usize)>,
     /// Anchors read but not yet placed: they mark the next line something is written on.
     pending_anchors: Vec<String>,
+    /// Text ending in an unfinished `{#anchor`, waiting for the rest.
+    held: Option<String>,
     /// `lines.len()` when the current block began, and whether `start_block` put a blank
     /// line before it (a block that then draws nothing, like a lone `{#anchor}`, takes it
     /// back so the page does not get a double gap).
@@ -1211,6 +1233,9 @@ impl Renderer<'_> {
                 let top = self.lines.len();
                 for (o, p) in placed.iter().enumerate().filter(|(_, p)| p.row == r) {
                     first_line[o] = n;
+                    for name in &cell_of(p).anchors {
+                        self.anchors.push((name.clone(), top));
+                    }
                     if let Some(img) = cell_of(p).image {
                         let slot = &mut self.images[img];
                         slot.line = top;
@@ -1292,34 +1317,66 @@ impl Renderer<'_> {
         }
     }
 
+    /// A run of text, with its anchors and `\\n` breaks.
+    fn text(&mut self, text: &str) {
+        if self.hiding_title {
+            let (text, names) = strip_anchors(text);
+            self.pending_anchors.extend(names);
+            if let Some((_, _, heading)) = &mut self.heading {
+                heading.push_str(&text);
+            }
+        } else if let Some((_, alt)) = &mut self.image_alt {
+            alt.push_str(text);
+        } else if let Some(diagram) = &mut self.diagram {
+            diagram.push_str(text);
+        } else if self.in_code_block {
+            self.write_code_block(text);
+        } else if !self.skip_text {
+            // A hidden `{#anchor}` marks the line and is not drawn; in a table it
+            // marks its row.
+            let (text, names) = strip_anchors(text);
+            match self
+                .table
+                .as_mut()
+                .and_then(|t| t.rows.last_mut()?.last_mut())
+            {
+                Some(cell) => cell.anchors.extend(names),
+                None => self.pending_anchors.extend(names),
+            }
+            // A literal `\n` in the text breaks the line, as `<br>` does.
+            for (i, piece) in text.split("\\n").enumerate() {
+                if i > 0 {
+                    self.line_break();
+                }
+                self.write(piece);
+            }
+        }
+    }
+
     fn event(&mut self, event: Event, range: std::ops::Range<usize>) {
+        if !matches!(event, Event::Text(_))
+            && let Some(held) = self.held.take()
+        {
+            self.text(&held);
+        }
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) => {
-                if self.hiding_title {
-                    let (text, names) = strip_anchors(&text);
-                    self.pending_anchors.extend(names);
-                    if let Some((_, _, heading)) = &mut self.heading {
-                        heading.push_str(&text);
+                // An anchor the parser split (an escaped pipe in a table cell makes its own
+                // text event) waits for its closing brace.
+                let text = match self.held.take() {
+                    Some(mut held) => {
+                        held.push_str(&text);
+                        held
                     }
-                } else if let Some((_, alt)) = &mut self.image_alt {
-                    alt.push_str(&text);
-                } else if let Some(diagram) = &mut self.diagram {
-                    diagram.push_str(&text);
-                } else if self.in_code_block {
-                    self.write_code_block(&text);
-                } else if !self.skip_text {
-                    // A hidden `{#anchor}` marks the line and is not drawn.
-                    let (text, names) = strip_anchors(&text);
-                    self.pending_anchors.extend(names);
-                    // A literal `\n` in the text breaks the line, as `<br>` does.
-                    for (i, piece) in text.split("\\n").enumerate() {
-                        if i > 0 {
-                            self.line_break();
-                        }
-                        self.write(piece);
-                    }
+                    None => text.to_string(),
+                };
+                let open = text.rfind("{#").is_some_and(|at| !text[at..].contains('}'));
+                if open && !self.in_code_block && self.diagram.is_none() {
+                    self.held = Some(text);
+                } else {
+                    self.text(&text);
                 }
             }
             Event::Code(code) => {
@@ -1711,6 +1768,29 @@ mod tests {
             "a {#b c} d {# } e"
         );
         assert_eq!(strip_anchors("{#a} b {#c} d {#e}").0, "b d ");
+        assert_eq!(
+            strip_anchors("{#a|Shown} b {#c|} d {#e|x y}"),
+            (
+                "Shown b  d x y".to_string(),
+                vec!["a".into(), "c".into(), "e".into()]
+            )
+        );
+        assert_eq!(strip_anchors("{#a b|c} {#|d}").0, "{#a b|c} {#|d}");
+    }
+
+    #[test]
+    fn anchors_and_heading_links_work_in_tables() {
+        let src = "| H | I |\n|---|---|\n| one | [[a/b#Sec]] |\n| {#second} two | {#third|Third} |\n| three | x |";
+        let r = render(src, 80, 40, &mut Ctx);
+        let lines = text(&r);
+        println!("{}", lines.join("\n"));
+        assert_eq!(r.links[0].anchor.as_deref(), Some("Sec"));
+        let row2 = lines.iter().position(|l| l.starts_with("two")).unwrap();
+        assert!(lines[row2].contains("Third"), "the anchor's text is drawn");
+        assert_eq!(
+            r.anchors,
+            vec![("second".to_string(), row2), ("third".to_string(), row2)]
+        );
     }
 
     #[test]
