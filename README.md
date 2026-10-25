@@ -89,7 +89,7 @@ rather than `[[folder/page|label]]`.
 
 ## Diagrams
 
-A ```diaBits block draws a flowchart with box-drawing characters — no external tools:
+A ```diaBits block draws a flowchart or a tree with box-drawing characters — no external tools:
 
 ```diaBits
 diaType: flowchart
@@ -115,6 +115,26 @@ is a box, `id(label)` a rounded pill, `id<label>` a diamond. Lines join ids with
 `<--`, `<->` or `---`, can be chained, and take a label after `|`. Lines between neighbouring
 rows go straight down (fanning out and merging as needed); lines that skip rows run down a
 channel on the right. A block that does not parse shows its source with the problem.
+
+`diaType: tree` draws a tree instead: one shape per line, with leading dots saying how deep
+it sits (one more than its parent), and the lines from a parent down and across to its
+children drawn for you. Any number of roots (no dots) can follow each other:
+
+```diaBits
+diaType: tree
+root(Live Game State)
+.vitals[Hero Vitals]
+..hp[Hit Points]
+..mp[Mana]
+.party[Party Roster]
+.map[Map and Viewport]
+```
+
+A label can hold `[[links]]`, in either kind of diagram: `a[Go to [[pets/store]]]` shows the
+page's title in the box, `b([[pets/store|the store]])` your own text, and a line's label can
+link too (`a --> b | see [[pets/store]]`). The link is selectable and opens like any other,
+counts as a link to that page (backlinks, the wiki report), and is rewritten when the page
+is renamed.
 
 ## Editing
 

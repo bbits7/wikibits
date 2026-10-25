@@ -451,10 +451,13 @@ if(__exports != exports)module.exports = exports;return module.exports}));
 </script>
 
 <script id="diabits">
-// diaBits: a small flowchart language drawn with box-drawing characters. A line-for-line
-// port of src/diabits.rs so diagrams come out exactly as in the terminal.
+// diaBits: small flowchart and tree languages drawn with box-drawing characters. A
+// line-for-line port of src/diabits.rs so diagrams come out exactly as in the terminal.
 const diaBits = (() => {
   const ROW_GAP = 4;
+  // Columns a tree's child sits to the right of its parent, and the column of the trunk
+  // down from a parent, from the parent's left edge.
+  const TREE_INDENT = 5, TREE_TRUNK = 2;
 
   function charWidth(cp) {
     if ((cp >= 0x0300 && cp <= 0x036f) || (cp >= 0x200b && cp <= 0x200f) || (cp >= 0xfe00 && cp <= 0xfe0f)) return 0;
@@ -491,6 +494,20 @@ const diaBits = (() => {
     return rl > ru + 1 || (au && center(d.nodes[u]) !== center(d.nodes[l]));
   }
 
+  // The diaType line, wherever it is in the block; a block without one is a flowchart.
+  function kind(source) {
+    let kind = null;
+    source.split("\n").forEach((raw, number) => {
+      const line = raw.replace(/\r$/, "").trim();
+      if (!line.startsWith("diaType:")) return;
+      const at = number + 1;
+      if (kind) throw `line ${at}: diaType given twice`;
+      kind = line.slice(8).trim();
+      if (kind !== "flowchart" && kind !== "tree") throw `line ${at}: unknown diaType '${kind}' (flowchart or tree)`;
+    });
+    return kind ?? "flowchart";
+  }
+
   // ----- parsing -----
   function parseShape(item) {
     const open = item.search(/[[(<]/);
@@ -507,20 +524,13 @@ const diaBits = (() => {
 
   function parse(source) {
     const nodes = [], edges = [], rows = [], explicit = [], ids = new Map();
-    let seenType = false;
     const lines = source.split("\n");
     if (lines.length && lines[lines.length - 1] === "") lines.pop();
     for (let number = 0; number < lines.length; number++) {
       const line = lines[number].replace(/\r$/, "").trim();
-      if (!line) continue;
+      // The diaType line was read by kind().
+      if (!line || line.startsWith("diaType:")) continue;
       const at = number + 1;
-      if (line.startsWith("diaType:")) {
-        if (seenType) throw `line ${at}: diaType given twice`;
-        seenType = true;
-        const kind = line.slice(8).trim();
-        if (kind !== "flowchart") throw `line ${at}: unknown diaType '${kind}' (only flowchart for now)`;
-        continue;
-      }
       if (line.includes("-->") || line.includes("<--") || line.includes("<->") || line.includes("---")) {
         const bar = line.indexOf("|");
         const chain = bar >= 0 ? line.slice(0, bar) : line;
@@ -563,11 +573,13 @@ const diaBits = (() => {
     return { nodes, edges, rows, explicit };
   }
 
+  // Columns a shape takes for its label.
+  const shapeWidth = (shape, label) => width(label) + (shape === "diamond" ? 6 : 4);
+
   // ----- layout -----
   function layout(d) {
     for (const n of d.nodes) {
-      const lw = width(n.label);
-      n.w = n.shape === "diamond" ? lw + 6 : lw + 4;
+      n.w = shapeWidth(n.shape, n.label);
       n.h = 3;
     }
     const columns = Math.max(1, ...d.rows.map((row, r) => d.explicit[r] ?? row.length));
@@ -725,7 +737,7 @@ const diaBits = (() => {
     const channel = (k) => content + 2 + k * (3 + labelRoom);
     const w = side.length ? channel(side.length - 1) + 1 + labelRoom : content;
     const g = new Grid(w, height);
-    for (const n of d.nodes) drawShape(g, n);
+    for (const n of d.nodes) drawShape(g, n.x, n.y, n.w, n.shape, n.label);
     for (let r = 0; r + 1 < d.rows.length; r++) drawRegion(g, d, r);
     for (let e = 0; e < d.edges.length; e++) {
       const [u, l, au, al] = vertical(d, e);
@@ -741,19 +753,19 @@ const diaBits = (() => {
     return " ".repeat(left) + s + " ".repeat(extra - left);
   }
 
-  function drawShape(g, n) {
-    if (n.shape === "diamond") {
-      const inner = n.w - 4;
-      g.text(n.x, n.y, " ╱" + "‾".repeat(inner) + "╲");
-      g.text(n.x, n.y + 1, "⟨" + pad(n.label, n.w - 2) + "⟩");
-      g.text(n.x, n.y + 2, " ╲" + "_".repeat(inner) + "╱");
+  function drawShape(g, x, y, w, shape, label) {
+    if (shape === "diamond") {
+      const inner = w - 4;
+      g.text(x, y, " ╱" + "‾".repeat(inner) + "╲");
+      g.text(x, y + 1, "⟨" + pad(label, w - 2) + "⟩");
+      g.text(x, y + 2, " ╲" + "_".repeat(inner) + "╱");
       return;
     }
-    const inner = n.w - 2;
-    const [tl, tr, bl, br] = n.shape === "box" ? ["┌", "┐", "└", "┘"] : ["╭", "╮", "╰", "╯"];
-    g.text(n.x, n.y, tl + "─".repeat(inner) + tr);
-    g.text(n.x, n.y + 1, "│" + pad(n.label, inner) + "│");
-    g.text(n.x, n.y + 2, bl + "─".repeat(inner) + br);
+    const inner = w - 2;
+    const [tl, tr, bl, br] = shape === "box" ? ["┌", "┐", "└", "┘"] : ["╭", "╮", "╰", "╯"];
+    g.text(x, y, tl + "─".repeat(inner) + tr);
+    g.text(x, y + 1, "│" + pad(label, inner) + "│");
+    g.text(x, y + 2, bl + "─".repeat(inner) + br);
   }
 
   function drawRegion(g, d, r) {
@@ -852,14 +864,88 @@ const diaBits = (() => {
     if (d.edges[e].label != null) g.text(col + 2, Math.floor((uy + ly) / 2), d.edges[e].label);
   }
 
+  // ----- trees -----
+  // One shape per line; the leading dots say how deep it sits, one more than its parent.
+  function parseTree(source) {
+    const nodes = [], ids = new Map();
+    const lines = source.split("\n");
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
+    for (let number = 0; number < lines.length; number++) {
+      const line = lines[number].replace(/\r$/, "").trim();
+      if (!line || line.startsWith("diaType:")) continue;
+      const at = number + 1;
+      const depth = line.match(/^\.*/)[0].length;
+      const item = line.slice(depth).trimStart();
+      if (item.includes("-->") || item.includes("<--") || item.includes("<->") || item.includes("---")) {
+        throw `line ${at}: a tree has no lines: a child follows its parent with one more leading dot`;
+      }
+      if (!nodes.length && depth > 0) throw `line ${at}: the first shape is a root: no leading dots`;
+      const above = nodes.length ? nodes[nodes.length - 1].depth : 0;
+      if (depth > above + 1) throw `line ${at}: ${depth} dots, but the shape above has ${above}: one more dot per level`;
+      const shape = parseShape(item);
+      if (!shape) throw `line ${at}: '${item}' is not id[label], id(label) or id<label>`;
+      if (ids.has(shape.id)) throw `line ${at}: '${shape.id}' is defined twice`;
+      ids.set(shape.id, nodes.length);
+      nodes.push({ label: shape.label.trim(), shape: shape.shape, depth, x: 0, y: 0, w: 0 });
+    }
+    if (!nodes.length) throw "no shapes: add lines like id[label] and .child[label]";
+    return nodes;
+  }
+
+  // Shapes in order, each three rows tall, children indented under their parent; a blank
+  // row separates one root's tree from the next.
+  function layoutTree(nodes) {
+    let y = 0;
+    const lefts = []; // left edge of the current shape at each depth
+    nodes.forEach((n, i) => {
+      n.w = shapeWidth(n.shape, n.label);
+      if (i > 0 && n.depth === 0) y += 1;
+      n.x = n.depth === 0 ? 0 : lefts[n.depth - 1] + TREE_INDENT;
+      lefts.length = n.depth;
+      lefts.push(n.x);
+      n.y = y;
+      y += 3;
+    });
+  }
+
+  function drawTree(nodes) {
+    const w = Math.max(0, ...nodes.map((n) => n.x + n.w));
+    const h = Math.max(0, ...nodes.map((n) => n.y + 3));
+    const g = new Grid(w, h);
+    for (const n of nodes) drawShape(g, n.x, n.y, n.w, n.shape, n.label);
+    nodes.forEach((n, i) => {
+      // A trunk down from the parent, with an arm across to each child.
+      const children = [];
+      for (let j = i + 1; j < nodes.length && nodes[j].depth > n.depth; j++) {
+        if (nodes[j].depth === n.depth + 1) children.push(nodes[j]);
+      }
+      if (!children.length) return;
+      const last = children[children.length - 1];
+      const trunk = n.x + TREE_TRUNK;
+      if (n.shape !== "diamond") g.put(trunk, n.y + 2, "┬");
+      for (let y = n.y + 3; y < last.y + 1; y++) g.put(trunk, y, "│");
+      for (const child of children) {
+        const y = child.y + 1;
+        g.put(trunk, y, child === last ? "└" : "├");
+        for (let x = trunk + 1; x < child.x; x++) g.put(x, y, "─");
+      }
+    });
+    return g.cells.map((row) => row.join("").replace(/\s+$/, ""));
+  }
+
   // Render a diaBits block to text lines, or throw a string explaining the problem.
   function render(source) {
+    if (kind(source) === "tree") {
+      const nodes = parseTree(source);
+      layoutTree(nodes);
+      return drawTree(nodes);
+    }
     const d = parse(source);
     layout(d);
     return draw(d);
   }
 
-  return { render, charWidth };
+  return { render, charWidth, width };
 })();
 if (typeof module !== "undefined") module.exports = diaBits;
 </script>
@@ -1158,6 +1244,13 @@ function extractLinks(text) {
   md.walkTokens(tokens, (t) => {
     if (t.type === "wikilink") add(t.target.trim());
     else if (t.type === "link" && !/^mailto:/i.test(t.href) && !(t.text && t.href === "mailto:" + t.text)) add(decodeHref(t.href));
+    else if (t.type === "code" && /^diabits$/i.test((t.lang || "").trim().split(/\s+/)[0] || "")) {
+      // The [[links]] written in a diagram's labels.
+      for (const m of t.text.matchAll(/\[\[([^\[\]\n]+?)\]\]/g)) {
+        const bar = m[1].indexOf("|");
+        add((bar < 0 ? m[1] : m[1].slice(0, bar)).trim());
+      }
+    }
   });
   return links;
 }
@@ -1267,18 +1360,41 @@ md.use({
   },
 });
 
+// First of the private-use characters that stand in for links in a diagram's source.
+const DIAGRAM_LINK_MARK = 0xe000;
+
+// [[page]] and [[page|label]] in a diagram's labels: each becomes a run of one private-use
+// character (a different one per link) as wide as the text it shows, so the diagram is laid
+// out around the text without ever parsing it; the runs become links in the drawn lines.
+function markDiagramLinks(source) {
+  const links = [];
+  const marked = source.replace(/\[\[([^\[\]\n]+?)\]\]/g, (_, body) => {
+    const bar = body.indexOf("|");
+    const raw = bar < 0 ? body : body.slice(0, bar);
+    const target = render.wiki.resolve(render.pageId, raw);
+    render.noteLink(target);
+    const text = bar >= 0 ? body.slice(bar + 1) : target.kind === "page" ? render.wiki.title(target.id) : raw;
+    const mark = String.fromCodePoint(DIAGRAM_LINK_MARK + links.length);
+    links.push({ text, target });
+    return mark.repeat(Math.max(1, diaBits.width(text)));
+  });
+  return { marked, links };
+}
+
 function diagramHtml(source) {
-  let lines;
+  let lines, links;
   try {
-    lines = diaBits.render(source);
+    let marked;
+    ({ marked, links } = markDiagramLinks(source));
+    lines = diaBits.render(marked);
   } catch (problem) {
     return `<pre class="diabits-error"><code>${esc(source)}</code><div class="diabits-problem">diaBits: ${esc(problem)}</div></pre>\n`;
   }
   // Every non-ASCII character sits in a box one (or two) cells wide, so lines stay aligned
   // whichever font ends up drawing the box-drawing characters.
-  const html = lines.map((line) => {
+  const cells = (text) => {
     let out = "";
-    const chars = [...line];
+    const chars = [...text];
     for (let i = 0; i < chars.length; i++) {
       const ch = chars[i], cp = ch.codePointAt(0);
       if (cp < 128) { out += esc(ch); continue; }
@@ -1289,8 +1405,21 @@ function diagramHtml(source) {
       } else out += `<span class="g">${esc(ch)}</span>`;
     }
     return out;
+  };
+  const html = lines.map((line) => {
+    let out = "", plain = "";
+    const chars = [...line];
+    for (let i = 0; i < chars.length; i++) {
+      const k = chars[i].codePointAt(0) - DIAGRAM_LINK_MARK;
+      if (k < 0 || k >= links.length) { plain += chars[i]; continue; }
+      while (chars[i + 1] === chars[i]) i++;
+      out += cells(plain);
+      plain = "";
+      out += render.linkHtml(links[k].target, cells(links[k].text));
+    }
+    return out + cells(plain);
   }).join("\n");
-  return `<pre class="diabits" role="img" aria-label="Flowchart">${html}</pre>\n`;
+  return `<pre class="diabits" aria-label="Diagram">${html}</pre>\n`;
 }
 
 // Cells holding only ^^ merge with the cell above, cells holding only << with the cell to

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
-use pulldown_cmark::{Event, LinkType, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -910,6 +910,7 @@ pub fn rewrite_links(text: &str, replace: impl Fn(LinkKind, &str) -> Option<Stri
     let mut rest = text;
     while !rest.is_empty() {
         if let Some(inner) = rest.strip_prefix("[[")
+            && !inner.starts_with('[')
             && let Some(close) = inner.find("]]")
         {
             let body = &inner[..close];
@@ -1020,26 +1021,61 @@ pub fn parser_options() -> Options {
         | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
 }
 
-/// Every link target in the document, in order, without duplicates.
+/// Every link target in the document, in order, without duplicates — including the
+/// `[[links]]` written in the labels of ```diaBits blocks.
 fn extract_links(text: &str) -> Vec<String> {
     let mut links: Vec<String> = Vec::new();
+    let mut add = |dest: String| {
+        if !links.contains(&dest) {
+            links.push(dest);
+        }
+    };
+    let mut in_diagram = false;
     for event in Parser::new_ext(text, parser_options()) {
-        if let Event::Start(Tag::Link {
-            link_type,
-            dest_url,
-            ..
-        }) = event
-        {
-            if matches!(link_type, LinkType::Email) {
-                continue;
+        match event {
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            }) => {
+                if !matches!(link_type, LinkType::Email) {
+                    add(dest_url.to_string());
+                }
             }
-            let dest = dest_url.to_string();
-            if !links.contains(&dest) {
-                links.push(dest);
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang))) => {
+                in_diagram = lang.trim().eq_ignore_ascii_case("diabits");
             }
+            Event::End(TagEnd::CodeBlock) => in_diagram = false,
+            Event::Text(source) if in_diagram => {
+                for target in diagram_links(&source) {
+                    add(target.to_string());
+                }
+            }
+            _ => {}
         }
     }
     links
+}
+
+/// The targets of the `[[page]]` / `[[page|label]]` links in a diagram's source.
+pub fn diagram_links(source: &str) -> Vec<&str> {
+    let mut targets = Vec::new();
+    let mut rest = source;
+    while let Some(start) = rest.find("[[") {
+        let inner = &rest[start + 2..];
+        // `a[[[page]]]`: the link starts at the last of the opening brackets.
+        if inner.starts_with('[') {
+            rest = &rest[start + 1..];
+            continue;
+        }
+        let Some(close) = inner.find("]]") else { break };
+        let body = &inner[..close];
+        if !body.contains('\n') {
+            targets.push(body.split_once('|').map_or(body, |(t, _)| t));
+        }
+        rest = &inner[close + 2..];
+    }
+    targets
 }
 
 #[cfg(test)]
@@ -1066,9 +1102,21 @@ mod tests {
     }
 
     #[test]
+    fn links_are_rewritten_inside_diagram_shapes() {
+        let out = rewrite_links("a[[[old]]]\nb([[old|B]])", |_, raw| {
+            (raw == "old").then(|| "new".to_string())
+        });
+        assert_eq!(out, "a[[[new]]]\nb([[new|B]])");
+    }
+
+    #[test]
     fn links_are_collected_once() {
         let links = extract_links("[[a/b]] and [[a/b|again]] then [c](c.md) <https://x.y>");
         assert_eq!(links, vec!["a/b", "c.md", "https://x.y"]);
+        let links = extract_links(
+            "```diaBits\na[[[d]]]\nb([[e|E]])\na --> b | [[a/b]]\n```\n```\n[[not]]\n```",
+        );
+        assert_eq!(links, vec!["d", "e", "a/b"]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! diaBits: a small flowchart language rendered with box-drawing characters.
+//! diaBits: small flowchart and tree languages rendered with box-drawing characters.
 //!
 //! ```text
 //! diaType: flowchart
@@ -18,6 +18,18 @@
 //! Each line of shapes is a row of the diagram, top to bottom; shapes on one line share the
 //! row. `id[label]` is a box, `id(label)` a pill, `id<label>` a diamond. Lines are `-->`,
 //! `<--`, `<->` or `---` between ids, chainable, with `| label` at the end.
+//!
+//! ```text
+//! diaType: tree
+//! root(Live Game State)
+//! .vitals[Hero Vitals]
+//! ..hp[Hit Points]
+//! .party[Party Roster]
+//! ```
+//!
+//! A tree has one shape per line; the leading dots say how deep it sits, one more than its
+//! parent, and the lines from a parent down and across to its children are implied. Any
+//! number of roots (no dots) can follow each other.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -85,6 +97,36 @@ struct Diagram {
 /// Columns between shapes on the same row.
 const ROW_GAP: usize = 4;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Flowchart,
+    Tree,
+}
+
+/// The `diaType:` line, wherever it is in the block; a block without one is a flowchart.
+fn kind(source: &str) -> Result<Kind, String> {
+    let mut kind = None;
+    for (number, raw) in source.lines().enumerate() {
+        let Some(rest) = raw.trim().strip_prefix("diaType:") else {
+            continue;
+        };
+        let at = number + 1;
+        if kind.is_some() {
+            return Err(format!("line {at}: diaType given twice"));
+        }
+        kind = Some(match rest.trim() {
+            "flowchart" => Kind::Flowchart,
+            "tree" => Kind::Tree,
+            other => {
+                return Err(format!(
+                    "line {at}: unknown diaType '{other}' (flowchart or tree)"
+                ));
+            }
+        });
+    }
+    Ok(kind.unwrap_or(Kind::Flowchart))
+}
+
 /// Whether an edge is routed down a channel on the right instead of between its rows:
 /// edges that skip rows, edges between non-neighbouring shapes of one row, and edges that
 /// point back up (or both ways) without lining up, which would be ambiguous on a shared bus.
@@ -99,9 +141,18 @@ fn goes_sideways(d: &Diagram, e: usize) -> bool {
 
 /// Render a diaBits block to text lines, or explain what is wrong with it.
 pub fn render(source: &str) -> Result<Vec<String>, String> {
-    let mut diagram = parse(source)?;
-    layout(&mut diagram);
-    Ok(draw(&diagram))
+    match kind(source)? {
+        Kind::Flowchart => {
+            let mut diagram = parse(source)?;
+            layout(&mut diagram);
+            Ok(draw(&diagram))
+        }
+        Kind::Tree => {
+            let mut nodes = parse_tree(source)?;
+            layout_tree(&mut nodes);
+            Ok(draw_tree(&nodes))
+        }
+    }
 }
 
 // ----- parsing ------------------------------------------------------------------------
@@ -112,26 +163,13 @@ fn parse(source: &str) -> Result<Diagram, String> {
     let mut rows: Vec<Vec<usize>> = Vec::new();
     let mut explicit: Vec<Option<usize>> = Vec::new();
     let mut ids: HashMap<String, usize> = HashMap::new();
-    let mut seen_type = false;
     for (number, raw) in source.lines().enumerate() {
         let line = raw.trim();
-        if line.is_empty() {
+        // The diaType line was read by `kind`.
+        if line.is_empty() || line.starts_with("diaType:") {
             continue;
         }
         let at = number + 1;
-        if let Some(kind) = line.strip_prefix("diaType:") {
-            if seen_type {
-                return Err(format!("line {at}: diaType given twice"));
-            }
-            seen_type = true;
-            if kind.trim() != "flowchart" {
-                return Err(format!(
-                    "line {at}: unknown diaType '{}' (only flowchart for now)",
-                    kind.trim()
-                ));
-            }
-            continue;
-        }
         if line.contains("-->")
             || line.contains("<--")
             || line.contains("<->")
@@ -243,15 +281,19 @@ fn parse_shape(item: &str) -> Option<(&str, &str, Shape)> {
     (!label.trim().is_empty()).then_some((id, label, shape))
 }
 
+/// Columns a shape takes for its label.
+fn shape_width(shape: Shape, label: &str) -> usize {
+    match shape {
+        Shape::Box | Shape::Pill => label.width() + 4,
+        Shape::Diamond => label.width() + 6,
+    }
+}
+
 // ----- layout -------------------------------------------------------------------------
 
 fn layout(d: &mut Diagram) {
     for node in &mut d.nodes {
-        let lw = node.label.width();
-        node.w = match node.shape {
-            Shape::Box | Shape::Pill => lw + 4,
-            Shape::Diamond => lw + 6,
-        };
+        node.w = shape_width(node.shape, &node.label);
         node.h = 3;
     }
     // A grid of columns: as many as the fullest row has shapes (or slots). A row with fewer
@@ -559,8 +601,8 @@ fn draw(d: &Diagram) -> Vec<String> {
     };
     let mut g = Grid::new(width, height);
 
-    for node in &d.nodes {
-        draw_shape(&mut g, node);
+    for n in &d.nodes {
+        draw_shape(&mut g, n.x, n.y, n.w, n.shape, &n.label);
     }
     for r in 0..d.rows.len().saturating_sub(1) {
         draw_region(&mut g, d, r);
@@ -586,29 +628,29 @@ fn neighbours(d: &Diagram, a: usize, b: usize) -> bool {
     matches!((ia, ib), (Some(ia), Some(ib)) if ia.abs_diff(ib) == 1)
 }
 
-fn draw_shape(g: &mut Grid, n: &Node) {
-    let inner = n.w - 2;
+fn draw_shape(g: &mut Grid, x: usize, y: usize, w: usize, shape: Shape, label: &str) {
+    let inner = w - 2;
     let pad = |s: &str, width: usize| {
         let extra = width.saturating_sub(s.width());
         let left = extra / 2;
         format!("{}{}{}", " ".repeat(left), s, " ".repeat(extra - left))
     };
-    match n.shape {
+    match shape {
         Shape::Box | Shape::Pill => {
-            let (tl, tr, bl, br) = if n.shape == Shape::Box {
+            let (tl, tr, bl, br) = if shape == Shape::Box {
                 ('┌', '┐', '└', '┘')
             } else {
                 ('╭', '╮', '╰', '╯')
             };
-            g.text(n.x, n.y, &format!("{tl}{}{tr}", "─".repeat(inner)));
-            g.text(n.x, n.y + 1, &format!("│{}│", pad(&n.label, inner)));
-            g.text(n.x, n.y + 2, &format!("{bl}{}{br}", "─".repeat(inner)));
+            g.text(x, y, &format!("{tl}{}{tr}", "─".repeat(inner)));
+            g.text(x, y + 1, &format!("│{}│", pad(label, inner)));
+            g.text(x, y + 2, &format!("{bl}{}{br}", "─".repeat(inner)));
         }
         Shape::Diamond => {
-            let inner = n.w - 4;
-            g.text(n.x, n.y, &format!(" ╱{}╲", "‾".repeat(inner)));
-            g.text(n.x, n.y + 1, &format!("⟨{}⟩", pad(&n.label, n.w - 2)));
-            g.text(n.x, n.y + 2, &format!(" ╲{}╱", "_".repeat(inner)));
+            let inner = w - 4;
+            g.text(x, y, &format!(" ╱{}╲", "‾".repeat(inner)));
+            g.text(x, y + 1, &format!("⟨{}⟩", pad(label, w - 2)));
+            g.text(x, y + 2, &format!(" ╲{}╱", "_".repeat(inner)));
         }
     }
 }
@@ -790,6 +832,143 @@ fn draw_side(g: &mut Grid, d: &Diagram, e: usize, col: usize) {
     }
 }
 
+// ----- trees --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct TreeNode {
+    label: String,
+    shape: Shape,
+    /// How many leading dots: 0 for a root, one more than the parent for a child.
+    depth: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+}
+
+/// Columns a child sits to the right of its parent.
+const TREE_INDENT: usize = 5;
+/// Column of the trunk down from a parent, from the parent's left edge.
+const TREE_TRUNK: usize = 2;
+
+fn parse_tree(source: &str) -> Result<Vec<TreeNode>, String> {
+    let mut nodes: Vec<TreeNode> = Vec::new();
+    let mut ids: HashMap<String, usize> = HashMap::new();
+    for (number, raw) in source.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("diaType:") {
+            continue;
+        }
+        let at = number + 1;
+        let depth = line.chars().take_while(|&c| c == '.').count();
+        let item = line[depth..].trim_start();
+        if item.contains("-->")
+            || item.contains("<--")
+            || item.contains("<->")
+            || item.contains("---")
+        {
+            return Err(format!(
+                "line {at}: a tree has no lines: a child follows its parent with one more leading dot"
+            ));
+        }
+        if nodes.is_empty() && depth > 0 {
+            return Err(format!(
+                "line {at}: the first shape is a root: no leading dots"
+            ));
+        }
+        let above = nodes.last().map_or(0, |n| n.depth);
+        if depth > above + 1 {
+            return Err(format!(
+                "line {at}: {depth} dots, but the shape above has {above}: one more dot per level"
+            ));
+        }
+        let (id, label, shape) = parse_shape(item).ok_or_else(|| {
+            format!("line {at}: '{item}' is not id[label], id(label) or id<label>")
+        })?;
+        if ids.contains_key(id) {
+            return Err(format!("line {at}: '{id}' is defined twice"));
+        }
+        ids.insert(id.to_string(), nodes.len());
+        nodes.push(TreeNode {
+            label: label.trim().to_string(),
+            shape,
+            depth,
+            x: 0,
+            y: 0,
+            w: 0,
+        });
+    }
+    if nodes.is_empty() {
+        return Err("no shapes: add lines like id[label] and .child[label]".to_string());
+    }
+    Ok(nodes)
+}
+
+/// Shapes in order, each three rows tall, children indented under their parent; a blank
+/// row separates one root's tree from the next.
+fn layout_tree(nodes: &mut [TreeNode]) {
+    let mut y = 0;
+    // Left edge of the current shape at each depth.
+    let mut lefts: Vec<usize> = Vec::new();
+    for (i, n) in nodes.iter_mut().enumerate() {
+        n.w = shape_width(n.shape, &n.label);
+        if i > 0 && n.depth == 0 {
+            y += 1;
+        }
+        n.x = if n.depth == 0 {
+            0
+        } else {
+            lefts[n.depth - 1] + TREE_INDENT
+        };
+        lefts.truncate(n.depth);
+        lefts.push(n.x);
+        n.y = y;
+        y += 3;
+    }
+}
+
+fn draw_tree(nodes: &[TreeNode]) -> Vec<String> {
+    let width = nodes.iter().map(|n| n.x + n.w).max().unwrap_or(0);
+    let height = nodes.iter().map(|n| n.y + 3).max().unwrap_or(0);
+    let mut g = Grid::new(width, height);
+    for n in nodes {
+        draw_shape(&mut g, n.x, n.y, n.w, n.shape, &n.label);
+    }
+    for (i, n) in nodes.iter().enumerate() {
+        // A trunk down from the parent, with an arm across to each child.
+        let children: Vec<&TreeNode> = nodes[i + 1..]
+            .iter()
+            .take_while(|m| m.depth > n.depth)
+            .filter(|m| m.depth == n.depth + 1)
+            .collect();
+        let Some(last) = children.last() else {
+            continue;
+        };
+        let trunk = n.x + TREE_TRUNK;
+        if n.shape != Shape::Diamond {
+            g.put(trunk, n.y + 2, '┬');
+        }
+        for y in n.y + 3..last.y + 1 {
+            g.put(trunk, y, '│');
+        }
+        for child in &children {
+            let y = child.y + 1;
+            g.put(
+                trunk,
+                y,
+                if std::ptr::eq(*child, *last) {
+                    '└'
+                } else {
+                    '├'
+                },
+            );
+            for x in trunk + 1..child.x {
+                g.put(x, y, '─');
+            }
+        }
+    }
+    g.lines()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,6 +1045,56 @@ mod tests {
         );
         assert!(render("hello").unwrap_err().contains("is not id[label]"));
         assert!(render("a[A], b[B]\na -- b").is_err());
+        assert!(
+            render("diaType: tree\n.a[A]")
+                .unwrap_err()
+                .contains("the first shape is a root")
+        );
+        assert!(
+            render("diaType: tree\na[A]\n...b[B]")
+                .unwrap_err()
+                .contains("one more dot per level")
+        );
+        assert!(
+            render("diaType: tree\na[A]\nb[B]\na --> b")
+                .unwrap_err()
+                .contains("a tree has no lines")
+        );
+    }
+
+    #[test]
+    fn a_tree_hangs_children_under_their_parent() {
+        let src = "diaType: tree\nr1(Root 1)\n.g1[Parent]\n..c1[Kid 1]\n..c2<Kid 2?>\n.g2[Aunt]\nr2(Root 2)\n.x[Only]";
+        let out = render(src).unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert_eq!(
+            out,
+            vec![
+                "╭────────╮",
+                "│ Root 1 │",
+                "╰─┬──────╯",
+                "  │  ┌────────┐",
+                "  ├──│ Parent │",
+                "  │  └─┬──────┘",
+                "  │    │  ┌───────┐",
+                "  │    ├──│ Kid 1 │",
+                "  │    │  └───────┘",
+                "  │    │   ╱‾‾‾‾‾‾‾‾╲",
+                "  │    └──⟨  Kid 2?  ⟩",
+                "  │        ╲________╱",
+                "  │  ┌──────┐",
+                "  └──│ Aunt │",
+                "     └──────┘",
+                "",
+                "╭────────╮",
+                "│ Root 2 │",
+                "╰─┬──────╯",
+                "  │  ┌──────┐",
+                "  └──│ Only │",
+                "     └──────┘",
+            ]
+        );
     }
 
     #[test]

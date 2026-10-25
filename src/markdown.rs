@@ -268,6 +268,8 @@ pub const EXTERNAL_LINK: Style = Style::new()
     .fg(Color::Blue)
     .add_modifier(Modifier::UNDERLINED);
 const CODE: Style = Style::new().fg(Color::Magenta);
+/// First of the private-use characters that stand in for links in a diagram's source.
+const DIAGRAM_LINK_MARK: u32 = 0xE000;
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 /// Lines and shapes of a diaBits diagram.
 const DIAGRAM: Style = Style::new().fg(Color::Cyan);
@@ -381,6 +383,13 @@ impl Renderer<'_> {
     /// Write inline text, wrapping at word boundaries.
     fn write(&mut self, text: &str) {
         let style = self.style();
+        self.write_styled(text, style);
+    }
+
+    /// Write inline text in `style`, wrapping at word boundaries; a word wider than the line
+    /// is broken across lines.
+    fn write_styled(&mut self, text: &str, style: Style) {
+        use unicode_width::UnicodeWidthChar;
         let link = self.cur_link;
         if self.table.is_some() {
             self.emit(&text.replace('\n', " "), style, link);
@@ -395,7 +404,27 @@ impl Renderer<'_> {
             if self.at_line_start && word.trim().is_empty() {
                 continue;
             }
-            self.emit(word, style, link);
+            if self.cur_width + w <= self.width {
+                self.emit(word, style, link);
+                continue;
+            }
+            let (mut piece, mut piece_width) = (String::new(), 0);
+            for c in word.chars() {
+                let cw = c.width().unwrap_or(0);
+                if self.cur_width + piece_width + cw > self.width
+                    && !(piece.is_empty() && self.at_line_start)
+                {
+                    self.emit(&piece, style, link);
+                    (piece, piece_width) = (String::new(), 0);
+                    self.newline();
+                    if c == ' ' {
+                        continue;
+                    }
+                }
+                piece.push(c);
+                piece_width += cw;
+            }
+            self.emit(&piece, style, link);
         }
     }
 
@@ -525,10 +554,12 @@ impl Renderer<'_> {
     /// Draw a diaBits block, or show its source with the problem when it does not parse.
     fn end_diagram(&mut self, source: &str) {
         self.finish_line();
-        match crate::diabits::render(source) {
+        let (marked, links) = self.mark_diagram_links(source);
+        match crate::diabits::render(&marked) {
             Ok(lines) => {
+                let mut indices: Vec<Option<usize>> = vec![None; links.len()];
                 for line in lines {
-                    self.emit(&line, DIAGRAM, None);
+                    self.diagram_line(&line, &links, &mut indices);
                     self.newline();
                 }
             }
@@ -543,6 +574,80 @@ impl Renderer<'_> {
             }
         }
         self.need_blank = true;
+    }
+
+    /// Each `[[page]]` / `[[page|label]]` in a diagram's source is replaced by a run of one
+    /// private-use character (a different one per link) as wide as the text it shows, so
+    /// the diagram is laid out around the text without ever parsing it. Returns the marked
+    /// source and, per link, its text and target; `diagram_line` swaps the runs back.
+    fn mark_diagram_links(&self, source: &str) -> (String, Vec<(String, LinkTarget)>) {
+        let mut out = String::with_capacity(source.len());
+        let mut links = Vec::new();
+        let mut rest = source;
+        while !rest.is_empty() {
+            // `a[[[page]]]`: the link starts at the last of the opening brackets.
+            if let Some(inner) = rest.strip_prefix("[[")
+                && !inner.starts_with('[')
+                && let Some(close) = inner.find("]]")
+                && !inner[..close].contains('\n')
+            {
+                let body = &inner[..close];
+                let (raw, label) = body
+                    .split_once('|')
+                    .map_or((body, None), |(t, l)| (t, Some(l)));
+                let target = self.ctx.resolve(raw);
+                let text = match (label, &target) {
+                    (Some(label), _) => label.to_string(),
+                    (None, LinkTarget::Page(id)) => self.ctx.title(id),
+                    (None, _) => raw.to_string(),
+                };
+                let mark = char::from_u32(DIAGRAM_LINK_MARK + links.len() as u32).unwrap();
+                out.extend(std::iter::repeat_n(mark, text.width().max(1)));
+                links.push((text, target));
+                rest = &inner[close + 2..];
+            } else {
+                let c = rest.chars().next().unwrap();
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+        (out, links)
+    }
+
+    /// One drawn line of a diagram: the drawing itself, with each run of a link's marker
+    /// written as that link's text.
+    fn diagram_line(
+        &mut self,
+        line: &str,
+        links: &[(String, LinkTarget)],
+        indices: &mut [Option<usize>],
+    ) {
+        let mut plain = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            let k = (c as u32).wrapping_sub(DIAGRAM_LINK_MARK) as usize;
+            if (c as u32) < DIAGRAM_LINK_MARK || k >= links.len() {
+                plain.push(c);
+                continue;
+            }
+            while chars.peek() == Some(&c) {
+                chars.next();
+            }
+            self.emit(&plain, DIAGRAM, None);
+            plain.clear();
+            let (text, target) = &links[k];
+            let index = *indices[k].get_or_insert_with(|| {
+                self.links.push(Link {
+                    target: target.clone(),
+                    spans: Vec::new(),
+                });
+                self.items.push(Item::Link(self.links.len() - 1));
+                self.links.len() - 1
+            });
+            self.emit(text, Self::link_style(target), Some(index));
+        }
+        self.emit(&plain, DIAGRAM, None);
+        self.at_line_start = false;
     }
 
     /// One line of an image frame, after any list or quote prefix.
@@ -749,12 +854,12 @@ impl Renderer<'_> {
                 }
                 let mark = marker(at(r, c));
                 let merged = match mark {
-                    Some("<<") if c > 0 => owner[r][c - 1]
-                        .filter(|&o| placed[o].row == r)
-                        .map(|o| {
+                    Some("<<") if c > 0 => {
+                        owner[r][c - 1].filter(|&o| placed[o].row == r).map(|o| {
                             placed[o].cols += 1;
                             o
-                        }),
+                        })
+                    }
                     Some("^^") if r > 0 => owner[r - 1][c]
                         .filter(|&o| placed[o].col == c && placed[o].row + placed[o].rows == r)
                         .map(|o| {
@@ -1143,14 +1248,9 @@ impl Renderer<'_> {
                 }
             }
             Event::Code(code) => {
+                // A code span wraps at its spaces like any text (it keeps its colour).
                 let style = self.style().patch(CODE);
-                let link = self.cur_link;
-                let text = code.to_string();
-                if !self.at_line_start && self.cur_width + text.width() > self.width {
-                    self.trim_trailing_space();
-                    self.newline();
-                }
-                self.emit(&text, style, link);
+                self.write_styled(&code, style);
             }
             Event::SoftBreak => self.write(" "),
             Event::HardBreak => self.line_break(),
@@ -1506,6 +1606,41 @@ mod tests {
     fn wraps_words() {
         let r = render("one two three four five", 10, 40, &mut Ctx);
         assert_eq!(text(&r), vec!["one two", "three four", "five"]);
+        // A word wider than the line breaks across lines.
+        let r = render("abcdefghijklmnopqrstuvwxyz end", 10, 40, &mut Ctx);
+        assert_eq!(text(&r), vec!["abcdefghij", "klmnopqrst", "uvwxyz end"]);
+    }
+
+    #[test]
+    fn code_spans_wrap_like_text() {
+        let r = render("> `one two three four five`", 12, 40, &mut Ctx);
+        assert_eq!(text(&r), vec!["│ one two", "│ three four", "│ five"]);
+        let r = render("a `b c` d", 20, 40, &mut Ctx);
+        assert_eq!(text(&r), vec!["a b c d"]);
+        assert_eq!(r.lines[0].spans[1].style, CODE);
+    }
+
+    #[test]
+    fn diagram_labels_can_hold_links() {
+        let src = "```diaBits\na[Go to [[a/b]]]\nb([[nope|Missing]])\na --> b | see [[a/b|B]]\n```";
+        let r = render(src, 80, 40, &mut Ctx);
+        let lines = text(&r);
+        println!("{}", lines.join("\n"));
+        assert_eq!(lines[1], "│ Go to Page B │");
+        assert!(lines.iter().any(|l| l.contains("see B")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("│  Missing  │") || l.contains("│ Missing │"))
+        );
+        // Links are numbered in drawing order: the line's label sits above the second box.
+        assert_eq!(r.links.len(), 3);
+        assert_eq!(r.links[0].target, LinkTarget::Page("a/b".into()));
+        assert_eq!(r.links[1].target, LinkTarget::Page("a/b".into()));
+        assert_eq!(r.links[2].target, LinkTarget::Missing("nope".into()));
+        let (line, span) = r.links[0].spans[0];
+        assert_eq!(r.lines[line].spans[span].content, "Page B");
+        assert_eq!(r.items.len(), 3);
     }
 
     #[test]
