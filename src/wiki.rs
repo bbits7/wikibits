@@ -1107,7 +1107,7 @@ pub fn escape_link_pipes(text: &str) -> (String, Vec<usize>) {
 
 /// A link's destination as written: outside a table the parser keeps the backslash of an
 /// escaped pipe (`[[page\|label]]`) on the end of a wiki link's target.
-pub fn wiki_dest<'a>(link_type: LinkType, dest: &'a str) -> &'a str {
+pub fn wiki_dest(link_type: LinkType, dest: &str) -> &str {
     match link_type {
         LinkType::WikiLink { .. } => dest.strip_suffix('\\').unwrap_or(dest),
         _ => dest,
