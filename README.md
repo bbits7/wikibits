@@ -57,6 +57,7 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `V` | select text with the keyboard: arrows move, `Shift`+arrows extend, `y` copies, `Esc` ends; dragging with the mouse selects and copies too |
 | `h` / `l`, ← / → | collapse / expand a folder; in the page, scroll sideways when a diagram or code block is wider than it |
 | `J` / `K` | move the selected page or folder down / up within its folder (outside the pages column: the current page) |
+| `Ctrl+↑` / `Ctrl+↓` | move the page under the page or folder listed above it, as its last child (a plain page above becomes a folder with the page as its index) / out of its folder, to just after the folder; links to the page are rewritten as for a rename |
 | `b`, `Backspace` / `f` | back / forward, to the place on the page you left: after a link to a heading or anchor, `b` lands on that link, and a jump within the page is a step too |
 | `H` | home page |
 | `r` | reload |

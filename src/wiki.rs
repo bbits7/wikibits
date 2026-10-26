@@ -534,8 +534,8 @@ impl Wiki {
     }
 
     /// Move a page to a new id (`folder/name`) and rewrite the links that point at it in the
-    /// other pages. Returns how many pages had links updated.
-    pub fn rename_page(&mut self, old: &str, new: &str) -> Result<usize> {
+    /// other pages. Reports the plain pages that became folder indexes to make room.
+    pub fn rename_page(&mut self, old: &str, new: &str) -> Result<Moved> {
         let page = self
             .pages
             .get(old)
@@ -544,7 +544,7 @@ impl Wiki {
         if target.exists() {
             anyhow::bail!("a page named {new} already exists");
         }
-        self.promote_ancestors_to_folders(new)?;
+        let promoted = self.promote_ancestors_to_folders(new)?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -583,7 +583,57 @@ impl Wiki {
             }
         }
         self.reload()?;
-        Ok(updated)
+        Ok(Moved {
+            id: new.to_string(),
+            updated,
+            promoted,
+        })
+    }
+
+    /// Move the page `id` under the sibling listed just above it in the tree, as that
+    /// sibling's last child: with `[notes, todo]`, moving `todo` makes `notes/todo`, and a
+    /// plain `notes` page becomes the folder's index. `None` when nothing is above it.
+    pub fn move_into_previous(&mut self, id: &str) -> Result<Option<Moved>> {
+        let (folder, name) = split_id(id);
+        let names = self.sibling_names(folder);
+        let Some(at) = names.iter().position(|n| n == name) else {
+            anyhow::bail!("{name} is not in {}", display_folder(folder));
+        };
+        if at == 0 {
+            return Ok(None);
+        }
+        let parent = join_id(folder, &names[at - 1]);
+        let moved = self.rename_page(id, &join_id(&parent, name))?;
+        // Last among its new siblings, and pinned there whatever the alphabet says later.
+        let mut names = self.sibling_names(&parent);
+        names.retain(|n| n != name);
+        names.push(name.to_string());
+        self.write_order(&parent, names)?;
+        Ok(Some(moved))
+    }
+
+    /// Move the page `id` out of its folder, to just after that folder among the folder's
+    /// siblings. `None` when it is already at the top level.
+    pub fn move_out(&mut self, id: &str) -> Result<Option<Moved>> {
+        let (folder, name) = split_id(id);
+        if folder.is_empty() {
+            return Ok(None);
+        }
+        let (grandparent, folder_name) = split_id(folder);
+        let new = join_id(grandparent, name);
+        if self.root.join(&new).is_dir() {
+            anyhow::bail!("a folder named {new} already exists");
+        }
+        let moved = self.rename_page(id, &new)?;
+        let mut names = self.sibling_names(grandparent);
+        names.retain(|n| n != name);
+        let at = names
+            .iter()
+            .position(|n| n == folder_name)
+            .map_or(names.len(), |i| i + 1);
+        names.insert(at, name.to_string());
+        self.write_order(grandparent, names)?;
+        Ok(Some(moved))
     }
 
     /// Remove `folder` and its parents while they are empty (an order file alone counts as
@@ -756,6 +806,26 @@ impl Wiki {
 /// The folder and the last segment of an id or path (`""` folder at the root).
 fn split_id(id: &str) -> (&str, &str) {
     id.rsplit_once('/').unwrap_or(("", id))
+}
+
+/// `folder/name`, or `name` at the root.
+fn join_id(folder: &str, name: &str) -> String {
+    if folder.is_empty() {
+        name.to_string()
+    } else {
+        format!("{folder}/{name}")
+    }
+}
+
+/// What a page move did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    /// The page's new id.
+    pub id: String,
+    /// How many pages had links to it rewritten.
+    pub updated: usize,
+    /// Plain pages that became folder indexes to hold it, old id to new.
+    pub promoted: Vec<(String, String)>,
 }
 
 fn last_segment(path: &str) -> &str {
@@ -1394,7 +1464,7 @@ mod tests {
             "# Thing\n![p](../assets/p.png) [h](../index.md) [x](https://x.y/a.png)",
         )
         .unwrap();
-        let updated = wiki.rename_page("old/thing", "new/place").unwrap();
+        let updated = wiki.rename_page("old/thing", "new/place").unwrap().updated;
         assert_eq!(updated, 1);
         assert_eq!(
             fs::read_to_string(dir.join("new/place.md")).unwrap(),
@@ -1466,6 +1536,59 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_page_moves_under_the_sibling_above_it_and_back_out() {
+        let dir = std::env::temp_dir().join(format!("wikibits-nest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("index.md"), "# Home\n[[notes]] [[todo]] [[zed]]").unwrap();
+        fs::write(dir.join("notes.md"), "# Notes").unwrap();
+        fs::write(dir.join("todo.md"), "# Todo").unwrap();
+        fs::write(dir.join("zed.md"), "# Zed").unwrap();
+        let mut wiki = Wiki::load(&dir).unwrap();
+
+        assert_eq!(
+            wiki.move_into_previous("notes").unwrap(),
+            None,
+            "nothing above"
+        );
+        let moved = wiki.move_into_previous("todo").unwrap().unwrap();
+        assert_eq!(moved.id, "notes/todo");
+        assert_eq!(moved.updated, 1);
+        assert_eq!(
+            moved.promoted,
+            vec![("notes".to_string(), "notes/index".to_string())]
+        );
+        assert!(dir.join("notes/index.md").is_file());
+        assert!(dir.join("notes/todo.md").is_file());
+        assert_eq!(
+            fs::read_to_string(dir.join("index.md")).unwrap(),
+            "# Home\n[[notes]] [[notes/todo]] [[zed]]"
+        );
+
+        // Into an existing folder: last, ahead of the alphabet.
+        let moved = wiki.move_into_previous("zed").unwrap().unwrap();
+        assert_eq!(moved.id, "notes/zed");
+        assert!(moved.promoted.is_empty());
+        fs::write(dir.join("notes/apple.md"), "# Apple").unwrap();
+        wiki.reload().unwrap();
+        assert_eq!(wiki.sibling_names("notes"), ["todo", "zed", "apple"]);
+
+        // Out again: right after the folder it left, at the top level.
+        let moved = wiki.move_out("notes/todo").unwrap().unwrap();
+        assert_eq!(moved.id, "todo");
+        assert_eq!(wiki.sibling_names(""), ["notes", "todo"]);
+        assert_eq!(wiki.move_out("todo").unwrap(), None, "already at the top");
+        assert_eq!(
+            fs::read_to_string(dir.join("index.md")).unwrap(),
+            "# Home\n[[notes]] [[todo]] [[notes/zed]]"
+        );
+        wiki.move_out("notes/zed").unwrap().unwrap();
+        assert_eq!(wiki.sibling_names(""), ["notes", "zed", "todo"]);
+        assert_eq!(wiki.sibling_names("notes"), ["apple"]);
         fs::remove_dir_all(&dir).unwrap();
     }
 

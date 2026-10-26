@@ -948,6 +948,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "J / K",
             "move the selected page or folder down / up (the current page elsewhere)",
         ),
+        (
+            "Ctrl+↑ / Ctrl+↓",
+            "move the page under the one above it (making it a folder) / out of its folder",
+        ),
         ("", ""),
         ("Related column", ""),
         (

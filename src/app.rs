@@ -460,6 +460,12 @@ impl App {
             return;
         }
         self.images.clear();
+        // The row the cursor was on, to stay there when it still exists (a page the user
+        // just moved from the pages column, say) rather than jump to the open page.
+        let was_on = self.tree.get(self.tree_sel).map(|row| match &row.kind {
+            TreeKind::Page { id } => id.clone(),
+            TreeKind::Folder { path, .. } => path.clone(),
+        });
         self.rebuild_tree();
         match self.current.clone() {
             Some(id) if self.wiki.pages.contains_key(&id) => {
@@ -469,7 +475,16 @@ impl App {
                 self.sel = None;
                 self.rebuild_related();
                 self.rebuild_crumbs();
-                self.reveal_in_tree(&id);
+                let still_there = was_on.and_then(|key| {
+                    self.tree.iter().position(|r| match &r.kind {
+                        TreeKind::Page { id } => *id == key,
+                        TreeKind::Folder { path, .. } => *path == key,
+                    })
+                });
+                match still_there {
+                    Some(i) => self.tree_sel = i,
+                    None => self.reveal_in_tree(&id),
+                }
             }
             _ => match self.wiki.landing_page() {
                 Some(id) => self.open(&id, false),
@@ -2122,24 +2137,79 @@ impl App {
             return;
         }
         match self.wiki.rename_page(&old, &new) {
-            Ok(updated) => {
-                for h in self.history.iter_mut().chain(self.future.iter_mut()) {
-                    if h.id == old {
-                        h.id = new.clone();
-                    }
-                }
-                self.rebuild_tree();
-                self.open(&new, false);
-                self.status = match updated {
-                    0 => format!("Renamed to {new}"),
-                    1 => format!("Renamed to {new}; updated the link in 1 page"),
-                    n => format!("Renamed to {new}; updated links in {n} pages"),
-                };
-                self.demote_folders();
-                self.commit(&format!("Rename {old} to {new}"));
-            }
+            Ok(moved) => self.page_moved(&old, moved, "Renamed"),
             Err(err) => self.status = format!("{err:#}"),
         }
+    }
+
+    /// The page `Ctrl+Up` / `Ctrl+Down` move: the selected row in the pages column, the
+    /// current page elsewhere. A folder stays put: its pages move one at a time.
+    fn move_target(&mut self) -> Option<String> {
+        let id = match self.tree.get(self.tree_sel) {
+            Some(row) if self.focus == Focus::Tree => match &row.kind {
+                TreeKind::Page { id } => id.clone(),
+                TreeKind::Folder { index, .. } => index.clone().unwrap_or_default(),
+            },
+            _ => self.current.clone()?,
+        };
+        if id.is_empty() || wiki::is_index_id(&id) {
+            self.status = "A folder stays put: move its pages one at a time".into();
+            return None;
+        }
+        Some(id)
+    }
+
+    /// `Ctrl+Up` moves the page under the sibling listed above it (a plain page above
+    /// becomes a folder); `Ctrl+Down` moves it out of its folder, to just after the folder.
+    fn move_page(&mut self, into: bool) {
+        let Some(id) = self.move_target() else {
+            return;
+        };
+        let result = if into {
+            self.wiki.move_into_previous(&id)
+        } else {
+            self.wiki.move_out(&id)
+        };
+        match result {
+            Ok(Some(moved)) => self.page_moved(&id, moved, "Moved"),
+            Ok(None) if into => self.status = "Nothing above it to move under".into(),
+            Ok(None) => self.status = "Already at the top level".into(),
+            Err(err) => self.status = format!("{err:#}"),
+        }
+    }
+
+    /// Bring the view in line with a page that moved from `old`: history, the tree, the
+    /// open page and the status line; then fold lonely folders and commit.
+    fn page_moved(&mut self, old: &str, moved: wiki::Moved, verb: &str) {
+        let new = moved.id.clone();
+        for h in self.history.iter_mut().chain(self.future.iter_mut()) {
+            if h.id == old {
+                h.id = new.clone();
+            }
+        }
+        self.note_moved_pages(&moved.promoted);
+        if self.current.as_deref() == Some(old) {
+            self.open(&new, false);
+        } else if let Some(id) = self.current.clone() {
+            // Another page is open: its links may have been rewritten, so draw it again.
+            let scroll = self.scroll;
+            self.open(&id, false);
+            self.scroll = scroll.min(self.max_scroll());
+        }
+        self.status = match moved.updated {
+            0 => format!("{verb} to {new}"),
+            1 => format!("{verb} to {new}; updated the link in 1 page"),
+            n => format!("{verb} to {new}; updated links in {n} pages"),
+        };
+        for (old, new) in &moved.promoted {
+            self.status
+                .push_str(&format!("; {old} is now the folder page {new}"));
+        }
+        self.demote_folders();
+        // Last: redrawing the open page puts the tree cursor back on it.
+        self.reveal_in_tree(&new);
+        let action = verb.strip_suffix('d').unwrap_or(verb);
+        self.commit(&format!("{action} {old} to {new}"));
     }
 
     pub fn handle_paste(&mut self, text: &str) {
@@ -2416,6 +2486,8 @@ impl App {
             KeyCode::Char('D') if self.current.is_some() => self.prompt = Prompt::DeletePage,
             KeyCode::Char('J') => self.reorder(1),
             KeyCode::Char('K') => self.reorder(-1),
+            KeyCode::Up if ctrl => self.move_page(true),
+            KeyCode::Down if ctrl => self.move_page(false),
             KeyCode::Char('/') => self.start_find(""),
             KeyCode::Char('w') => self.open_report(),
             KeyCode::Char('y') if self.select.is_some() => {
