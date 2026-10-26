@@ -2001,8 +2001,22 @@ function showPage(id, path, anchor) {
     state.highlight = null;
     if (first) { first.scrollIntoView({ block: "center" }); return; }
   }
-  if (anchor) scrollToAnchor(anchor);
+  const saved = history.state && history.state.scroll;
+  if (saved != null) window.scrollTo(0, saved);
+  else if (anchor) scrollToAnchor(anchor);
   else if (changed) window.scrollTo(0, 0);
+}
+
+// Each history entry remembers how far down the page the reader was, so that going back
+// (or forward) lands where they left: on the link they followed, not the top of the page.
+let saveTimer = null;
+function saveScroll() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  try { history.replaceState({ scroll: window.scrollY }, "", location.href); } catch {}
+}
+function saveScrollSoon() {
+  if (saveTimer == null) saveTimer = setTimeout(saveScroll, 500);
 }
 
 function scrollToAnchor(anchor) {
@@ -2195,6 +2209,7 @@ function openHit(a) {
   state.highlight = $("search").value.toLowerCase().split(/\s+/).filter(Boolean);
   $("results").classList.add("hidden");
   $("search").blur();
+  saveScroll();
   if (location.hash === a.getAttribute("href")) route();
   else location.hash = a.getAttribute("href");
 }
@@ -2243,7 +2258,9 @@ function wire() {
   $("menu-btn").onclick = () => document.body.classList.toggle("tree-open");
   $("more-btn").onclick = showHelp;
   $("overlay").onclick = (e) => { if (e.target === $("overlay") || e.target.tagName === "IMG" || e.target.closest("a")) closeOverlay(); };
+  window.addEventListener("scroll", saveScrollSoon, { passive: true });
   document.addEventListener("click", (e) => {
+    if (e.target.closest("a[href^='#']")) saveScroll();
     const a = e.target.closest("a[data-anchor]");
     if (a) { e.preventDefault(); scrollToAnchor(a.dataset.anchor); }
     if (!e.target.closest(".search")) $("results").classList.add("hidden");
@@ -2276,9 +2293,9 @@ function wire() {
     const actions = {
       s: () => search.focus(), "/": () => search.focus(),
       v: () => $("source-btn")?.click(),
-      H: () => { location.hash = "#/"; },
+      H: () => { saveScroll(); location.hash = "#/"; },
       b: () => history.back(), f: () => history.forward(),
-      w: () => { location.hash = "#/:report"; },
+      w: () => { saveScroll(); location.hash = "#/:report"; },
       r: reload,
       "?": showHelp,
     };

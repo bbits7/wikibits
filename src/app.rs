@@ -76,6 +76,15 @@ pub struct TextSelect {
     pub keyboard: bool,
 }
 
+/// Where the reader was on a page: what `b` and `f` return to.
+#[derive(Clone, Debug, PartialEq)]
+struct Visit {
+    id: String,
+    scroll: usize,
+    hscroll: usize,
+    sel: Option<usize>,
+}
+
 /// The wiki report (`w`): broken links, orphan pages, recent changes.
 pub struct Report {
     pub rows: Vec<ReportRow>,
@@ -197,8 +206,8 @@ pub struct App {
     pub tree_scroll: usize,
 
     pub current: Option<String>,
-    history: Vec<String>,
-    future: Vec<String>,
+    history: Vec<Visit>,
+    future: Vec<Visit>,
 
     pub rendered: Option<Rendered>,
     render_width: u16,
@@ -343,8 +352,8 @@ impl App {
 
     pub fn open(&mut self, id: &str, record: bool) {
         if record {
-            if let Some(prev) = self.current.take()
-                && prev != id
+            if let Some(prev) = self.here()
+                && prev.id != id
             {
                 self.history.push(prev);
             }
@@ -368,12 +377,31 @@ impl App {
         self.reveal_in_tree(id);
     }
 
+    /// The current page and the place on it, to come back to.
+    fn here(&self) -> Option<Visit> {
+        self.current.clone().map(|id| Visit {
+            id,
+            scroll: self.scroll,
+            hscroll: self.hscroll,
+            sel: self.sel,
+        })
+    }
+
+    /// Open a page at a remembered place on it.
+    fn revisit(&mut self, visit: &Visit) {
+        self.open(&visit.id, false);
+        self.scroll = visit.scroll.min(self.max_scroll());
+        self.hscroll = visit.hscroll.min(self.max_hscroll());
+        let items = self.rendered.as_ref().map(|r| r.items.len()).unwrap_or(0);
+        self.sel = visit.sel.filter(|&i| i < items);
+    }
+
     pub fn back(&mut self) {
         if let Some(prev) = self.history.pop() {
-            if let Some(cur) = self.current.take() {
+            if let Some(cur) = self.here() {
                 self.future.push(cur);
             }
-            self.open(&prev, false);
+            self.revisit(&prev);
         } else {
             self.status = "Nothing to go back to".into();
         }
@@ -381,10 +409,10 @@ impl App {
 
     pub fn forward(&mut self) {
         if let Some(next) = self.future.pop() {
-            if let Some(cur) = self.current.take() {
+            if let Some(cur) = self.here() {
                 self.history.push(cur);
             }
-            self.open(&next, false);
+            self.revisit(&next);
         } else {
             self.status = "Nothing to go forward to".into();
         }
@@ -815,8 +843,14 @@ impl App {
             Some(Item::Link(l)) => {
                 let link = &self.rendered.as_ref().unwrap().links[l];
                 let (target, anchor) = (link.target.clone(), link.anchor.clone());
+                let from = self.here();
                 self.follow(&target);
-                if let (LinkTarget::Page(_), Some(anchor)) = (&target, anchor) {
+                if let (LinkTarget::Page(id), Some(anchor)) = (&target, anchor) {
+                    // A jump within the page is a step too: `b` returns to the link.
+                    if let Some(from) = from.filter(|v| v.id == *id) {
+                        self.history.push(from);
+                        self.future.clear();
+                    }
                     self.jump_to_anchor(&anchor);
                 }
             }
@@ -1775,8 +1809,8 @@ impl App {
     fn note_moved_pages(&mut self, moved: &[(String, String)]) {
         for (old, new) in moved {
             for h in self.history.iter_mut().chain(self.future.iter_mut()) {
-                if h == old {
-                    *h = new.clone();
+                if h.id == *old {
+                    h.id = new.clone();
                 }
             }
             if self.current.as_deref() == Some(old.as_str()) {
@@ -2037,8 +2071,8 @@ impl App {
         let folder = id.rsplit_once('/').map(|(f, _)| f).unwrap_or("");
         match self.wiki.delete_page(&id) {
             Ok(()) => {
-                self.history.retain(|h| *h != id);
-                self.future.retain(|h| *h != id);
+                self.history.retain(|h| h.id != id);
+                self.future.retain(|h| h.id != id);
                 self.current = None;
                 self.rebuild_tree();
                 let next = self
@@ -2090,8 +2124,8 @@ impl App {
         match self.wiki.rename_page(&old, &new) {
             Ok(updated) => {
                 for h in self.history.iter_mut().chain(self.future.iter_mut()) {
-                    if *h == old {
-                        *h = new.clone();
+                    if h.id == old {
+                        h.id = new.clone();
                     }
                 }
                 self.rebuild_tree();
@@ -2753,7 +2787,66 @@ impl markdown::Context for RenderCtx<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::wiki::relative_path;
+
+    fn app_with(pages: &[(&str, &str)], name: &str) -> App {
+        let dir = std::env::temp_dir().join(format!("wikibits-app-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for (id, text) in pages {
+            fs::write(dir.join(format!("{id}.md")), text).unwrap();
+        }
+        let mut app = App::new(Wiki::load(&dir).unwrap(), None, Some("index".into()));
+        app.rects.content = Rect::new(0, 0, 40, 10);
+        app.content_height = 10;
+        app.set_size(40, 10);
+        app
+    }
+
+    #[test]
+    fn back_returns_to_the_link_that_was_followed() {
+        let far = "# Far\n\n".to_string() + &"filler\n\n".repeat(20) + "{#deep}\nhere";
+        let mut app = app_with(
+            &[
+                (
+                    "index",
+                    &("# Home\n\n".to_string() + &"text\n\n".repeat(20) + "[[far#deep]]"),
+                ),
+                ("far", &far),
+            ],
+            "back",
+        );
+        // Select the link at the end of the page and follow it.
+        app.next_item();
+        let (scroll, sel) = (app.scroll, app.sel);
+        assert!(scroll > 0 && sel.is_some());
+        app.activate_selected();
+        assert_eq!(app.current.as_deref(), Some("far"));
+        assert!(app.scroll > 0, "the link jumped to the anchor");
+
+        app.back();
+        assert_eq!(app.current.as_deref(), Some("index"));
+        assert_eq!((app.scroll, app.sel), (scroll, sel));
+
+        // Forward returns to the anchor, not the top of the page.
+        app.forward();
+        assert_eq!(app.current.as_deref(), Some("far"));
+        assert!(app.scroll > 0);
+    }
+
+    #[test]
+    fn a_jump_within_the_page_can_be_undone_with_back() {
+        let page = "# Home\n\n[[#deep]]\n\n".to_string() + &"text\n\n".repeat(20) + "{#deep}\nhere";
+        let mut app = app_with(&[("index", &page)], "within");
+        app.next_item();
+        app.activate_selected();
+        assert!(app.scroll > 0, "jumped down the page");
+        app.back();
+        assert_eq!(app.current.as_deref(), Some("index"));
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.sel, Some(0));
+    }
 
     #[test]
     fn column_slices_respect_wide_characters() {
