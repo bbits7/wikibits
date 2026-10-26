@@ -444,13 +444,7 @@ impl Wiki {
                 moved
                     .iter()
                     .find(|(old, _)| *old == target)
-                    .map(|(_, new)| {
-                        if raw.trim_end().ends_with(".md") {
-                            format!("{new}.md")
-                        } else {
-                            new.clone()
-                        }
-                    })
+                    .map(|(_, new)| retarget(raw, new))
             });
             if rewritten != page.text {
                 fs::write(&page.path, rewritten)?;
@@ -536,15 +530,22 @@ impl Wiki {
     /// Move a page to a new id (`folder/name`) and rewrite the links that point at it in the
     /// other pages. Reports the plain pages that became folder indexes to make room.
     pub fn rename_page(&mut self, old: &str, new: &str) -> Result<Moved> {
-        let page = self
-            .pages
-            .get(old)
-            .with_context(|| format!("no page {old}"))?;
+        if !self.pages.contains_key(old) {
+            anyhow::bail!("no page {old}");
+        }
         let target = self.root.join(format!("{new}.md"));
         if target.exists() {
             anyhow::bail!("a page named {new} already exists");
         }
         let promoted = self.promote_ancestors_to_folders(new)?;
+        if !promoted.is_empty() {
+            // A promoted page may link to this one: its file moved, so forget the old path.
+            self.reload()?;
+        }
+        let page = self
+            .pages
+            .get(old)
+            .with_context(|| format!("no page {old}"))?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -569,13 +570,8 @@ impl Wiki {
                 continue;
             };
             let rewritten = rewrite_links(&linker.text, |_, raw| {
-                (self.resolve(&id, raw) == LinkTarget::Page(old.to_string())).then(|| {
-                    if raw.trim_end().ends_with(".md") {
-                        format!("{new}.md")
-                    } else {
-                        new.to_string()
-                    }
-                })
+                (self.resolve(&id, raw) == LinkTarget::Page(old.to_string()))
+                    .then(|| retarget(raw, new))
             });
             if rewritten != linker.text {
                 fs::write(&linker.path, rewritten)?;
@@ -806,6 +802,21 @@ impl Wiki {
 /// The folder and the last segment of an id or path (`""` folder at the root).
 fn split_id(id: &str) -> (&str, &str) {
     id.rsplit_once('/').unwrap_or(("", id))
+}
+
+/// A link's target as written, pointed at the page `new` instead: `page.md#top` becomes
+/// `new.md#top`, keeping the `.md` and the anchor.
+fn retarget(raw: &str, new: &str) -> String {
+    let (target, anchor) = raw.split_once('#').unwrap_or((raw, ""));
+    let mut out = new.to_string();
+    if target.trim_end().ends_with(".md") {
+        out.push_str(".md");
+    }
+    if !anchor.is_empty() {
+        out.push('#');
+        out.push_str(anchor);
+    }
+    out
 }
 
 /// `folder/name`, or `name` at the root.
@@ -1545,7 +1556,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("index.md"), "# Home\n[[notes]] [[todo]] [[zed]]").unwrap();
-        fs::write(dir.join("notes.md"), "# Notes").unwrap();
+        fs::write(
+            dir.join("notes.md"),
+            "# Notes\n[[todo#Soon|soon]] [b](todo.md#Soon)",
+        )
+        .unwrap();
         fs::write(dir.join("todo.md"), "# Todo").unwrap();
         fs::write(dir.join("zed.md"), "# Zed").unwrap();
         let mut wiki = Wiki::load(&dir).unwrap();
@@ -1557,13 +1572,22 @@ mod tests {
         );
         let moved = wiki.move_into_previous("todo").unwrap().unwrap();
         assert_eq!(moved.id, "notes/todo");
-        assert_eq!(moved.updated, 1);
+        assert_eq!(moved.updated, 2);
         assert_eq!(
             moved.promoted,
             vec![("notes".to_string(), "notes/index".to_string())]
         );
         assert!(dir.join("notes/index.md").is_file());
         assert!(dir.join("notes/todo.md").is_file());
+        assert!(
+            !dir.join("notes.md").exists(),
+            "the promoted page left no copy behind"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("notes/index.md")).unwrap(),
+            "# Notes\n[[notes/todo#Soon|soon]] [b](notes/todo.md#Soon)",
+            "the promoted page's links follow, anchors kept"
+        );
         assert_eq!(
             fs::read_to_string(dir.join("index.md")).unwrap(),
             "# Home\n[[notes]] [[notes/todo]] [[zed]]"
