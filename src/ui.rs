@@ -48,9 +48,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// The selected image at full size, scrolled with the keys or the mouse wheel.
+/// The selected image, zoomed and scrolled with the keys or the mouse.
 fn draw_popup(f: &mut Frame, app: &mut App, area: Rect) {
-    let Some(popup) = &app.popup else { return };
+    let Some(popup) = &mut app.popup else { return };
+    // The frame takes a cell on each side; the pop-up keeps clear of the screen's edges.
+    popup.room = (area.width.saturating_sub(6), area.height.saturating_sub(4));
     let width = (popup.cells.0 + 2).min(area.width.saturating_sub(4)).max(4);
     let height = (popup.cells.1 + 2)
         .min(area.height.saturating_sub(2))
@@ -66,9 +68,13 @@ fn draw_popup(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!("  ·  at {},{}", popup.off.0, popup.off.1)
     };
+    // The keys are listed in the status line.
     let title = format!(
-        " {}  {}x{} px{position}  ·  h/j/k/l or drag  Esc close ",
-        popup.name, popup.pixels.0, popup.pixels.1
+        " {}  {}x{} px  ·  {:.0}%{position} ",
+        popup.name,
+        popup.pixels.0,
+        popup.pixels.1,
+        popup.zoom * 100.0
     );
     let block = pane(&title, true);
     let inner = block.inner(rect);
@@ -144,7 +150,12 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(block, area);
     app.rects.tree = inner;
 
-    keep_visible(&mut app.tree_scroll, app.tree_sel, inner.height as usize);
+    let height = inner.height as usize;
+    if app.tree_drawn_sel != Some(app.tree_sel) {
+        keep_visible(&mut app.tree_scroll, app.tree_sel, height);
+        app.tree_drawn_sel = Some(app.tree_sel);
+    }
+    app.tree_scroll = app.tree_scroll.min(app.tree.len().saturating_sub(height));
     let width = inner.width as usize;
     let lines: Vec<Line> = app
         .tree
@@ -391,11 +402,14 @@ fn draw_related(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(block, area);
     app.rects.related = inner;
 
-    keep_visible(
-        &mut app.related_scroll,
-        app.related_sel,
-        inner.height as usize,
-    );
+    let height = inner.height as usize;
+    if app.related_drawn_sel != Some(app.related_sel) {
+        keep_visible(&mut app.related_scroll, app.related_sel, height);
+        app.related_drawn_sel = Some(app.related_sel);
+    }
+    app.related_scroll = app
+        .related_scroll
+        .min(app.related.len().saturating_sub(height));
     let width = inner.width as usize;
     let lines: Vec<Line> = app
         .related
@@ -895,7 +909,9 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let hints = match app.focus {
-        _ if app.popup.is_some() => "h/j/k/l scroll  PgUp/PgDn  g/G  Esc close",
+        _ if app.popup.is_some() => {
+            "+/- zoom  f fit  0 full size  h/j/k/l scroll  PgUp/PgDn  g/G  Esc close"
+        }
         _ if app.select.as_ref().is_some_and(|s| s.keyboard) => {
             "Select: arrows move  Shift+arrows extend  y copy  Esc done"
         }
@@ -1045,7 +1061,14 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "h / j / k / l, arrows",
             "scroll (PgUp / PgDn a screen, g / G top / bottom)",
         ),
-        ("mouse", "drag the image, or use the wheel"),
+        (
+            "+ / -",
+            "zoom in / out around the middle (0 full size, f fit)",
+        ),
+        (
+            "mouse",
+            "drag the image, wheel scrolls, Ctrl+wheel or double-click zooms at the pointer",
+        ),
         ("Esc  q  Enter", "close"),
         ("", ""),
         (

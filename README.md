@@ -64,7 +64,9 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `?` | help |
 | `q` | quit |
 
-The mouse works too: click to open, wheel to scroll (a sideways wheel or trackpad swipe scrolls a wide page sideways), right-click to go back.
+The mouse works too: click to open, wheel to scroll (over the pages or related column it scrolls
+the list without moving the selection; a sideways wheel or trackpad swipe scrolls a wide page
+sideways), right-click to go back.
 
 ## Tables and images
 
@@ -186,10 +188,12 @@ inside it, so they keep pointing at the same files.
 
 Images render through the terminal's graphics protocol (sixel in foot), scaled down to fit the
 page area when they are too big (never scaled up). Each image sits in a thin frame; select it
-with `n`/`p` (or click it) and press `Enter` to see it at full size in a pop-up, scrolling with
-`h`/`j`/`k`/`l`, the arrows, the mouse wheel or by dragging it; `Esc` closes it. If images come out the wrong
-size, `wikibits --probe` prints what the terminal reports about protocol and cell size. Inside
-tmux, images are drawn with block characters.
+with `n`/`p` (or click it) and press `Enter` to see it at full size in a pop-up. `+`/`-` zoom in
+and out around the middle (`f` fits the whole image on the screen, `0` is back to full size);
+`Ctrl`+wheel or a double-click zooms at the pointer. Pan with `h`/`j`/`k`/`l`, the arrows, the
+mouse wheel or by dragging the image; `Esc` closes it. If images come out the wrong size,
+`wikibits --probe` prints what the terminal reports about protocol and cell size. Inside tmux,
+images are drawn with block characters.
 
 ## Web viewer
 

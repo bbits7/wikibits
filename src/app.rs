@@ -112,23 +112,72 @@ pub struct Search {
     pub view: Rect,
 }
 
-/// `(view size, scroll offset)` a pop-up image was encoded for.
-type PopupKey = ((u16, u16), (u16, u16));
+/// `(view size, scroll offset, zoom)` a pop-up image was encoded for.
+type PopupKey = ((u16, u16), (u16, u16), u64);
 
-/// An image opened at full size over the page, scrolled in cells.
+/// Each zoom step multiplies the scale by this, so two steps double it.
+const ZOOM_STEP: f64 = std::f64::consts::SQRT_2;
+const MAX_ZOOM: f64 = 32.0;
+/// Two clicks this close together on the same cell are a double-click.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// An image opened over the page: zoomed by a scale factor, scrolled in cells.
 pub struct ImagePopup {
     pub name: String,
     image: image::DynamicImage,
     pub pixels: (u32, u32),
-    /// The whole image in cells at the current font size.
+    /// Screen pixels per image pixel: 1 shows the image at its full size.
+    pub zoom: f64,
+    /// The scaled image in cells at the current font size.
     pub cells: (u16, u16),
     pub off: (u16, u16),
     /// Inner area from the last draw.
     pub view: Rect,
+    /// The largest the inner area can be on this screen, from the last draw.
+    pub room: (u16, u16),
     /// Mouse position and offset when a drag started.
     drag: Option<((u16, u16), (u16, u16))>,
-    /// Encoded for `(view size, offset)`.
+    /// When and where the last click landed, to spot a double-click.
+    last_click: Option<(std::time::Instant, (u16, u16))>,
+    /// The whole image scaled down for a zoom below 1, so panning only crops it.
+    shrunk: Option<(u64, image::DynamicImage)>,
+    /// Encoded for `(view size, offset, zoom)`.
     protocol: Option<(PopupKey, Protocol)>,
+}
+
+impl ImagePopup {
+    /// The scaled image's size in screen pixels.
+    fn scaled(&self) -> (u32, u32) {
+        let (w, h) = self.pixels;
+        (
+            (w as f64 * self.zoom).round().max(1.0) as u32,
+            (h as f64 * self.zoom).round().max(1.0) as u32,
+        )
+    }
+
+    /// The scaled image in cells of `font`.
+    fn scaled_cells(&self, font: (f64, f64)) -> (u16, u16) {
+        let (w, h) = self.scaled();
+        (
+            (w as f64 / font.0).ceil().min(u16::MAX as f64) as u16,
+            (h as f64 / font.1).ceil().min(u16::MAX as f64) as u16,
+        )
+    }
+
+    /// The zoom that shows the whole image in the room there is for it.
+    fn fit_zoom(&self, font: (f64, f64)) -> f64 {
+        if self.room == (0, 0) {
+            return 1.0;
+        }
+        let zw = self.room.0 as f64 * font.0 / self.pixels.0.max(1) as f64;
+        let zh = self.room.1 as f64 * font.1 / self.pixels.1.max(1) as f64;
+        zw.min(zh).max(1e-3)
+    }
+
+    /// Zooming out stops at the whole image, and never shrinks one that already fits.
+    fn min_zoom(&self, font: (f64, f64)) -> f64 {
+        self.fit_zoom(font).min(1.0)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -204,6 +253,9 @@ pub struct App {
     pub expanded: HashSet<String>,
     pub tree_sel: usize,
     pub tree_scroll: usize,
+    /// The selection the last draw showed: the list only follows the selection when it moves,
+    /// so the wheel can scroll the list without the selection pulling it back.
+    pub tree_drawn_sel: Option<usize>,
 
     pub current: Option<String>,
     history: Vec<Visit>,
@@ -223,6 +275,7 @@ pub struct App {
     pub related: Vec<RelatedRow>,
     pub related_sel: usize,
     pub related_scroll: usize,
+    pub related_drawn_sel: Option<usize>,
     /// Headings whose sub-headings are shown in "On this page".
     toc_expanded: HashSet<usize>,
     /// Reset `toc_expanded` to the defaults on the next rebuild (a new page was opened).
@@ -272,6 +325,7 @@ impl App {
             expanded: HashSet::new(),
             tree_sel: 0,
             tree_scroll: 0,
+            tree_drawn_sel: None,
             current: None,
             history: Vec::new(),
             future: Vec::new(),
@@ -286,6 +340,7 @@ impl App {
             related: Vec::new(),
             related_sel: 0,
             related_scroll: 0,
+            related_drawn_sel: None,
             toc_expanded: HashSet::new(),
             toc_fresh: true,
             focus: Focus::Content,
@@ -579,61 +634,99 @@ impl App {
             .ok()
             .and_then(|r| r.with_guessed_format().ok())
             .and_then(|r| r.decode().ok());
-        let (Some(image), Some(picker)) = (decoded, &self.picker) else {
+        let (Some(image), Some(font)) = (decoded, self.popup_font()) else {
             self.status = format!("Cannot open {}", path.display());
             return;
         };
-        let font = picker.font_size();
-        let pixels = (image.width(), image.height());
-        let cells = (
-            pixels
-                .0
-                .div_ceil(font.width.max(1) as u32)
-                .min(u16::MAX as u32) as u16,
-            pixels
-                .1
-                .div_ceil(font.height.max(1) as u32)
-                .min(u16::MAX as u32) as u16,
-        );
-        self.popup = Some(ImagePopup {
+        let mut popup = ImagePopup {
             name: path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            pixels: (image.width(), image.height()),
             image,
-            pixels,
-            cells,
+            zoom: 1.0,
+            cells: (0, 0),
             off: (0, 0),
             view: Rect::default(),
+            room: (0, 0),
             drag: None,
+            last_click: None,
+            shrunk: None,
             protocol: None,
-        });
+        };
+        popup.cells = popup.scaled_cells(font);
+        self.popup = Some(popup);
     }
 
-    /// The visible part of the pop-up image, encoded for `view`. Re-encodes only when the view
-    /// size or the scroll offset changed.
+    /// The terminal's cell size in pixels, as floats for the zoom arithmetic.
+    fn popup_font(&self) -> Option<(f64, f64)> {
+        let font = self.picker.as_ref()?.font_size();
+        Some((font.width.max(1) as f64, font.height.max(1) as f64))
+    }
+
+    /// The visible part of the pop-up image, scaled and encoded for `view`. Re-encodes only
+    /// when the view size, the scroll offset or the zoom changed.
     pub fn popup_protocol(&mut self, view: Rect) -> Option<&Protocol> {
         let picker = self.picker.as_ref()?;
         let font = picker.font_size();
+        let (fw, fh) = (font.width.max(1) as u32, font.height.max(1) as u32);
         let popup = self.popup.as_mut()?;
         popup.view = view;
-        let key = ((view.width, view.height), popup.off);
+        // The font size may have changed since the image was opened.
+        popup.cells = popup.scaled_cells((fw as f64, fh as f64));
+        // The view may have shrunk since the offset was set.
+        popup.off.0 = popup.off.0.min(popup.cells.0.saturating_sub(view.width));
+        popup.off.1 = popup.off.1.min(popup.cells.1.saturating_sub(view.height));
+        let key = ((view.width, view.height), popup.off, popup.zoom.to_bits());
         if popup.protocol.as_ref().is_none_or(|(k, _)| *k != key) {
-            let (fw, fh) = (font.width.max(1) as u32, font.height.max(1) as u32);
+            let z = popup.zoom;
             let (iw, ih) = popup.pixels;
-            let px = (popup.off.0 as u32 * fw).min(iw.saturating_sub(1));
-            let py = (popup.off.1 as u32 * fh).min(ih.saturating_sub(1));
-            let cw = (view.width as u32 * fw).min(iw - px);
-            let ch = (view.height as u32 * fh).min(ih - py);
-            if cw == 0 || ch == 0 {
+            let (sw, sh) = popup.scaled();
+            // The part of the scaled image the view shows, in scaled pixels.
+            let dx0 = (popup.off.0 as u32 * fw).min(sw.saturating_sub(1));
+            let dy0 = (popup.off.1 as u32 * fh).min(sh.saturating_sub(1));
+            let dw = (view.width as u32 * fw).min(sw - dx0);
+            let dh = (view.height as u32 * fh).min(sh - dy0);
+            if dw == 0 || dh == 0 {
                 return None;
             }
-            let cropped = popup.image.crop_imm(px, py, cw, ch);
-            let cells = Size::new(cw.div_ceil(fw) as u16, ch.div_ceil(fh) as u16);
-            // Crop, never scale: one image pixel is one screen pixel in the pop-up.
-            let proto = picker
-                .new_protocol(cropped, cells, Resize::Crop(None))
-                .ok()?;
+            let shown = if z == 1.0 {
+                popup.image.crop_imm(dx0, dy0, dw, dh)
+            } else if z < 1.0 {
+                // Zoomed out, most of the image is on show: shrink it once, then crop.
+                if popup.shrunk.as_ref().is_none_or(|(k, _)| *k != z.to_bits()) {
+                    let filter = image::imageops::FilterType::Triangle;
+                    let small = popup.image.resize_exact(sw, sh, filter);
+                    popup.shrunk = Some((z.to_bits(), small));
+                }
+                popup.shrunk.as_ref().unwrap().1.crop_imm(dx0, dy0, dw, dh)
+            } else {
+                // Zoomed in: scale only the source pixels under the view, then cut out the
+                // view's part.
+                let sx0 = ((dx0 as f64 / z).floor() as u32).min(iw.saturating_sub(1));
+                let sy0 = ((dy0 as f64 / z).floor() as u32).min(ih.saturating_sub(1));
+                let sx1 = (((dx0 + dw) as f64 / z).ceil() as u32).clamp(sx0 + 1, iw);
+                let sy1 = (((dy0 + dh) as f64 / z).ceil() as u32).clamp(sy0 + 1, ih);
+                let at = |s: u32| (s as f64 * z).round() as u32;
+                let (zx0, zy0) = (at(sx0).min(dx0), at(sy0).min(dy0));
+                let zw = (at(sx1).max(dx0 + dw) - zx0).max(1);
+                let zh = (at(sy1).max(dy0 + dh) - zy0).max(1);
+                // Blocky pixels when zoomed well in, smooth otherwise.
+                let filter = if z >= 2.0 {
+                    image::imageops::FilterType::Nearest
+                } else {
+                    image::imageops::FilterType::Triangle
+                };
+                popup
+                    .image
+                    .crop_imm(sx0, sy0, sx1 - sx0, sy1 - sy0)
+                    .resize_exact(zw, zh, filter)
+                    .crop_imm(dx0 - zx0, dy0 - zy0, dw, dh)
+            };
+            let cells = Size::new(dw.div_ceil(fw) as u16, dh.div_ceil(fh) as u16);
+            // Crop, never scale: the image is already at the size the zoom asks for.
+            let proto = picker.new_protocol(shown, cells, Resize::Crop(None)).ok()?;
             popup.protocol = Some((key, proto));
         }
         popup.protocol.as_ref().map(|(_, p)| p)
@@ -641,16 +734,59 @@ impl App {
 
     fn popup_scroll(&mut self, dx: i32, dy: i32) {
         let Some(popup) = &mut self.popup else { return };
-        let max_x = popup.cells.0.saturating_sub(popup.view.width);
-        let max_y = popup.cells.1.saturating_sub(popup.view.height);
+        // After a zoom the view grows or shrinks to the image on the next draw.
+        let (vw, vh) = if popup.room == (0, 0) {
+            (popup.view.width, popup.view.height)
+        } else {
+            (
+                popup.cells.0.min(popup.room.0),
+                popup.cells.1.min(popup.room.1),
+            )
+        };
+        let max_x = popup.cells.0.saturating_sub(vw);
+        let max_y = popup.cells.1.saturating_sub(vh);
         popup.off.0 = (popup.off.0 as i32 + dx).clamp(0, max_x as i32) as u16;
         popup.off.1 = (popup.off.1 as i32 + dy).clamp(0, max_y as i32) as u16;
+    }
+
+    /// Set the zoom, keeping the image point under `anchor` (a cell of the view, from its
+    /// top-left corner) where it is as far as the edges allow.
+    fn popup_zoom_to(&mut self, zoom: f64, anchor: (u16, u16)) {
+        let Some(font) = self.popup_font() else {
+            return;
+        };
+        let Some(popup) = &mut self.popup else { return };
+        let zoom = zoom.clamp(popup.min_zoom(font), MAX_ZOOM);
+        if zoom == popup.zoom {
+            return;
+        }
+        let (ax, ay) = (anchor.0 as f64, anchor.1 as f64);
+        // The image pixel under the anchor, which should stay there.
+        let ix = (popup.off.0 as f64 + ax) * font.0 / popup.zoom;
+        let iy = (popup.off.1 as f64 + ay) * font.1 / popup.zoom;
+        popup.zoom = zoom;
+        popup.cells = popup.scaled_cells(font);
+        popup.off = (0, 0);
+        let nx = (ix * zoom / font.0 - ax).round() as i32;
+        let ny = (iy * zoom / font.1 - ay).round() as i32;
+        self.popup_scroll(nx, ny);
+    }
+
+    /// Zoom in (`steps` > 0) or out around `anchor`, or around the middle of the view.
+    fn popup_zoom(&mut self, steps: i32, anchor: Option<(u16, u16)>) {
+        let Some(popup) = &self.popup else { return };
+        let anchor = anchor.unwrap_or((popup.view.width / 2, popup.view.height / 2));
+        let zoom = popup.zoom * ZOOM_STEP.powi(steps);
+        // Land exactly on 1:1 when a step comes close to it.
+        let zoom = if (zoom - 1.0).abs() < 0.02 { 1.0 } else { zoom };
+        self.popup_zoom_to(zoom, anchor);
     }
 
     fn popup_key(&mut self, key: KeyEvent) {
         let Some(popup) = &self.popup else { return };
         let page = popup.view.height.max(1) as i32;
         let far = i32::MAX / 4;
+        let centre = (popup.view.width / 2, popup.view.height / 2);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.popup = None,
             KeyCode::Char('h') | KeyCode::Left => self.popup_scroll(-4, 0),
@@ -661,6 +797,16 @@ impl App {
             KeyCode::PageUp => self.popup_scroll(0, -page),
             KeyCode::Char('g') | KeyCode::Home => self.popup_scroll(-far, -far),
             KeyCode::Char('G') | KeyCode::End => self.popup_scroll(0, far),
+            KeyCode::Char('+' | '=') => self.popup_zoom(1, None),
+            KeyCode::Char('-' | '_') => self.popup_zoom(-1, None),
+            KeyCode::Char('0' | '1') => self.popup_zoom_to(1.0, centre),
+            KeyCode::Char('f') => {
+                let Some(font) = self.popup_font() else {
+                    return;
+                };
+                let fit = popup.fit_zoom(font);
+                self.popup_zoom_to(fit, centre);
+            }
             _ => {}
         }
     }
@@ -674,11 +820,36 @@ impl App {
             height: popup.view.height + 2,
         };
         let at = (mouse.column, mouse.row);
+        // The pointer as a cell of the view, for zooming around it.
+        let anchor = Some((
+            mouse
+                .column
+                .saturating_sub(popup.view.x)
+                .min(popup.view.width),
+            mouse
+                .row
+                .saturating_sub(popup.view.y)
+                .min(popup.view.height),
+        ));
+        // Ctrl+wheel zooms; Alt+wheel too, for terminals that keep Ctrl+wheel for themselves.
+        let zooming = mouse
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match mouse.kind {
             MouseEventKind::Down(_) if !outer.contains(at.into()) => self.popup = None,
             MouseEventKind::Down(MouseButton::Left) => {
+                let now = std::time::Instant::now();
+                let double = popup
+                    .last_click
+                    .is_some_and(|(when, where_)| where_ == at && now - when < DOUBLE_CLICK);
                 let off = popup.off;
-                self.popup.as_mut().unwrap().drag = Some((at, off));
+                let popup = self.popup.as_mut().unwrap();
+                popup.drag = Some((at, off));
+                popup.last_click = if double { None } else { Some((now, at)) };
+                if double {
+                    popup.drag = None;
+                    self.popup_zoom(2, anchor);
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 // Dragging moves the image with the pointer, so the offset goes the other way.
@@ -691,6 +862,8 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => self.popup.as_mut().unwrap().drag = None,
+            MouseEventKind::ScrollUp if zooming => self.popup_zoom(1, anchor),
+            MouseEventKind::ScrollDown if zooming => self.popup_zoom(-1, anchor),
             MouseEventKind::ScrollDown => self.popup_scroll(0, 2),
             MouseEventKind::ScrollUp => self.popup_scroll(0, -2),
             MouseEventKind::ScrollRight => self.popup_scroll(4, 0),
@@ -2739,10 +2912,16 @@ impl App {
                 } else {
                     -1
                 };
+                // Over a list the wheel scrolls the list, leaving the selection where it is.
                 if rects.tree.contains((x, y).into()) {
-                    self.tree_move(delta);
+                    let max = self.tree.len().saturating_sub(rects.tree.height as usize);
+                    self.tree_scroll = scrolled(self.tree_scroll, delta * 3, max);
                 } else if rects.related.contains((x, y).into()) {
-                    self.related_move(delta);
+                    let max = self
+                        .related
+                        .len()
+                        .saturating_sub(rects.related.height as usize);
+                    self.related_scroll = scrolled(self.related_scroll, delta * 3, max);
                 } else {
                     self.scroll_by(delta * 3);
                 }
@@ -2761,6 +2940,11 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// `scroll` moved by `delta` rows, kept within `0..=max`.
+fn scrolled(scroll: usize, delta: isize, max: usize) -> usize {
+    (scroll as isize + delta).clamp(0, max as isize) as usize
 }
 
 /// The characters of `text` between display columns `from` and `to`.
