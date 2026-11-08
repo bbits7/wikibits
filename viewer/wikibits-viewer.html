@@ -638,6 +638,8 @@ const diaBits = (() => {
     // With the shapes in place, decide how each line runs, then make room for the channels:
     // the gaps they use widen, and the shapes move right of the channels on the left.
     d.through = d.edges.map((_, e) => goesThrough(d, e));
+    d.elbow = d.edges.map(() => false);
+    for (let e = 0; e < d.edges.length; e++) d.elbow[e] = takesElbow(d, e);
     channelPlan(d);
     for (let g = 1; g < columns; g++) gaps[g - 1] = Math.max(gaps[g - 1], gapWidth(d.gaps[g], g, columns));
     place(gapWidth(d.gaps[0], 0, columns));
@@ -653,14 +655,15 @@ const diaBits = (() => {
   }
 
   // Whether an edge asks for a channel in a gap rather than a bus between its rows: edges
-  // that skip rows (unless they can go straight through), and edges that point back up (or
-  // both ways) without lining up, which would be ambiguous on a shared bus. Edges along a
-  // row are never routed: neighbours join directly and others loop under the row.
+  // that skip rows (unless they can go straight through or take an elbow), and edges that
+  // point back up (or both ways) without lining up, which would be ambiguous on a shared
+  // bus. Edges along a row are never routed: neighbours join directly and others loop under
+  // the row.
   function wantsChannel(d, e) {
     const [u, l, au] = vertical(d, e);
     const ru = d.nodes[u].row, rl = d.nodes[l].row;
     if (ru === rl) return false;
-    return (rl > ru + 1 && !d.through[e]) || (au && center(d.nodes[u]) !== center(d.nodes[l]));
+    return (rl > ru + 1 && !d.through[e] && !d.elbow[e]) || (au && center(d.nodes[u]) !== center(d.nodes[l]));
   }
 
   // The rows of the two ends of an edge, top one first.
@@ -695,6 +698,50 @@ const diaBits = (() => {
       else if (neighbours(d, fu, fl)) between = ru < ra && ra < rl;
       else between = ru <= ra && ra < rl; // a loop under row ra lives in the region below it
       const [lo, hi] = edgeExtent(d, f);
+      return between && lo <= x && x <= hi;
+    });
+  }
+
+  // Whether an edge that skips rows is drawn as an elbow instead of round a channel: straight
+  // down from the upper shape through its own empty column, then along the lower shape's row
+  // into its side. The column holds no shape on the rows between or on the lower row, no
+  // shape on the lower row sits between the column and the lower shape, and no other line
+  // crosses the column or the arm: a bus or loop between the rows, a line along a row, or a
+  // line down the same column (through or elbow, which are decided in written order).
+  function takesElbow(d, e) {
+    const [u, l] = vertical(d, e);
+    const ru = d.nodes[u].row, rl = d.nodes[l].row;
+    const [c0, c1] = d.span[u], [l0, l1] = d.span[l];
+    if (rl <= ru + 1 || (c0 < l1 && l0 < c1)) return false;
+    const x = center(d.nodes[u]);
+    // The arm runs right from the column into the lower shape's left side, or left.
+    const left = c1 <= l0;
+    const blocked = d.nodes.some((n, m) => {
+      const [m0, m1] = d.span[m];
+      if (n.row <= ru || n.row > rl || m === l) return false;
+      if (n.row < rl) return m0 < c1 && c0 < m1;
+      return left ? m1 > c0 && m0 < l0 : m0 < c1 && m1 > l1;
+    });
+    if (blocked) return false;
+    const arm = left ? [x, center(d.nodes[l])] : [center(d.nodes[l]), x];
+    return !d.edges.some((_, f) => {
+      if (f === e) return false;
+      const [fu, fl] = vertical(d, f);
+      const ra = d.nodes[fu].row, rb = d.nodes[fl].row;
+      const [lo, hi] = edgeExtent(d, f);
+      if (rb > ra + 1) {
+        if (!(d.through[f] || d.elbow[f])) return false; // channels run down the gaps
+        // Down the same column from the same shape, down a column the arm crosses, or (an
+        // elbow) along a row across the column.
+        const xf = center(d.nodes[fu]);
+        return fu === u
+          || (ra < rl && rl <= rb && arm[0] <= xf && xf <= arm[1])
+          || (d.elbow[f] && ru < rb && rb <= rl && lo <= x && x <= hi);
+      }
+      let between;
+      if (ra < rb) between = ru <= ra && rb <= rl;
+      else if (neighbours(d, fu, fl)) between = ru < ra && ra <= rl;
+      else between = ru <= ra && ra < rl; // a loop under row ra lives in the region below it
       return between && lo <= x && x <= hi;
     });
   }
@@ -762,7 +809,8 @@ const diaBits = (() => {
     const blocks = (e, g) => { const [u, l] = vertical(d, e); return armBlocks(u, g) + armBlocks(l, g) + dropBlocks(e, g); };
     // Lines not routed through channels that a channel in gap g between the rows of e
     // would cross: a line along a row between them (2), or along one of its own rows,
-    // which it joins instead (1); a bus or a loop between two rows in its range (2).
+    // which it joins instead (1); a bus or a loop between two rows in its range (2); an
+    // elbow's arm.
     const lineCrossings = (e, g) => {
       const [ru, rl] = edgeRows(d, e);
       return sum(d.edges.map((_, f) => {
@@ -782,6 +830,12 @@ const diaBits = (() => {
         if (rb === ra + 1 && ru <= ra && rb <= rl && !wantsChannel(d, f)) {
           const [lo, hi] = edgeExtent(d, f), x = d.gaps[g].x;
           return lo < x && x <= hi ? 2 : 0;
+        }
+        if (d.elbow[f] && ru <= rb && rb <= rl) {
+          // An elbow's arm runs along row rb from its column to its shape.
+          const [lo, hi] = edgeExtent(d, f), x = d.gaps[g].x;
+          if (!(lo < x && x <= hi)) return 0;
+          return rb === ru || rb === rl ? 1 : 2;
         }
         return 0;
       }));
@@ -835,10 +889,15 @@ const diaBits = (() => {
       if (m == null) return false;
       return d.nodes[m].row === d.nodes[n].row && neighbours(d, n, m) && (d.span[m][0] < d.span[n][0]) === gapLeftOf(d, n, g);
     });
+    // Whether an elbow arrives at shape n on the side of gap g.
+    const elbowAt = (n, g) => d.edges.some((_, f) => {
+      const [fu, fl] = vertical(d, f);
+      return d.elbow[f] && fl === n && (center(d.nodes[fu]) < center(d.nodes[n])) === gapLeftOf(d, n, g);
+    });
     routes.forEach((route, i) => {
       const [u, l, au, al] = vertical(d, route.edge);
-      route.upperCorner = rowLineAt(u, route.gap) || (!au && headedAt(i, u));
-      route.lowerCorner = rowLineAt(l, route.gap) || (!al && headedAt(i, l));
+      route.upperCorner = rowLineAt(u, route.gap) || elbowAt(u, route.gap) || (!au && headedAt(i, u));
+      route.lowerCorner = rowLineAt(l, route.gap) || elbowAt(l, route.gap) || (!al && headedAt(i, l));
     });
     routes.sort((a, b) => a.edge - b.edge);
     for (let g = 0; g < gaps; g++) {
@@ -915,10 +974,12 @@ const diaBits = (() => {
       levels = Math.max(levels, level + 1);
       placed.push([level, lo, hi]);
     }
-    // Lines passing straight through from further up end or start here too.
+    // Lines passing straight through from further up end or start here too; an elbow
+    // starts here and carries its label beside it.
     const endsHere = (e) => { const [ru, rl] = edgeRows(d, e); return rl === r + 1 && (ru === r || d.through[e]); };
-    const startsHere = (e) => { const [ru, rl] = edgeRows(d, e); return ru === r && (rl === r + 1 || d.through[e]); };
-    const labelled = d.edges.some((edge, e) => (edges.includes(e) || endsHere(e)) && edge.label != null);
+    const startsHere = (e) => { const [ru, rl] = edgeRows(d, e); return ru === r && (rl === r + 1 || d.through[e] || d.elbow[e]); };
+    const elbowHere = (e) => d.elbow[e] && edgeRows(d, e)[0] === r;
+    const labelled = d.edges.some((edge, e) => (edges.includes(e) || endsHere(e) || elbowHere(e)) && edge.label != null);
     // An arrow head pointing up into a shape of row r.
     const twoWay = d.edges.some((_, e) => {
       const [, , au, al] = vertical(d, e);
@@ -986,6 +1047,7 @@ const diaBits = (() => {
       const [u, l, au, al] = vertical(d, e);
       if (d.nodes[u].row === d.nodes[l].row && neighbours(d, u, l)) drawSameRow(g, d, u, l, au, al, d.edges[e].label);
       else if (d.through[e]) drawThrough(g, d, e);
+      else if (d.elbow[e]) drawElbow(g, d, e);
     }
     return g.cells.map((row) => row.join("").replace(/\s+$/, ""));
   }
@@ -1098,6 +1160,30 @@ const diaBits = (() => {
     if (au) g.put(x, top, "▲");
     if (al) g.put(x, lower.y - 1, "▼");
     if (d.edges[e].label != null) g.text(x + 2, lower.y - 2, d.edges[e].label);
+  }
+
+  // An edge that skips rows drawn as an elbow: straight down the upper shape's empty column,
+  // then along the lower shape's row into its side. Its label sits beside the line on the
+  // entry row of the region below the upper shape, where a direct edge's would.
+  function drawElbow(g, d, e) {
+    const [u, l, au, al] = vertical(d, e);
+    const upper = d.nodes[u], lower = d.nodes[l];
+    const x = center(upper);
+    const top = upper.y + upper.h;
+    const y = middle(lower);
+    for (let row = top; row < y; row++) g.put(x, row, "│");
+    if (au) g.put(x, top, "▲");
+    const left = x < center(lower);
+    const edge = left ? lower.x : lower.x + lower.w - 1;
+    if (left) for (let col = x + 1; col < edge; col++) g.put(col, y, "─");
+    else for (let col = edge + 1; col < x; col++) g.put(col, y, "─");
+    g.put(x, y, left ? "└" : "┘");
+    if (al) g.put(left ? edge - 1 : edge + 1, y, left ? "▶" : "◀");
+    if (d.edges[e].label != null) {
+      const plan = regionPlan(d, upper.row);
+      const row = plan.levels > 0 || plan.height > 2 ? top + plan.height - 2 : top;
+      g.text(x + 2, row, d.edges[e].label);
+    }
   }
 
   // An edge routed down (or up) a channel in a gap.

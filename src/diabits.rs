@@ -99,6 +99,9 @@ struct Diagram {
     span: Vec<(usize, usize)>,
     /// Lines that skip rows but run straight down the empty cells of their column.
     through: Vec<bool>,
+    /// Lines that skip rows drawn as an elbow: down the empty column of their upper shape,
+    /// then along the lower shape's row into its side.
+    elbow: Vec<bool>,
     /// Lines routed down a channel in a gap.
     routes: Vec<Route>,
     /// The gaps a line can run down: gap 0 is left of the first column, gap `columns` right
@@ -290,6 +293,7 @@ fn parse(source: &str) -> Result<Diagram, String> {
         columns: 0,
         span: Vec::new(),
         through: Vec::new(),
+        elbow: Vec::new(),
         routes: Vec::new(),
         gaps: Vec::new(),
         height: 0,
@@ -327,16 +331,18 @@ fn shape_width(shape: Shape, label: &str) -> usize {
 // ----- layout -------------------------------------------------------------------------
 
 /// Whether an edge asks for a channel in a gap rather than a bus between its rows: edges
-/// that skip rows (unless they can go straight through), and edges that point back up (or
-/// both ways) without lining up, which would be ambiguous on a shared bus. Edges along a
-/// row are never routed: neighbours join directly and others loop under the row.
+/// that skip rows (unless they can go straight through or take an elbow), and edges that
+/// point back up (or both ways) without lining up, which would be ambiguous on a shared
+/// bus. Edges along a row are never routed: neighbours join directly and others loop under
+/// the row.
 fn wants_channel(d: &Diagram, e: usize) -> bool {
     let (u, l, au, _) = d.edges[e].vertical(&d.nodes);
     let (ru, rl) = (d.nodes[u].row, d.nodes[l].row);
     if ru == rl {
         return false;
     }
-    (rl > ru + 1 && !d.through[e]) || (au && d.nodes[u].center() != d.nodes[l].center())
+    (rl > ru + 1 && !d.through[e] && !d.elbow[e])
+        || (au && d.nodes[u].center() != d.nodes[l].center())
 }
 
 /// The rows of the two ends of an edge, top one first.
@@ -393,6 +399,77 @@ fn goes_through(d: &Diagram, e: usize) -> bool {
         };
         let (lo, hi) = edge_extent(d, f);
         between && lo <= x && x <= hi
+    })
+}
+
+/// Whether an edge that skips rows is drawn as an elbow instead of round a channel: straight
+/// down from the upper shape through its own empty column, then along the lower shape's row
+/// into its side. The column holds no shape on the rows between or on the lower row, no
+/// shape on the lower row sits between the column and the lower shape, and no other line
+/// crosses the column or the arm: a bus or loop between the rows, a line along a row, or a
+/// line down the same column (through or elbow, which are decided in written order).
+fn takes_elbow(d: &Diagram, e: usize) -> bool {
+    let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
+    let (ru, rl) = (d.nodes[u].row, d.nodes[l].row);
+    let ((c0, c1), (l0, l1)) = (d.span[u], d.span[l]);
+    if rl <= ru + 1 || (c0 < l1 && l0 < c1) {
+        return false;
+    }
+    let x = d.nodes[u].center();
+    // The arm runs right from the column into the lower shape's left side, or left.
+    let left = c1 <= l0;
+    let blocked = d
+        .nodes
+        .iter()
+        .zip(&d.span)
+        .enumerate()
+        .any(|(m, (n, &(m0, m1)))| {
+            if n.row <= ru || n.row > rl || m == l {
+                false
+            } else if n.row < rl {
+                m0 < c1 && c0 < m1
+            } else if left {
+                m1 > c0 && m0 < l0
+            } else {
+                m0 < c1 && m1 > l1
+            }
+        });
+    if blocked {
+        return false;
+    }
+    let arm = if left {
+        x..=d.nodes[l].center()
+    } else {
+        d.nodes[l].center()..=x
+    };
+    !(0..d.edges.len()).any(|f| {
+        if f == e {
+            return false;
+        }
+        let (fu, fl, _, _) = d.edges[f].vertical(&d.nodes);
+        let (ra, rb) = (d.nodes[fu].row, d.nodes[fl].row);
+        let (lo, hi) = edge_extent(d, f);
+        if rb > ra + 1 {
+            if !(d.through[f] || d.elbow[f]) {
+                // Channels run down the gaps.
+                return false;
+            }
+            // Down the same column from the same shape, down a column the arm crosses, or
+            // (an elbow) along a row across the column.
+            fu == u
+                || (ra < rl && rl <= rb && arm.contains(&d.nodes[fu].center()))
+                || (d.elbow[f] && ru < rb && rb <= rl && lo <= x && x <= hi)
+        } else {
+            let between = if ra < rb {
+                ru <= ra && rb <= rl
+            } else if neighbours(d, fu, fl) {
+                ru < ra && ra <= rl
+            } else {
+                // A loop under row `ra` lives in the region below it.
+                ru <= ra && ra < rl
+            };
+            between && lo <= x && x <= hi
+        }
     })
 }
 
@@ -499,6 +576,10 @@ fn layout(d: &mut Diagram) {
     // With the shapes in place, decide how each line runs, then make room for the channels:
     // the gaps they use widen, and the shapes move right of the channels on the left.
     d.through = (0..d.edges.len()).map(|e| goes_through(d, e)).collect();
+    d.elbow = vec![false; d.edges.len()];
+    for e in 0..d.edges.len() {
+        d.elbow[e] = takes_elbow(d, e);
+    }
     channel_plan(d);
     for g in 1..columns {
         gaps[g - 1] = gaps[g - 1].max(gap_width(d.gaps[g], g, columns));
@@ -623,7 +704,7 @@ fn channel_plan(d: &mut Diagram) {
     };
     // Lines not routed through channels that a channel in gap `g` between the rows of `e`
     // would cross: a line along a row between them (2), or along one of its own rows,
-    // which it joins instead (1); a bus between two rows in its range (2).
+    // which it joins instead (1); a bus between two rows in its range (2); an elbow's arm.
     let line_crossings = |e: usize, g: usize| -> usize {
         let (ru, rl) = edge_rows(d, e);
         (0..d.edges.len())
@@ -654,6 +735,17 @@ fn channel_plan(d: &mut Diagram) {
                     let (lo, hi) = edge_extent(d, f);
                     let x = d.gaps[g].x;
                     usize::from(lo < x && x <= hi) * 2
+                } else if d.elbow[f] && ru <= rb && rb <= rl {
+                    // An elbow's arm runs along row `rb` from its column to its shape.
+                    let (lo, hi) = edge_extent(d, f);
+                    let x = d.gaps[g].x;
+                    if !(lo < x && x <= hi) {
+                        0
+                    } else if rb == ru || rb == rl {
+                        1
+                    } else {
+                        2
+                    }
                 } else {
                     0
                 }
@@ -751,11 +843,22 @@ fn channel_plan(d: &mut Diagram) {
                 && (d.span[m].0 < d.span[n].0) == gap_left_of(d, n, g)
         })
     };
+    // Whether an elbow arrives at shape `n` on the side of gap `g`.
+    let elbow_at = |n: usize, g: usize| {
+        (0..d.edges.len()).any(|f| {
+            let (fu, fl, _, _) = d.edges[f].vertical(&d.nodes);
+            d.elbow[f]
+                && fl == n
+                && (d.nodes[fu].center() < d.nodes[n].center()) == gap_left_of(d, n, g)
+        })
+    };
     for i in 0..routes.len() {
         let (u, l, au, al) = d.edges[routes[i].edge].vertical(&d.nodes);
         let g = routes[i].gap;
-        routes[i].upper_corner = row_line_at(u, g) || (!au && headed_at(&routes, i, u));
-        routes[i].lower_corner = row_line_at(l, g) || (!al && headed_at(&routes, i, l));
+        routes[i].upper_corner =
+            row_line_at(u, g) || elbow_at(u, g) || (!au && headed_at(&routes, i, u));
+        routes[i].lower_corner =
+            row_line_at(l, g) || elbow_at(l, g) || (!al && headed_at(&routes, i, l));
     }
     routes.sort_by_key(|r| r.edge);
     for g in 0..gaps {
@@ -889,17 +992,20 @@ fn region_plan(d: &Diagram, r: usize) -> RegionPlan {
         levels = levels.max(level + 1);
         placed.push((level, lo, hi));
     }
-    // Lines passing straight through from further up end or start here too.
+    // Lines passing straight through from further up end or start here too; an elbow
+    // starts here and carries its label beside it.
     let ends_here = |e: usize| {
         let (ru, rl) = edge_rows(d, e);
         rl == r + 1 && (ru == r || d.through[e])
     };
     let starts_here = |e: usize| {
         let (ru, rl) = edge_rows(d, e);
-        ru == r && (rl == r + 1 || d.through[e])
+        ru == r && (rl == r + 1 || d.through[e] || d.elbow[e])
     };
-    let labelled = (0..d.edges.len())
-        .any(|e| (edges.contains(&e) || ends_here(e)) && d.edges[e].label.is_some());
+    let elbow_here = |e: usize| d.elbow[e] && edge_rows(d, e).0 == r;
+    let labelled = (0..d.edges.len()).any(|e| {
+        (edges.contains(&e) || ends_here(e) || elbow_here(e)) && d.edges[e].label.is_some()
+    });
     // An arrow head pointing up into a shape of row `r`.
     let two_way = (0..d.edges.len()).any(|e| {
         let (_, _, au, al) = d.edges[e].vertical(&d.nodes);
@@ -1046,6 +1152,8 @@ fn draw(d: &Diagram) -> Vec<String> {
             draw_same_row(&mut g, d, u, l, au, al, d.edges[e].label.as_deref());
         } else if d.through[e] {
             draw_through(&mut g, d, e);
+        } else if d.elbow[e] {
+            draw_elbow(&mut g, d, e);
         }
     }
     g.lines()
@@ -1250,6 +1358,46 @@ fn draw_through(g: &mut Grid, d: &Diagram, e: usize) {
     }
     if let Some(label) = &d.edges[e].label {
         g.text(x + 2, lower.y - 2, label);
+    }
+}
+
+/// An edge that skips rows drawn as an elbow: straight down the upper shape's empty column,
+/// then along the lower shape's row into its side. Its label sits beside the line on the
+/// entry row of the region below the upper shape, where a direct edge's would.
+fn draw_elbow(g: &mut Grid, d: &Diagram, e: usize) {
+    let (u, l, au, al) = d.edges[e].vertical(&d.nodes);
+    let (upper, lower) = (&d.nodes[u], &d.nodes[l]);
+    let x = upper.center();
+    let top = upper.y + upper.h;
+    let y = lower.middle();
+    for row in top..y {
+        g.put(x, row, '│');
+    }
+    if au {
+        g.put(x, top, '▲');
+    }
+    let left = x < lower.center();
+    let edge = if left { lower.x } else { lower.x + lower.w - 1 };
+    let xs = if left { x + 1..edge } else { edge + 1..x };
+    for col in xs {
+        g.put(col, y, '─');
+    }
+    g.put(x, y, if left { '└' } else { '┘' });
+    if al {
+        g.put(
+            if left { edge - 1 } else { edge + 1 },
+            y,
+            if left { '▶' } else { '◀' },
+        );
+    }
+    if let Some(label) = &d.edges[e].label {
+        let plan = region_plan(d, upper.row);
+        let row = if plan.levels > 0 || plan.height > 2 {
+            top + plan.height - 2
+        } else {
+            top
+        };
+        g.text(x + 2, row, label);
     }
 }
 
@@ -1801,5 +1949,65 @@ mod tests {
                 "           ▼",
             ]
         );
+    }
+
+    #[test]
+    fn a_skipping_line_takes_an_elbow_into_a_shape_in_another_column() {
+        // "No" skips two rows whose first column is empty: it drops straight down that
+        // column and turns into the side of the diamond in the next column, its label where
+        // the "Yes" beside it sits.
+        let src = "a<Shop nearby?>, b<Known?>\n, c<Short?>\n, d<Monster?>\na --> b | Yes\nb --> c | Yes\nc --> d | No\na --> d | No";
+        let out = render(src).unwrap();
+        println!("{}", joined(&out));
+        assert_eq!(
+            out,
+            vec![
+                " ╱‾‾‾‾‾‾‾‾‾‾‾‾‾‾╲  Yes   ╱‾‾‾‾‾‾‾‾╲",
+                "⟨  Shop nearby?  ⟩─────▶⟨  Known?  ⟩",
+                " ╲______________╱        ╲________╱",
+                "         │                    │",
+                "         │ No                 │ Yes",
+                "         │                    ▼",
+                "         │               ╱‾‾‾‾‾‾‾‾╲",
+                "         │              ⟨  Short?  ⟩",
+                "         │               ╲________╱",
+                "         │                    │",
+                "         │                    │ No",
+                "         │                    ▼",
+                "         │              ╱‾‾‾‾‾‾‾‾‾‾╲",
+                "         └────────────▶⟨  Monster?  ⟩",
+                "                        ╲__________╱",
+            ]
+        );
+        // The mirror image turns left into the shape's right side.
+        let out =
+            render("a<A?>, b<B?>\nc<C?>,\nd<D?>,\nb --> a | Yes\na --> c\nc --> d\nb --> d | No")
+                .unwrap();
+        println!("{}", joined(&out));
+        assert_eq!(
+            &out[9..13],
+            &[
+                "    │            │",
+                "    ▼            │",
+                " ╱‾‾‾‾╲          │",
+                "⟨  D?  ⟩◀────────┘"
+            ]
+        );
+        // A shape in the column on the lower row leaves no room for the arm: the line takes
+        // a channel between the columns instead.
+        let out =
+            render("a<A?>, b<B?>\n, c<C?>\ne[E], d<D?>\na --> b\nb --> c\nc --> d\na --> d | No")
+                .unwrap();
+        println!("{}", joined(&out));
+        assert_eq!(out[2], " ╲____╱───┐     ╲____╱");
+        assert_eq!(out[11], "  │ E │   └───▶⟨  D?  ⟩");
+        // Two skipping lines from one shape: the first takes the column, the second goes
+        // round.
+        let out = render("a<A?>, b<B?>\n, c<C?>\n, d<D?>\n, f<F?>\na --> b\nb --> c\nc --> d\nd --> f\na --> d | one\na --> f | two")
+            .unwrap();
+        println!("{}", joined(&out));
+        assert_eq!(out[1], "     ┌──⟨  A?  ⟩───▶⟨  B?  ⟩");
+        assert_eq!(out[12], "     │      └──────▶⟨  D?  ⟩");
+        assert_eq!(out[17], "     └─────────────▶⟨  F?  ⟩");
     }
 }
