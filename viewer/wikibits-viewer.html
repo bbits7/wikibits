@@ -487,13 +487,6 @@ const diaBits = (() => {
     return ia >= 0 && ib >= 0 && Math.abs(ia - ib) === 1;
   }
 
-  function goesSideways(d, e) {
-    const [u, l, au] = vertical(d, e);
-    const ru = d.nodes[u].row, rl = d.nodes[l].row;
-    if (ru === rl) return !neighbours(d, u, l);
-    return rl > ru + 1 || (au && center(d.nodes[u]) !== center(d.nodes[l]));
-  }
-
   // The diaType line, wherever it is in the block; a block without one is a flowchart.
   function kind(source) {
     let kind = null;
@@ -582,8 +575,12 @@ const diaBits = (() => {
       n.w = shapeWidth(n.shape, n.label);
       n.h = 3;
     }
+    // A grid of columns: as many as the fullest row has shapes (or slots). A row with fewer
+    // shapes spreads them over the columns unless it used empty slots to pick columns, and
+    // every shape is centred in the columns it spans, so stacked shapes line up.
     const columns = Math.max(1, ...d.rows.map((row, r) => d.explicit[r] ?? row.length));
-    const span = d.nodes.map((n) => {
+    d.columns = columns;
+    d.span = d.nodes.map((n) => {
       if (d.explicit[n.row] != null) return [n.slot, n.slot + 1];
       const len = d.rows[n.row].length;
       let i = d.rows[n.row].findIndex((m) => d.nodes[m].slot === n.slot);
@@ -593,137 +590,277 @@ const diaBits = (() => {
     const widths = new Array(columns).fill(0);
     // The gap between two columns widens to fit the label of a line drawn across it.
     const gaps = new Array(Math.max(0, columns - 1)).fill(ROW_GAP);
+    const leads = new Array(Math.max(0, columns - 1)).fill(0);
     for (const e of d.edges) {
       const a = d.nodes[e.from], b = d.nodes[e.to];
-      if (e.label == null || a.row !== b.row) continue;
-      const row = d.rows[a.row];
-      const ia = row.indexOf(e.from), ib = row.indexOf(e.to);
-      if (ia < 0 || ib < 0 || Math.abs(ia - ib) !== 1) continue;
-      const [left, right] = ia < ib ? [e.from, e.to] : [e.to, e.from];
-      const c1 = span[left][1];
-      if (span[right][0] === c1 && c1 - 1 < gaps.length) gaps[c1 - 1] = Math.max(gaps[c1 - 1], width(e.label) + 2);
+      if (e.label == null || a.row !== b.row || !neighbours(d, e.from, e.to)) continue;
+      const [left, right] = d.span[e.from][0] < d.span[e.to][0] ? [e.from, e.to] : [e.to, e.from];
+      const c1 = d.span[left][1];
+      if (d.span[right][0] === c1 && c1 - 1 < gaps.length) {
+        leads[c1 - 1] = Math.max(leads[c1 - 1], width(e.label) + 2);
+        gaps[c1 - 1] = Math.max(gaps[c1 - 1], leads[c1 - 1]);
+      }
     }
     const gapSum = (c0, c1) => sum(gaps.slice(c0, c1 - 1));
-    for (const row of d.rows) for (const n of row) {
-      const [c0, c1] = span[n];
+    // Single-column shapes set the column widths; wider spanning shapes stretch their span.
+    d.span.forEach(([c0, c1], n) => {
       if (c1 - c0 === 1) widths[c0] = Math.max(widths[c0], d.nodes[n].w);
-    }
-    for (const row of d.rows) for (const n of row) {
-      const [c0, c1] = span[n];
+    });
+    d.span.forEach(([c0, c1], n) => {
       const have = sum(widths.slice(c0, c1)) + gapSum(c0, c1);
       if (d.nodes[n].w > have) {
         const each = Math.ceil((d.nodes[n].w - have) / (c1 - c0));
         for (let c = c0; c < c1; c++) widths[c] += each;
       }
-    }
-    const starts = [];
-    let x = 0;
-    widths.forEach((w, c) => { starts.push(x); x += w + (gaps[c] ?? 0); });
-    for (const row of d.rows) for (const n of row) {
-      const [c0, c1] = span[n];
-      const total = sum(widths.slice(c0, c1)) + gapSum(c0, c1);
-      // Place by centre, not by left edge, so shapes in one column share one centre.
-      const centre = starts[c0] + Math.floor(total / 2);
-      d.nodes[n].x = centre - Math.floor(d.nodes[n].w / 2);
-    }
-    // Lines routed down the left side need a margin for their channels.
-    const margin = leftMargin(sidePlan(d));
-    for (const n of d.nodes) n.x += margin;
+    });
+    // Place the shapes, margin columns in: by centre, not by left edge, so shapes of
+    // different widths in one column share one centre. Also notes where each gap starts.
+    const place = (margin) => {
+      const starts = [];
+      let x = margin;
+      widths.forEach((w, c) => { starts.push(x); x += w + (gaps[c] ?? 0); });
+      d.span.forEach(([c0, c1], n) => {
+        const total = sum(widths.slice(c0, c1)) + gapSum(c0, c1);
+        const centre = starts[c0] + Math.floor(total / 2);
+        d.nodes[n].x = centre - Math.floor(d.nodes[n].w / 2);
+      });
+      d.gaps[0].x = 0;
+      d.gaps[0].width = margin;
+      for (let g = 1; g < columns; g++) {
+        d.gaps[g].x = starts[g - 1] + widths[g - 1];
+        d.gaps[g].width = gaps[g - 1];
+      }
+      d.gaps[columns].x = starts[columns - 1] + widths[columns - 1];
+    };
+    d.gaps = Array.from({ length: columns + 1 }, () => ({ channels: 0, label: 0, x: 0, width: 0, lead: 0 }));
+    for (let g = 1; g < columns; g++) d.gaps[g].lead = leads[g - 1];
+    place(0);
+    // With the shapes in place, decide how each line runs, then make room for the channels:
+    // the gaps they use widen, and the shapes move right of the channels on the left.
+    d.through = d.edges.map((_, e) => goesThrough(d, e));
+    channelPlan(d);
+    for (let g = 1; g < columns; g++) gaps[g - 1] = Math.max(gaps[g - 1], gapWidth(d.gaps[g], g, columns));
+    place(gapWidth(d.gaps[0], 0, columns));
+    d.gaps[columns].width = gapWidth(d.gaps[columns], columns, columns);
+    // Vertical positions: each gap between rows is as tall as its edges need.
     let y = 0;
     for (let r = 0; r < d.rows.length; r++) {
       for (const n of d.rows[r]) d.nodes[n].y = y;
       y += 3;
-      if (r + 1 < d.rows.length) y += regionPlan(d, r).height;
+      if (r < regionCount(d)) y += regionPlan(d, r).height;
     }
+    d.height = y;
   }
 
-  // ----- side channels -----
-  // Plan the lines that run down the sides. Each takes the side where it crosses fewer of
-  // the lines placed before it (the right when it makes no difference; a line between two
-  // shapes of one row always the right), then the innermost channel on that side no line
-  // sharing any of its rows is using — so a line nests inside the longer ones around it,
-  // and lines that share no rows share a channel.
-  function sidePlan(d) {
-    const rows = (e) => { const [u, l] = vertical(d, e); return [d.nodes[u].row, d.nodes[l].row]; };
+  // Whether an edge asks for a channel in a gap rather than a bus between its rows: edges
+  // that skip rows (unless they can go straight through), and edges that point back up (or
+  // both ways) without lining up, which would be ambiguous on a shared bus. Edges along a
+  // row are never routed: neighbours join directly and others loop under the row.
+  function wantsChannel(d, e) {
+    const [u, l, au] = vertical(d, e);
+    const ru = d.nodes[u].row, rl = d.nodes[l].row;
+    if (ru === rl) return false;
+    return (rl > ru + 1 && !d.through[e]) || (au && center(d.nodes[u]) !== center(d.nodes[l]));
+  }
+
+  // The rows of the two ends of an edge, top one first.
+  function edgeRows(d, e) {
+    const [u, l] = vertical(d, e);
+    return [d.nodes[u].row, d.nodes[l].row];
+  }
+
+  // The leftmost and rightmost centre column of the two ends of an edge.
+  function edgeExtent(d, e) {
+    const a = center(d.nodes[d.edges[e].from]), b = center(d.nodes[d.edges[e].to]);
+    return [Math.min(a, b), Math.max(a, b)];
+  }
+
+  // Whether an edge that skips rows is drawn straight down instead of round a channel: its
+  // ends sit in the same columns, no shape on the rows between touches those columns, and
+  // no line drawn between those rows crosses or shares the column.
+  function goesThrough(d, e) {
+    const [u, l] = vertical(d, e);
+    const ru = d.nodes[u].row, rl = d.nodes[l].row;
+    if (rl <= ru + 1 || d.span[u][0] !== d.span[l][0] || d.span[u][1] !== d.span[l][1]) return false;
+    const [c0, c1] = d.span[u];
+    const x = center(d.nodes[u]);
+    if (d.nodes.some((n, m) => n.row > ru && n.row < rl && d.span[m][0] < c1 && c0 < d.span[m][1])) return false;
+    return !d.edges.some((_, f) => {
+      if (f === e) return false;
+      const [fu, fl] = vertical(d, f);
+      const ra = d.nodes[fu].row, rb = d.nodes[fl].row;
+      let between;
+      if (rb > ra + 1) between = false; // skipping lines run through their own column or down a channel
+      else if (ra < rb) between = ru <= ra && rb <= rl;
+      else if (neighbours(d, fu, fl)) between = ru < ra && ra < rl;
+      else between = ru <= ra && ra < rl; // a loop under row ra lives in the region below it
+      const [lo, hi] = edgeExtent(d, f);
+      return between && lo <= x && x <= hi;
+    });
+  }
+
+  // Columns a gap needs for its channels: outside the shapes a channel sits two columns out
+  // from them, with its label beyond it (on the left, before it); between columns a channel
+  // keeps a column clear on each side, after the room kept for labels along the rows.
+  function gapWidth(gap, g, columns) {
+    if (gap.channels === 0) return 0;
+    const more = (gap.channels - 1) * (3 + gap.label);
+    if (g === 0) return 3 + more + (gap.label > 0 ? gap.label + 2 : 0);
+    if (g === columns) return 3 + more + gap.label;
+    return gap.lead + 4 + more + (gap.label > 0 ? gap.label + 1 : 0);
+  }
+
+  // The column a route's channel runs down.
+  function channelX(d, route) {
+    const gap = d.gaps[route.gap];
+    const step = 3 + gap.label;
+    return route.gap === 0 ? gap.x + gap.width - 3 - route.channel * step : gap.x + gap.lead + 2 + route.channel * step;
+  }
+
+  // Whether gap g lies left of shape n.
+  const gapLeftOf = (d, n, g) => g <= d.span[n][0];
+
+  // Regions between rows, plus one under the last row when a line loops under it.
+  function regionCount(d) {
+    const last = d.rows.length - 1;
+    const loops = d.rows[last].some((n) => d.edges.some((e) =>
+      (e.from === n || e.to === n) && d.nodes[e.from].row === d.nodes[e.to].row && !neighbours(d, e.from, e.to)));
+    return last + (loops ? 1 : 0);
+  }
+
+  // Plan the lines that run down channels. A line may use a gap it can reach from both its
+  // shapes along their rows without crossing another shape, and that no shape on the rows
+  // between spans. Among those it takes the gap where it crosses the fewest lines (lines
+  // placed before it, lines along the rows it passes, buses between them), the rightmost
+  // when it makes no difference; the longest lines pick first so the shorter ones nest
+  // around them. In a gap it takes the innermost channel no line sharing any of its rows is
+  // using, so lines that share no rows share a channel. When no gap is clear a skipping line
+  // takes the least blocked one anyway; a back edge between neighbouring rows stays on a bus.
+  function channelPlan(d) {
+    const gaps = d.columns + 1;
     const crosses = (e, f) => {
-      const [a, b] = rows(e), [c, dd] = rows(f);
+      const [a, b] = edgeRows(d, e), [c, dd] = edgeRows(d, f);
       return (a < c && c < b && b < dd) || (c < a && a < dd && dd < b);
     };
-    const overlaps = (e, f) => { const [a, b] = rows(e), [c, dd] = rows(f); return !(b < c || dd < a); };
+    const overlaps = (e, f) => { const [a, b] = edgeRows(d, e), [c, dd] = edgeRows(d, f); return !(b < c || dd < a); };
     // Whether edge e has an arrow head at shape n.
     const headed = (e, n) => { const [u, l, au, al] = vertical(d, e); return (u === n && au) || (l === n && al); };
-    // Shapes where one of the edges arrives with an arrow head and the other just leaves.
-    const conflicts = (e, f) => {
-      const [u, l] = vertical(d, e), [fu, fl] = vertical(d, f);
-      return [u, l].filter((n) => (n === fu || n === fl) && headed(e, n) !== headed(f, n)).length;
+    // Shapes crossed along its row to reach gap g from shape n.
+    const armBlocks = (n, g) => {
+      const [c0, c1] = d.span[n];
+      if (c0 < g && g < c1) return 100;
+      return d.rows[d.nodes[n].row].filter((m) => m !== n).filter((m) => {
+        const [m0, m1] = d.span[m];
+        return g <= c0 ? m0 < c0 && m1 > g : m1 > c1 && m0 < g;
+      }).length;
+    };
+    // Shapes on the rows between the ends of e that span gap g.
+    const dropBlocks = (e, g) => {
+      const [ru, rl] = edgeRows(d, e);
+      return d.nodes.filter((n, m) => n.row > ru && n.row < rl && d.span[m][0] < g && g < d.span[m][1]).length;
+    };
+    const blocks = (e, g) => { const [u, l] = vertical(d, e); return armBlocks(u, g) + armBlocks(l, g) + dropBlocks(e, g); };
+    // Lines not routed through channels that a channel in gap g between the rows of e
+    // would cross: a line along a row between them (2), or along one of its own rows,
+    // which it joins instead (1); a bus or a loop between two rows in its range (2).
+    const lineCrossings = (e, g) => {
+      const [ru, rl] = edgeRows(d, e);
+      return sum(d.edges.map((_, f) => {
+        if (f === e) return 0;
+        const [fu, fl] = vertical(d, f);
+        const ra = d.nodes[fu].row, rb = d.nodes[fl].row;
+        if (ra === rb && !neighbours(d, fu, fl)) {
+          const [lo, hi] = edgeExtent(d, f), x = d.gaps[g].x;
+          return ru <= ra && ra < rl && lo < x && x <= hi ? 2 : 0;
+        }
+        if (ra === rb) {
+          if (ra < ru || ra > rl) return 0;
+          const [left, right] = d.span[fu][0] < d.span[fl][0] ? [fu, fl] : [fl, fu];
+          if (d.span[left][1] <= g && g <= d.span[right][0]) return ra === ru || ra === rl ? 1 : 2;
+          return 0;
+        }
+        if (rb === ra + 1 && ru <= ra && rb <= rl && !wantsChannel(d, f)) {
+          const [lo, hi] = edgeExtent(d, f), x = d.gaps[g].x;
+          return lo < x && x <= hi ? 2 : 0;
+        }
+        return 0;
+      }));
     };
     const side = [];
-    for (let e = 0; e < d.edges.length; e++) if (goesSideways(d, e)) side.push(e);
-    const length = (e) => { const [a, b] = rows(e); return b - a; };
-    // Longest lines pick their side first (a stable sort keeps the written order otherwise).
+    for (let e = 0; e < d.edges.length; e++) if (wantsChannel(d, e)) side.push(e);
+    const length = (e) => { const [a, b] = edgeRows(d, e); return b - a; };
+    // Longest lines pick their gap first (a stable sort keeps the written order otherwise).
     side.sort((e, f) => length(f) - length(e));
-    const leftOf = new Array(d.edges.length).fill(false);
-    const placed = [];
+    const gapOf = new Array(d.edges.length).fill(null);
     for (const e of side) {
-      const [a, b] = rows(e);
-      if (a !== b) {
-        const cost = (left) => sum(placed.filter((f) => leftOf[f] === left).map((f) => 2 * (crosses(e, f) ? 1 : 0) + conflicts(e, f)));
-        leftOf[e] = cost(true) < cost(false);
+      const [u, l] = vertical(d, e);
+      const [ru, rl] = edgeRows(d, e);
+      const cost = (g) => {
+        let placed = 0;
+        gapOf.forEach((gf, f) => {
+          if (gf == null) return;
+          const [fu, fl] = vertical(d, f);
+          // Shapes where one line arrives with an arrow head and the other just leaves,
+          // both from the same side: they would meet at one point.
+          const meets = [u, l].filter((n) =>
+            (n === fu || n === fl) && gapLeftOf(d, n, g) === gapLeftOf(d, n, gf) && headed(e, n) !== headed(f, n)).length;
+          placed += 2 * (gf === g && crosses(e, f) ? 1 : 0) + meets;
+        });
+        return 100 * blocks(e, g) + placed + lineCrossings(e, g);
+      };
+      let best = null;
+      for (let g = 0; g < gaps; g++) {
+        const c = cost(g);
+        if (best == null || c <= best[0]) best = [c, g];
       }
-      placed.push(e);
+      // A back edge between neighbouring rows is clearer on a bus than through a shape.
+      if (best[0] >= 100 && rl === ru + 1) continue;
+      gapOf[e] = best[1];
     }
-    side.sort((e, f) => length(e) - length(f));
+    const routed = side.filter((e) => gapOf[e] != null);
+    routed.sort((e, f) => length(e) - length(f));
     const routes = [];
-    for (const e of side) {
-      const left = leftOf[e];
+    for (const e of routed) {
+      const gap = gapOf[e];
       let channel = 0;
-      while (routes.some((r) => r.left === left && r.channel === channel && overlaps(e, r.edge))) channel++;
-      routes.push({ edge: e, left, channel, upperCorner: false, lowerCorner: false });
+      while (routes.some((r) => r.gap === gap && r.channel === channel && overlaps(e, r.edge))) channel++;
+      routes.push({ edge: e, gap, channel, upperCorner: false, lowerCorner: false });
     }
-    // An end without an arrow head attaches at the shape's corner when another line on
-    // that side arrives at the shape with one.
-    const headedAt = (i, n) => routes.some((r, j) => {
-      const [c, dd] = rows(r.edge);
-      return j !== i && r.left === routes[i].left && c !== dd && headed(r.edge, n);
+    // Whether some other line arrives at that side of shape n with an arrow head.
+    const headedAt = (i, n) => routes.some((r, j) =>
+      j !== i && gapLeftOf(d, n, r.gap) === gapLeftOf(d, n, routes[i].gap) && headed(r.edge, n));
+    // Whether a line along the row joins shape n on the side of gap g.
+    const rowLineAt = (n, g) => d.edges.some((f) => {
+      const m = f.from === n ? f.to : f.to === n ? f.from : null;
+      if (m == null) return false;
+      return d.nodes[m].row === d.nodes[n].row && neighbours(d, n, m) && (d.span[m][0] < d.span[n][0]) === gapLeftOf(d, n, g);
     });
     routes.forEach((route, i) => {
       const [u, l, au, al] = vertical(d, route.edge);
-      const [a, b] = rows(route.edge);
-      if (a === b) return;
-      route.upperCorner = !au && headedAt(i, u);
-      route.lowerCorner = !al && headedAt(i, l);
+      route.upperCorner = rowLineAt(u, route.gap) || (!au && headedAt(i, u));
+      route.lowerCorner = rowLineAt(l, route.gap) || (!al && headedAt(i, l));
     });
     routes.sort((a, b) => a.edge - b.edge);
-    const label = (left) => Math.max(0, ...routes.filter((r) => r.left === left).map((r) => (d.edges[r.edge].label != null ? width(d.edges[r.edge].label) : 0)));
-    const channels = (left) => Math.max(0, ...routes.filter((r) => r.left === left).map((r) => r.channel + 1));
-    return { routes, leftChannels: channels(true), rightChannels: channels(false), leftLabel: label(true), rightLabel: label(false) };
+    for (let g = 0; g < gaps; g++) {
+      const mine = routes.filter((r) => r.gap === g);
+      d.gaps[g].channels = Math.max(0, ...mine.map((r) => r.channel + 1));
+      d.gaps[g].label = Math.max(0, ...mine.map((r) => (d.edges[r.edge].label != null ? width(d.edges[r.edge].label) : 0)));
+    }
+    d.routes = routes;
   }
 
-  // Columns the shapes move right to make room for the channels on the left.
-  function leftMargin(plan) {
-    if (plan.leftChannels === 0) return 0;
-    const labels = plan.leftLabel > 0 ? plan.leftLabel + 2 : 0;
-    return 3 + (plan.leftChannels - 1) * (3 + plan.leftLabel) + labels;
-  }
+  const sameRow = (d, e) => d.nodes[d.edges[e].from].row === d.nodes[d.edges[e].to].row;
 
-  // Column of a route's channel, left of the margin or right of the shapes' content.
-  function channelColumn(plan, route, margin, content) {
-    return route.left
-      ? margin - 3 - route.channel * (3 + plan.leftLabel)
-      : content + 2 + route.channel * (3 + plan.rightLabel);
-  }
-
-  function diagramWidth(plan, margin, content) {
-    if (plan.rightChannels === 0) return content;
-    return channelColumn(plan, { left: false, channel: plan.rightChannels - 1 }, margin, content) + 1 + plan.rightLabel;
-  }
-
-  // Plan the edges between row r and row r + 1: straight lines and buses.
+  // Plan the edges between row r and row r + 1: the edges joining the rows that are not
+  // routed down a channel, and the loops under row r (a line along a row that skips a
+  // shape: down from both shapes and across).
   function regionPlan(d, r) {
+    const routed = (e) => d.routes.some((route) => route.edge === e);
     const edges = [];
     for (let e = 0; e < d.edges.length; e++) {
       const [u, l] = vertical(d, e);
-      if (d.nodes[u].row === r && d.nodes[l].row === r + 1 && !goesSideways(d, e)) edges.push(e);
+      const ru = d.nodes[u].row, rl = d.nodes[l].row;
+      if (ru === rl ? ru === r && !neighbours(d, u, l) : ru === r && rl === r + 1 && !routed(e)) edges.push(e);
     }
     // Union-find over the nodes the edges touch, so fan-outs and merges share a bus.
     const parent = new Map();
@@ -749,7 +886,7 @@ const diaBits = (() => {
     const direct = [], buses = [];
     for (const key of [...groups.keys()].sort((a, b) => a - b)) {
       const group = groups.get(key);
-      if (group.length === 1) {
+      if (group.length === 1 && !sameRow(d, group[0])) {
         const [u, l] = vertical(d, group[0]);
         if (center(d.nodes[u]) === center(d.nodes[l])) { direct.push(group[0]); continue; }
       }
@@ -757,7 +894,8 @@ const diaBits = (() => {
       for (const e of group) {
         const [u, l] = vertical(d, e);
         if (!uppers.includes(u)) uppers.push(u);
-        if (!lowers.includes(l)) lowers.push(l);
+        const ends = sameRow(d, e) ? uppers : lowers;
+        if (!ends.includes(l)) ends.push(l);
       }
       buses.push({ uppers, lowers, edges: group, level: 0 });
     }
@@ -777,36 +915,59 @@ const diaBits = (() => {
       levels = Math.max(levels, level + 1);
       placed.push([level, lo, hi]);
     }
-    const labelled = edges.some((e) => d.edges[e].label != null);
-    const twoWay = edges.some((e) => vertical(d, e)[2]);
+    // Lines passing straight through from further up end or start here too.
+    const endsHere = (e) => { const [ru, rl] = edgeRows(d, e); return rl === r + 1 && (ru === r || d.through[e]); };
+    const startsHere = (e) => { const [ru, rl] = edgeRows(d, e); return ru === r && (rl === r + 1 || d.through[e]); };
+    const labelled = d.edges.some((edge, e) => (edges.includes(e) || endsHere(e)) && edge.label != null);
+    // An arrow head pointing up into a shape of row r.
+    const twoWay = d.edges.some((_, e) => {
+      const [, , au, al] = vertical(d, e);
+      return (edges.includes(e) && (au || (sameRow(d, e) && al))) || (startsHere(e) && au);
+    });
+    // Rows: exit (│ or ▲), bus rows, entry (│ label), arrow (▼ or │). Direct unlabelled
+    // edges only need the exit and arrow rows; an upward arrow head needs its own row.
     let height = 2;
     if (levels > 0 || labelled) height = levels + 3;
     if (twoWay) height = Math.max(height, 3);
+    // Under the last row only loops are drawn: the exit row and the bus rows.
+    if (r + 1 === d.rows.length) height = levels + 1;
     return { direct, buses, levels, height };
   }
 
   // ----- drawing -----
+  // The arms of a line character: up 1, down 2, left 4, right 8.
+  const ARMS = { "│": 3, "─": 12, "┌": 10, "┐": 6, "└": 9, "┘": 5, "├": 11, "┤": 7, "┬": 14, "┴": 13, "┼": 15 };
+  const LINE_CHARS = { 1: "│", 2: "│", 3: "│", 4: "─", 8: "─", 12: "─", 10: "┌", 6: "┐", 9: "└", 5: "┘", 11: "├", 7: "┤", 14: "┬", 13: "┴", 15: "┼" };
+  const lineChar = (arms) => LINE_CHARS[arms] ?? " ";
+
   class Grid {
     constructor(w, h) {
       this.cells = Array.from({ length: Math.max(h, 1) }, () => new Array(Math.max(w, 1)).fill(" "));
     }
-    // Place a character, turning a crossing of ─ and │ into ┼.
-    put(x, y, c) {
-      if (y < 0 || y >= this.cells.length) return;
+    reach(x, y) {
+      if (y < 0 || y >= this.cells.length) return false;
       if (x >= this.cells[y].length) {
         const extra = x + 1 - this.cells[y].length;
         for (const row of this.cells) for (let i = 0; i < extra; i++) row.push(" ");
       }
+      return true;
+    }
+    // Place a character. Two lines meeting in a cell join: a crossing of ─ and │ is ┼, a
+    // line running on through a corner makes a junction. Text, arrow heads and shapes
+    // overwrite; a line never draws over them.
+    put(x, y, c) {
+      if (!this.reach(x, y)) return;
       const old = this.cells[y][x];
       let next;
-      if ((old === "─" && c === "│") || (old === "│" && c === "─")) next = "┼";
-      // A line running on through a corner makes a junction.
-      else if (((old === "┐" || old === "┌") && c === "─") || (old === "─" && (c === "┐" || c === "┌"))) next = "┬";
-      else if (((old === "┘" || old === "└") && c === "─") || (old === "─" && (c === "┘" || c === "└"))) next = "┴";
+      if (ARMS[old] != null && ARMS[c] != null) next = lineChar(ARMS[old] | ARMS[c]);
       else if (old === " ") next = c;
-      else if (c !== "─" && c !== "│") next = c;
+      else if (ARMS[c] == null) next = c;
       else next = old;
       this.cells[y][x] = next;
+    }
+    // Place a character whatever is there.
+    set(x, y, c) {
+      if (this.reach(x, y)) this.cells[y][x] = c;
     }
     text(x, y, s) {
       let col = x;
@@ -815,19 +976,17 @@ const diaBits = (() => {
   }
 
   function draw(d) {
-    const content = Math.max(0, ...d.nodes.map((n) => n.x + n.w));
-    const height = Math.max(0, ...d.nodes.map((n) => n.y + n.h));
-    // Edges that skip rows, or join non-neighbouring shapes of a row, use channels down the sides.
-    const plan = sidePlan(d);
-    const margin = leftMargin(plan);
-    const g = new Grid(diagramWidth(plan, margin, content), height);
+    const right = d.gaps[d.columns];
+    const g = new Grid(right.x + right.width, d.height);
     for (const n of d.nodes) drawShape(g, n.x, n.y, n.w, n.shape, n.label);
-    for (let r = 0; r + 1 < d.rows.length; r++) drawRegion(g, d, r);
+    for (let r = 0; r < regionCount(d); r++) drawRegion(g, d, r);
+    for (const route of d.routes) drawSide(g, d, route, channelX(d, route));
+    // Lines along the rows go last: their labels move out of the way of a channel's arm.
     for (let e = 0; e < d.edges.length; e++) {
       const [u, l, au, al] = vertical(d, e);
       if (d.nodes[u].row === d.nodes[l].row && neighbours(d, u, l)) drawSameRow(g, d, u, l, au, al, d.edges[e].label);
+      else if (d.through[e]) drawThrough(g, d, e);
     }
-    for (const route of plan.routes) drawSide(g, d, route, channelColumn(plan, route, margin, content));
     return g.cells.map((row) => row.join("").replace(/\s+$/, ""));
   }
 
@@ -838,18 +997,17 @@ const diaBits = (() => {
   }
 
   function drawShape(g, x, y, w, shape, label) {
+    const inner = w - 2;
     if (shape === "diamond") {
-      const inner = w - 4;
-      g.text(x, y, " ╱" + "‾".repeat(inner) + "╲");
-      g.text(x, y + 1, "⟨" + pad(label, w - 2) + "⟩");
-      g.text(x, y + 2, " ╲" + "_".repeat(inner) + "╱");
+      g.text(x, y, ` ╱${"‾".repeat(w - 4)}╲`);
+      g.text(x, y + 1, `⟨${pad(label, w - 2)}⟩`);
+      g.text(x, y + 2, ` ╲${"_".repeat(w - 4)}╱`);
       return;
     }
-    const inner = w - 2;
     const [tl, tr, bl, br] = shape === "box" ? ["┌", "┐", "└", "┘"] : ["╭", "╮", "╰", "╯"];
-    g.text(x, y, tl + "─".repeat(inner) + tr);
-    g.text(x, y + 1, "│" + pad(label, inner) + "│");
-    g.text(x, y + 2, bl + "─".repeat(inner) + br);
+    g.text(x, y, `${tl}${"─".repeat(inner)}${tr}`);
+    g.text(x, y + 1, `│${pad(label, inner)}│`);
+    g.text(x, y + 2, `${bl}${"─".repeat(inner)}${br}`);
   }
 
   function drawRegion(g, d, r) {
@@ -872,11 +1030,15 @@ const diaBits = (() => {
       const busRow = top + 1 + bus.level;
       const xs = [...bus.uppers, ...bus.lowers].map((n) => center(d.nodes[n]));
       const lo = Math.min(...xs), hi = Math.max(...xs);
-      for (let x = lo; x <= hi; x++) g.put(x, busRow, "─");
+      // Whether one of the bus's edges points an arrow head up into shape n.
+      const arrowUp = (n) => bus.edges.some((e) => {
+        const [u, l, au, al] = vertical(d, e);
+        return (u === n && au) || (l === n && al && sameRow(d, e));
+      });
       for (const u of bus.uppers) {
         const x = center(d.nodes[u]);
         for (let y = top; y < busRow; y++) g.put(x, y, "│");
-        if (bus.edges.some((e) => vertical(d, e)[0] === u && vertical(d, e)[2])) g.put(x, top, "▲");
+        if (arrowUp(u)) g.put(x, top, "▲");
       }
       for (const l of bus.lowers) {
         const x = center(d.nodes[l]);
@@ -884,29 +1046,20 @@ const diaBits = (() => {
         const down = bus.edges.some((e) => vertical(d, e)[1] === l && vertical(d, e)[3]);
         g.put(x, arrowRow, down ? "▼" : "│");
       }
-      // Junctions on the bus.
+      // The bus itself, with junctions where lines leave it.
       for (let x = lo; x <= hi; x++) {
-        const above = bus.uppers.some((u) => center(d.nodes[u]) === x);
-        const below = bus.lowers.some((l) => center(d.nodes[l]) === x);
-        const first = x === lo, last = x === hi;
-        let c = null;
-        if (above && below) c = "┼";
-        else if (first && last && (above || below)) c = "│";
-        else if (first && !last && above) c = "└";
-        else if (first && !last && below) c = "┌";
-        else if (!first && last && above) c = "┘";
-        else if (!first && last && below) c = "┐";
-        else if (above) c = "┴";
-        else if (below) c = "┬";
-        if (c) g.put(x, busRow, c);
+        const up = bus.uppers.some((u) => center(d.nodes[u]) === x);
+        const down = bus.lowers.some((l) => center(d.nodes[l]) === x);
+        g.put(x, busRow, lineChar((up ? 1 : 0) | (down ? 2 : 0) | (x > lo ? 4 : 0) | (x < hi ? 8 : 0)));
       }
-      // Labels sit on the segment that belongs to one edge only.
+      // Labels sit on the segment that belongs to one edge only; a loop's label beside
+      // where it leaves its shape.
       for (const e of bus.edges) {
         const label = d.edges[e].label;
         if (label == null) continue;
         const [u, l] = vertical(d, e);
-        const intoL = bus.edges.filter((o) => vertical(d, o)[1] === l).length;
-        if (intoL === 1) g.text(center(d.nodes[l]) + 2, entryRow, label);
+        const intoL = bus.edges.filter((o) => !sameRow(d, o) && vertical(d, o)[1] === l).length;
+        if (!sameRow(d, e) && intoL === 1) g.text(center(d.nodes[l]) + 2, entryRow, label);
         else g.text(center(d.nodes[u]) + 2, top, label);
       }
     }
@@ -920,46 +1073,66 @@ const diaBits = (() => {
     if (arrowLeft) g.put(left.x + left.w, y, "◀");
     if (arrowRight) g.put(right.x - 1, y, "▶");
     if (label != null) {
-      const gap = Math.max(0, right.x - (left.x + left.w));
-      g.text(left.x + left.w + Math.floor(Math.max(0, gap - width(label)) / 2), y - 1, label);
+      // Centred over the line, which is what the gap was widened for; before the channels
+      // when the gap holds some.
+      const [li, ri] = d.nodes[a].x < d.nodes[b].x ? [a, b] : [b, a];
+      const g1 = d.span[li][1];
+      let room = Math.max(0, right.x - (left.x + left.w));
+      if (d.span[ri][0] === g1 && d.gaps[g1].channels > 0) room = d.gaps[g1].lead;
+      const at = left.x + left.w + Math.floor(Math.max(0, room - width(label)) / 2);
+      // Above the line, unless a channel's arm runs there: then below it.
+      let taken = false;
+      for (let x = at; x < at + width(label); x++) if ((g.cells[y - 1][x] ?? " ") !== " ") taken = true;
+      g.text(at, taken ? y + 1 : y - 1, label);
     }
   }
 
-  // An edge routed down (or up) a channel beside the diagram.
+  // An edge that skips rows drawn straight down its empty column; its label sits where a
+  // direct edge's would, on the entry row above the lower shape.
+  function drawThrough(g, d, e) {
+    const [u, l, au, al] = vertical(d, e);
+    const upper = d.nodes[u], lower = d.nodes[l];
+    const x = center(upper);
+    const top = upper.y + upper.h;
+    for (let y = top; y < lower.y; y++) g.put(x, y, "│");
+    if (au) g.put(x, top, "▲");
+    if (al) g.put(x, lower.y - 1, "▼");
+    if (d.edges[e].label != null) g.text(x + 2, lower.y - 2, d.edges[e].label);
+  }
+
+  // An edge routed down (or up) a channel in a gap.
   function drawSide(g, d, route, col) {
     const [u, l, au, al] = vertical(d, route.edge);
     const upper = d.nodes[u], lower = d.nodes[l];
-    const left = route.left;
+    // Whether the channel lies left of each shape: the arms may leave to different sides
+    // when the channel runs between their columns.
+    const upperLeft = gapLeftOf(d, u, route.gap), lowerLeft = gapLeftOf(d, l, route.gap);
     const uy = route.upperCorner ? upper.y + upper.h - 1 : middle(upper);
     const ly = route.lowerCorner ? lower.y : middle(lower);
-    // The arm from the shape to the channel, joined to a box's corner when it starts there
-    // (a diamond's top and bottom rows start with a blank cell before its edge).
-    const arm = (n, y, corner) => {
-      if (left) for (let x = col + 1; x < n.x; x++) g.put(x, y, "─");
-      else for (let x = n.x + n.w; x < col; x++) g.put(x, y, "─");
-      if (!corner) return;
-      if (n.shape === "diamond") { if (left) g.put(n.x, y, "─"); }
-      else g.put(left ? n.x : n.x + n.w - 1, y, corner);
+    // The cell of the shape's outline the arm meets on row y: a diamond's top and bottom
+    // rows are a cell narrower on each side than its middle.
+    const boundary = (n, left, y) => {
+      if (n.shape === "diamond" && y !== middle(n)) return left ? n.x + 1 : n.x + n.w - 2;
+      return left ? n.x : n.x + n.w - 1;
     };
-    arm(upper, uy, route.upperCorner ? "┴" : null);
-    arm(lower, ly, route.lowerCorner ? "┬" : null);
-    if (uy === ly) {
-      // Same row, not neighbours: loop out and back on the row below.
-      g.put(col, uy, "┐");
-      g.put(col, uy + 1, "│");
-      g.put(col, uy + 2, "┘");
-      return;
-    }
+    // The arm from the shape to the channel, ending in an arrow head or, when it leaves a
+    // box's corner, joined to it.
+    const arm = (n, left, y, headed, junction) => {
+      const edge = boundary(n, left, y);
+      if (left) for (let x = col + 1; x < edge; x++) g.put(x, y, "─");
+      else for (let x = edge + 1; x < col; x++) g.put(x, y, "─");
+      if (headed) g.put(left ? edge - 1 : edge + 1, y, left ? "▶" : "◀");
+      else if (y !== middle(n) && n.shape !== "diamond") g.set(edge, y, junction);
+    };
+    arm(upper, upperLeft, uy, au, "┴");
+    arm(lower, lowerLeft, ly, al, "┬");
     for (let y = uy + 1; y < ly; y++) g.put(col, y, "│");
-    g.put(col, uy, left ? "┌" : "┐");
-    g.put(col, ly, left ? "└" : "┘");
-    const head = (n, y) => { if (left) g.put(n.x - 1, y, "▶"); else g.put(n.x + n.w, y, "◀"); };
-    if (au) head(upper, uy);
-    if (al) head(lower, ly);
+    g.put(col, uy, upperLeft ? "┌" : "┐");
+    g.put(col, ly, lowerLeft ? "└" : "┘");
     const label = d.edges[route.edge].label;
     if (label != null) {
       const y = Math.floor((uy + ly) / 2);
-      if (left) g.text(col - 1 - width(label), y, label);
+      if (route.gap === 0) g.text(col - 1 - width(label), y, label);
       else g.text(col + 2, y, label);
     }
   }

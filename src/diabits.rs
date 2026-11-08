@@ -92,6 +92,47 @@ struct Diagram {
     /// For each row: `Some(slot count)` when the line used empty slots (`,, z(End)`) to put
     /// shapes in explicit columns; `None` when its shapes spread over the columns.
     explicit: Vec<Option<usize>>,
+    // The rest is set by `layout`.
+    /// How many columns the grid has.
+    columns: usize,
+    /// The columns each shape spans: the first and one past the last.
+    span: Vec<(usize, usize)>,
+    /// Lines that skip rows but run straight down the empty cells of their column.
+    through: Vec<bool>,
+    /// Lines routed down a channel in a gap.
+    routes: Vec<Route>,
+    /// The gaps a line can run down: gap 0 is left of the first column, gap `columns` right
+    /// of the last, and gap `g` between columns `g - 1` and `g`.
+    gaps: Vec<Gap>,
+    /// Rows of text the diagram takes.
+    height: usize,
+}
+
+/// A line routed down a channel in a gap between columns or beside the diagram.
+#[derive(Clone, Copy, Debug)]
+struct Route {
+    edge: usize,
+    gap: usize,
+    /// Which channel of that gap, counting out from the shapes (on the left) or from the
+    /// left edge of the gap.
+    channel: usize,
+    /// An end without an arrow head attaches at the shape's corner (the bottom corner of
+    /// the upper shape, the top corner of the lower one) instead of the middle of its side,
+    /// because another line's arrow head arrives at that side of the shape.
+    upper_corner: bool,
+    lower_corner: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Gap {
+    /// Channels in use and the widest label on them.
+    channels: usize,
+    label: usize,
+    /// Where it starts and how wide it is.
+    x: usize,
+    width: usize,
+    /// Columns at its start kept for the label of a line drawn along a row across it.
+    lead: usize,
 }
 
 /// Columns between shapes on the same row.
@@ -125,18 +166,6 @@ fn kind(source: &str) -> Result<Kind, String> {
         });
     }
     Ok(kind.unwrap_or(Kind::Flowchart))
-}
-
-/// Whether an edge is routed down a channel on the right instead of between its rows:
-/// edges that skip rows, edges between non-neighbouring shapes of one row, and edges that
-/// point back up (or both ways) without lining up, which would be ambiguous on a shared bus.
-fn goes_sideways(d: &Diagram, e: usize) -> bool {
-    let (u, l, au, _) = d.edges[e].vertical(&d.nodes);
-    let (ru, rl) = (d.nodes[u].row, d.nodes[l].row);
-    if ru == rl {
-        return !neighbours(d, u, l);
-    }
-    rl > ru + 1 || (au && d.nodes[u].center() != d.nodes[l].center())
 }
 
 /// Render a diaBits block to text lines, or explain what is wrong with it.
@@ -258,6 +287,12 @@ fn parse(source: &str) -> Result<Diagram, String> {
         edges,
         rows,
         explicit,
+        columns: 0,
+        span: Vec::new(),
+        through: Vec::new(),
+        routes: Vec::new(),
+        gaps: Vec::new(),
+        height: 0,
     })
 }
 
@@ -291,6 +326,76 @@ fn shape_width(shape: Shape, label: &str) -> usize {
 
 // ----- layout -------------------------------------------------------------------------
 
+/// Whether an edge asks for a channel in a gap rather than a bus between its rows: edges
+/// that skip rows (unless they can go straight through), and edges that point back up (or
+/// both ways) without lining up, which would be ambiguous on a shared bus. Edges along a
+/// row are never routed: neighbours join directly and others loop under the row.
+fn wants_channel(d: &Diagram, e: usize) -> bool {
+    let (u, l, au, _) = d.edges[e].vertical(&d.nodes);
+    let (ru, rl) = (d.nodes[u].row, d.nodes[l].row);
+    if ru == rl {
+        return false;
+    }
+    (rl > ru + 1 && !d.through[e]) || (au && d.nodes[u].center() != d.nodes[l].center())
+}
+
+/// The rows of the two ends of an edge, top one first.
+fn edge_rows(d: &Diagram, e: usize) -> (usize, usize) {
+    let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
+    (d.nodes[u].row, d.nodes[l].row)
+}
+
+/// The leftmost and rightmost centre column of the two ends of an edge.
+fn edge_extent(d: &Diagram, e: usize) -> (usize, usize) {
+    let (a, b) = (
+        d.nodes[d.edges[e].from].center(),
+        d.nodes[d.edges[e].to].center(),
+    );
+    (a.min(b), a.max(b))
+}
+
+/// Whether an edge that skips rows is drawn straight down instead of round a channel: its
+/// ends sit in the same columns, no shape on the rows between touches those columns, and
+/// no line drawn between those rows crosses or shares the column (that would need a
+/// junction).
+fn goes_through(d: &Diagram, e: usize) -> bool {
+    let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
+    let (ru, rl) = (d.nodes[u].row, d.nodes[l].row);
+    if rl <= ru + 1 || d.span[u] != d.span[l] {
+        return false;
+    }
+    let (c0, c1) = d.span[u];
+    let x = d.nodes[u].center();
+    let blocked = d
+        .nodes
+        .iter()
+        .zip(&d.span)
+        .any(|(n, &(m0, m1))| n.row > ru && n.row < rl && m0 < c1 && c0 < m1);
+    if blocked {
+        return false;
+    }
+    !(0..d.edges.len()).any(|f| {
+        if f == e {
+            return false;
+        }
+        let (fu, fl, _, _) = d.edges[f].vertical(&d.nodes);
+        let (ra, rb) = (d.nodes[fu].row, d.nodes[fl].row);
+        let between = if rb > ra + 1 {
+            // Skipping lines run through their own column or down a channel.
+            false
+        } else if ra < rb {
+            ru <= ra && rb <= rl
+        } else if neighbours(d, fu, fl) {
+            ru < ra && ra < rl
+        } else {
+            // A loop under row `ra` lives in the region below it.
+            ru <= ra && ra < rl
+        };
+        let (lo, hi) = edge_extent(d, f);
+        between && lo <= x && x <= hi
+    })
+}
+
 fn layout(d: &mut Diagram) {
     for node in &mut d.nodes {
         node.w = shape_width(node.shape, &node.label);
@@ -307,7 +412,8 @@ fn layout(d: &mut Diagram) {
         .map(|(row, explicit)| explicit.unwrap_or(row.len()))
         .max()
         .unwrap_or(1);
-    let node_span: Vec<(usize, usize)> = d
+    d.columns = columns;
+    d.span = d
         .nodes
         .iter()
         .map(|n| match d.explicit[n.row] {
@@ -325,79 +431,80 @@ fn layout(d: &mut Diagram) {
     let mut widths = vec![0usize; columns];
     // The gap between two columns widens to fit the label of a line drawn across it.
     let mut gaps = vec![ROW_GAP; columns.saturating_sub(1)];
+    let mut leads = vec![0usize; columns.saturating_sub(1)];
     for e in &d.edges {
         let (a, b) = (&d.nodes[e.from], &d.nodes[e.to]);
         let Some(label) = &e.label else { continue };
-        if a.row != b.row {
+        if a.row != b.row || !neighbours(d, e.from, e.to) {
             continue;
         }
-        let row = &d.rows[a.row];
-        let (Some(ia), Some(ib)) = (
-            row.iter().position(|&n| n == e.from),
-            row.iter().position(|&n| n == e.to),
-        ) else {
-            continue;
-        };
-        if ia.abs_diff(ib) != 1 {
-            continue;
-        }
-        let (left, right) = if ia < ib {
+        let (left, right) = if d.span[e.from].0 < d.span[e.to].0 {
             (e.from, e.to)
         } else {
             (e.to, e.from)
         };
-        let (_, c1) = node_span[left];
-        if node_span[right].0 == c1
-            && let Some(gap) = gaps.get_mut(c1 - 1)
+        let (_, c1) = d.span[left];
+        if d.span[right].0 == c1
+            && let Some(lead) = leads.get_mut(c1 - 1)
         {
-            *gap = (*gap).max(label.width() + 2);
+            *lead = (*lead).max(label.width() + 2);
+            gaps[c1 - 1] = gaps[c1 - 1].max(*lead);
         }
     }
     let gap_sum = |gaps: &[usize], c0: usize, c1: usize| gaps[c0..c1 - 1].iter().sum::<usize>();
     // Single-column shapes set the column widths; wider spanning shapes stretch their span.
-    for row in &d.rows {
-        for &n in row {
-            let (c0, c1) = node_span[n];
-            if c1 - c0 == 1 {
-                widths[c0] = widths[c0].max(d.nodes[n].w);
+    for (n, &(c0, c1)) in d.span.iter().enumerate() {
+        if c1 - c0 == 1 {
+            widths[c0] = widths[c0].max(d.nodes[n].w);
+        }
+    }
+    for (n, &(c0, c1)) in d.span.iter().enumerate() {
+        let have = widths[c0..c1].iter().sum::<usize>() + gap_sum(&gaps, c0, c1);
+        if d.nodes[n].w > have {
+            let extra = d.nodes[n].w - have;
+            let each = extra.div_ceil(c1 - c0);
+            for w in &mut widths[c0..c1] {
+                *w += each;
             }
         }
     }
-    for row in &d.rows {
-        for &n in row {
-            let (c0, c1) = node_span[n];
-            let have = widths[c0..c1].iter().sum::<usize>() + gap_sum(&gaps, c0, c1);
-            if d.nodes[n].w > have {
-                let extra = d.nodes[n].w - have;
-                let each = extra.div_ceil(c1 - c0);
-                for w in &mut widths[c0..c1] {
-                    *w += each;
-                }
-            }
+    // Place the shapes, `margin` columns in: by centre, not by left edge, so shapes of
+    // different widths in one column share the same centre column exactly. Also notes where
+    // each gap starts.
+    let place = |d: &mut Diagram, widths: &[usize], gaps: &[usize], margin: usize| {
+        let mut starts = Vec::with_capacity(columns);
+        let mut x = margin;
+        for (c, w) in widths.iter().enumerate() {
+            starts.push(x);
+            x += w + gaps.get(c).copied().unwrap_or(0);
         }
-    }
-    let mut starts = Vec::with_capacity(columns);
-    let mut x = 0;
-    for (c, w) in widths.iter().enumerate() {
-        starts.push(x);
-        x += w + gaps.get(c).copied().unwrap_or(0);
-    }
-    for row in &d.rows {
-        for &n in row {
-            let (c0, c1) = node_span[n];
-            let left = starts[c0];
-            let total = widths[c0..c1].iter().sum::<usize>() + gap_sum(&gaps, c0, c1);
-            // Place by centre, not by left edge, so shapes of different widths in one
-            // column share the same centre column exactly.
-            let centre = left + total / 2;
+        for (n, &(c0, c1)) in d.span.iter().enumerate() {
+            let total = widths[c0..c1].iter().sum::<usize>() + gap_sum(gaps, c0, c1);
+            let centre = starts[c0] + total / 2;
             d.nodes[n].x = centre - d.nodes[n].w / 2;
         }
+        d.gaps[0].x = 0;
+        d.gaps[0].width = margin;
+        for g in 1..columns {
+            d.gaps[g].x = starts[g - 1] + widths[g - 1];
+            d.gaps[g].width = gaps[g - 1];
+        }
+        d.gaps[columns].x = starts[columns - 1] + widths[columns - 1];
+    };
+    d.gaps = vec![Gap::default(); columns + 1];
+    for g in 1..columns {
+        d.gaps[g].lead = leads[g - 1];
     }
-    // Lines routed down the left side need a margin for their channels.
-    let margin = side_plan(d).left_margin();
-    for n in &mut d.nodes {
-        n.x += margin;
+    place(d, &widths, &gaps, 0);
+    // With the shapes in place, decide how each line runs, then make room for the channels:
+    // the gaps they use widen, and the shapes move right of the channels on the left.
+    d.through = (0..d.edges.len()).map(|e| goes_through(d, e)).collect();
+    channel_plan(d);
+    for g in 1..columns {
+        gaps[g - 1] = gaps[g - 1].max(gap_width(d.gaps[g], g, columns));
     }
+    place(d, &widths, &gaps, gap_width(d.gaps[0], 0, columns));
+    d.gaps[columns].width = gap_width(d.gaps[columns], columns, columns);
     // Vertical positions: each gap between rows is as tall as its edges need.
     let mut y = 0;
     for r in 0..d.rows.len() {
@@ -405,13 +512,265 @@ fn layout(d: &mut Diagram) {
             d.nodes[n].y = y;
         }
         y += 3;
-        if r + 1 < d.rows.len() {
+        if r + 1 < region_count(d) + 1 {
             y += region_plan(d, r).height;
         }
     }
+    d.height = y;
+}
+
+/// Columns a gap needs for its channels: outside the shapes a channel sits two columns out
+/// from them, with its label beyond it (on the left, before it); between columns a channel
+/// keeps a column clear on each side, after the room kept for labels along the rows.
+fn gap_width(gap: Gap, g: usize, columns: usize) -> usize {
+    if gap.channels == 0 {
+        return 0;
+    }
+    let step = 3 + gap.label;
+    let more = (gap.channels - 1) * step;
+    if g == 0 {
+        3 + more + if gap.label > 0 { gap.label + 2 } else { 0 }
+    } else if g == columns {
+        3 + more + gap.label
+    } else {
+        gap.lead + 4 + more + if gap.label > 0 { gap.label + 1 } else { 0 }
+    }
+}
+
+/// The column a route's channel runs down.
+fn channel_x(d: &Diagram, route: &Route) -> usize {
+    let gap = d.gaps[route.gap];
+    let step = 3 + gap.label;
+    if route.gap == 0 {
+        gap.x + gap.width - 3 - route.channel * step
+    } else {
+        gap.x + gap.lead + 2 + route.channel * step
+    }
+}
+
+/// Whether gap `g` lies left of shape `n`.
+fn gap_left_of(d: &Diagram, n: usize, g: usize) -> bool {
+    g <= d.span[n].0
+}
+
+/// Regions between rows, plus one under the last row when a line loops under it.
+fn region_count(d: &Diagram) -> usize {
+    let last = d.rows.len() - 1;
+    let loops = d.rows[last].iter().any(|&n| {
+        d.edges.iter().any(|e| {
+            (e.from == n || e.to == n)
+                && d.nodes[e.from].row == d.nodes[e.to].row
+                && !neighbours(d, e.from, e.to)
+        })
+    });
+    last + usize::from(loops)
+}
+
+/// Plan the lines that run down channels. A line may use a gap it can reach from both its
+/// shapes along their rows without crossing another shape, and that no shape on the rows
+/// between spans. Among those it takes the gap where it crosses the fewest lines (lines
+/// placed before it, lines along the rows it passes, buses between them), the rightmost
+/// when it makes no difference; the longest lines pick first so the shorter ones nest
+/// around them. In a gap it takes the innermost channel no line sharing any of its rows is
+/// using, so lines that share no rows share a channel. When no gap is clear a skipping line
+/// takes the least blocked one anyway; a back edge between neighbouring rows stays on a bus.
+fn channel_plan(d: &mut Diagram) {
+    let gaps = d.columns + 1;
+    let crosses = |e: usize, f: usize| {
+        let ((a, b), (c, dd)) = (edge_rows(d, e), edge_rows(d, f));
+        (a < c && c < b && b < dd) || (c < a && a < dd && dd < b)
+    };
+    let overlaps = |e: usize, f: usize| {
+        let ((a, b), (c, dd)) = (edge_rows(d, e), edge_rows(d, f));
+        !(b < c || dd < a)
+    };
+    // Whether edge `e` has an arrow head at shape `n`.
+    let headed = |e: usize, n: usize| {
+        let (u, l, au, al) = d.edges[e].vertical(&d.nodes);
+        (u == n && au) || (l == n && al)
+    };
+    // Shapes crossed along its row to reach gap `g` from shape `n`.
+    let arm_blocks = |n: usize, g: usize| -> usize {
+        let (c0, c1) = d.span[n];
+        if c0 < g && g < c1 {
+            return 100;
+        }
+        d.rows[d.nodes[n].row]
+            .iter()
+            .filter(|&&m| m != n)
+            .filter(|&&m| {
+                let (m0, m1) = d.span[m];
+                if g <= c0 {
+                    m0 < c0 && m1 > g
+                } else {
+                    m1 > c1 && m0 < g
+                }
+            })
+            .count()
+    };
+    // Shapes on the rows between the ends of `e` that span gap `g`.
+    let drop_blocks = |e: usize, g: usize| -> usize {
+        let (ru, rl) = edge_rows(d, e);
+        d.nodes
+            .iter()
+            .zip(&d.span)
+            .filter(|&(n, &(m0, m1))| n.row > ru && n.row < rl && m0 < g && g < m1)
+            .count()
+    };
+    let blocks = |e: usize, g: usize| {
+        let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
+        arm_blocks(u, g) + arm_blocks(l, g) + drop_blocks(e, g)
+    };
+    // Lines not routed through channels that a channel in gap `g` between the rows of `e`
+    // would cross: a line along a row between them (2), or along one of its own rows,
+    // which it joins instead (1); a bus between two rows in its range (2).
+    let line_crossings = |e: usize, g: usize| -> usize {
+        let (ru, rl) = edge_rows(d, e);
+        (0..d.edges.len())
+            .filter(|&f| f != e)
+            .map(|f| {
+                let (fu, fl, _, _) = d.edges[f].vertical(&d.nodes);
+                let (ra, rb) = (d.nodes[fu].row, d.nodes[fl].row);
+                if ra == rb && !neighbours(d, fu, fl) {
+                    // A loop under row `ra` runs across the region below it.
+                    let (lo, hi) = edge_extent(d, f);
+                    let x = d.gaps[g].x;
+                    usize::from(ru <= ra && ra < rl && lo < x && x <= hi) * 2
+                } else if ra == rb {
+                    if ra < ru || ra > rl {
+                        return 0;
+                    }
+                    let (left, right) = if d.span[fu].0 < d.span[fl].0 {
+                        (fu, fl)
+                    } else {
+                        (fl, fu)
+                    };
+                    if d.span[left].1 <= g && g <= d.span[right].0 {
+                        if ra == ru || ra == rl { 1 } else { 2 }
+                    } else {
+                        0
+                    }
+                } else if rb == ra + 1 && ru <= ra && rb <= rl && !wants_channel(d, f) {
+                    let (lo, hi) = edge_extent(d, f);
+                    let x = d.gaps[g].x;
+                    usize::from(lo < x && x <= hi) * 2
+                } else {
+                    0
+                }
+            })
+            .sum()
+    };
+    let mut side: Vec<usize> = (0..d.edges.len())
+        .filter(|&e| wants_channel(d, e))
+        .collect();
+    // Longest lines pick their gap first: the shorter ones then nest around them. Meeting
+    // another line at a shape counts for less than crossing one.
+    side.sort_by_key(|&e| {
+        let (a, b) = edge_rows(d, e);
+        std::cmp::Reverse(b - a)
+    });
+    let mut gap_of: Vec<Option<usize>> = vec![None; d.edges.len()];
+    for &e in &side {
+        let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
+        let (ru, rl) = edge_rows(d, e);
+        let cost = |g: usize| {
+            let placed: usize = gap_of
+                .iter()
+                .enumerate()
+                .filter_map(|(f, gf)| gf.map(|gf| (f, gf)))
+                .map(|(f, gf)| {
+                    let (fu, fl, _, _) = d.edges[f].vertical(&d.nodes);
+                    // Shapes where one line arrives with an arrow head and the other just
+                    // leaves, both from the same side: they would meet at one point.
+                    let meets = [u, l]
+                        .iter()
+                        .filter(|&&n| {
+                            (n == fu || n == fl)
+                                && gap_left_of(d, n, g) == gap_left_of(d, n, gf)
+                                && headed(e, n) != headed(f, n)
+                        })
+                        .count();
+                    2 * usize::from(gf == g && crosses(e, f)) + meets
+                })
+                .sum();
+            100 * blocks(e, g) + placed + line_crossings(e, g)
+        };
+        let best = (0..gaps)
+            .map(|g| (cost(g), g))
+            .min_by_key(|&(c, g)| (c, std::cmp::Reverse(g)));
+        let Some((cost, g)) = best else { continue };
+        // A back edge between neighbouring rows is clearer on a bus than through a shape.
+        if cost >= 100 && rl == ru + 1 {
+            continue;
+        }
+        gap_of[e] = Some(g);
+    }
+    side.retain(|&e| gap_of[e].is_some());
+    side.sort_by_key(|&e| {
+        let (a, b) = edge_rows(d, e);
+        b - a
+    });
+    let mut routes: Vec<Route> = Vec::new();
+    for &e in &side {
+        let gap = gap_of[e].unwrap_or(0);
+        let mut channel = 0;
+        while routes
+            .iter()
+            .any(|r| r.gap == gap && r.channel == channel && overlaps(e, r.edge))
+        {
+            channel += 1;
+        }
+        routes.push(Route {
+            edge: e,
+            gap,
+            channel,
+            upper_corner: false,
+            lower_corner: false,
+        });
+    }
+    // Whether some other line arrives at that side of shape `n` with an arrow head.
+    let headed_at = |routes: &[Route], i: usize, n: usize| {
+        routes.iter().enumerate().any(|(j, r)| {
+            j != i
+                && gap_left_of(d, n, r.gap) == gap_left_of(d, n, routes[i].gap)
+                && headed(r.edge, n)
+        })
+    };
+    // Whether a line along the row joins shape `n` on the side of gap `g`.
+    let row_line_at = |n: usize, g: usize| {
+        d.edges.iter().any(|f| {
+            let m = if f.from == n {
+                f.to
+            } else if f.to == n {
+                f.from
+            } else {
+                return false;
+            };
+            d.nodes[m].row == d.nodes[n].row
+                && neighbours(d, n, m)
+                && (d.span[m].0 < d.span[n].0) == gap_left_of(d, n, g)
+        })
+    };
+    for i in 0..routes.len() {
+        let (u, l, au, al) = d.edges[routes[i].edge].vertical(&d.nodes);
+        let g = routes[i].gap;
+        routes[i].upper_corner = row_line_at(u, g) || (!au && headed_at(&routes, i, u));
+        routes[i].lower_corner = row_line_at(l, g) || (!al && headed_at(&routes, i, l));
+    }
+    routes.sort_by_key(|r| r.edge);
+    for g in 0..gaps {
+        let mine = routes.iter().filter(|r| r.gap == g);
+        d.gaps[g].channels = mine.clone().map(|r| r.channel + 1).max().unwrap_or(0);
+        d.gaps[g].label = mine
+            .filter_map(|r| d.edges[r.edge].label.as_deref().map(UnicodeWidthStr::width))
+            .max()
+            .unwrap_or(0);
+    }
+    d.routes = routes;
 }
 
 /// A bus: a horizontal line between two rows joining a set of upper nodes to lower nodes.
+/// A line along a row that skips a shape is a bus too: down from both shapes and across.
 struct Bus {
     uppers: Vec<usize>,
     lowers: Vec<usize>,
@@ -428,12 +787,23 @@ struct RegionPlan {
     height: usize,
 }
 
-/// Plan the edges between row `r` and row `r + 1`.
+fn same_row(d: &Diagram, e: usize) -> bool {
+    d.nodes[d.edges[e].from].row == d.nodes[d.edges[e].to].row
+}
+
+/// Plan the edges between row `r` and row `r + 1`: the edges joining the rows that are not
+/// routed down a channel, and the loops under row `r`.
 fn region_plan(d: &Diagram, r: usize) -> RegionPlan {
+    let routed = |e: usize| d.routes.iter().any(|route| route.edge == e);
     let edges: Vec<usize> = (0..d.edges.len())
         .filter(|&e| {
             let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
-            d.nodes[u].row == r && d.nodes[l].row == r + 1 && !goes_sideways(d, e)
+            let (ru, rl) = (d.nodes[u].row, d.nodes[l].row);
+            if ru == rl {
+                ru == r && !neighbours(d, u, l)
+            } else {
+                ru == r && rl == r + 1 && !routed(e)
+            }
         })
         .collect();
     // Union-find over the nodes the edges touch, so fan-outs and merges share a bus.
@@ -464,7 +834,7 @@ fn region_plan(d: &Diagram, r: usize) -> RegionPlan {
     let mut direct = Vec::new();
     let mut buses: Vec<Bus> = Vec::new();
     for group in groups.into_values() {
-        if group.len() == 1 {
+        if group.len() == 1 && !same_row(d, group[0]) {
             let (u, l, _, _) = d.edges[group[0]].vertical(&d.nodes);
             if d.nodes[u].center() == d.nodes[l].center() {
                 direct.push(group[0]);
@@ -478,8 +848,13 @@ fn region_plan(d: &Diagram, r: usize) -> RegionPlan {
             if !uppers.contains(&u) {
                 uppers.push(u);
             }
-            if !lowers.contains(&l) {
-                lowers.push(l);
+            let ends = if same_row(d, e) {
+                &mut uppers
+            } else {
+                &mut lowers
+            };
+            if !ends.contains(&l) {
+                ends.push(l);
             }
         }
         buses.push(Bus {
@@ -514,10 +889,21 @@ fn region_plan(d: &Diagram, r: usize) -> RegionPlan {
         levels = levels.max(level + 1);
         placed.push((level, lo, hi));
     }
-    let labelled = edges.iter().any(|&e| d.edges[e].label.is_some());
-    let two_way = edges.iter().any(|&e| {
-        let (_, _, au, _) = d.edges[e].vertical(&d.nodes);
-        au
+    // Lines passing straight through from further up end or start here too.
+    let ends_here = |e: usize| {
+        let (ru, rl) = edge_rows(d, e);
+        rl == r + 1 && (ru == r || d.through[e])
+    };
+    let starts_here = |e: usize| {
+        let (ru, rl) = edge_rows(d, e);
+        ru == r && (rl == r + 1 || d.through[e])
+    };
+    let labelled = (0..d.edges.len())
+        .any(|e| (edges.contains(&e) || ends_here(e)) && d.edges[e].label.is_some());
+    // An arrow head pointing up into a shape of row `r`.
+    let two_way = (0..d.edges.len()).any(|e| {
+        let (_, _, au, al) = d.edges[e].vertical(&d.nodes);
+        (edges.contains(&e) && (au || (same_row(d, e) && al))) || (starts_here(e) && au)
     });
     // Rows: exit (│ or ▲), bus rows, entry (│ label), arrow (▼ or │). Direct unlabelled
     // edges only need the exit and arrow rows; an upward arrow head needs its own row.
@@ -528,197 +914,15 @@ fn region_plan(d: &Diagram, r: usize) -> RegionPlan {
     if two_way {
         height = height.max(3);
     }
+    // Under the last row only loops are drawn: the exit row and the bus rows.
+    if r + 1 == d.rows.len() {
+        height = levels + 1;
+    }
     RegionPlan {
         direct,
         buses,
         levels,
         height,
-    }
-}
-
-// ----- side channels ------------------------------------------------------------------
-
-/// A line routed down a channel beside the diagram.
-#[derive(Clone, Copy, Debug)]
-struct Route {
-    edge: usize,
-    left: bool,
-    /// Which channel on that side, counting out from the shapes.
-    channel: usize,
-    /// An end without an arrow head attaches at the shape's corner (the bottom corner of
-    /// the upper shape, the top corner of the lower one) instead of the middle of its side,
-    /// because another line's arrow head arrives at that side of the shape.
-    upper_corner: bool,
-    lower_corner: bool,
-}
-
-struct SidePlan {
-    routes: Vec<Route>,
-    /// Channels and widest label on each side.
-    left_channels: usize,
-    right_channels: usize,
-    left_label: usize,
-    right_label: usize,
-}
-
-impl SidePlan {
-    /// Columns the shapes move right to make room for the channels on the left.
-    fn left_margin(&self) -> usize {
-        if self.left_channels == 0 {
-            return 0;
-        }
-        let labels = if self.left_label > 0 {
-            self.left_label + 2
-        } else {
-            0
-        };
-        3 + (self.left_channels - 1) * (3 + self.left_label) + labels
-    }
-
-    /// Column of channel `k` on the left (`margin` as `left_margin`) or the right of a
-    /// diagram whose shapes end at `content`.
-    fn column(&self, route: &Route, margin: usize, content: usize) -> usize {
-        if route.left {
-            margin - 3 - route.channel * (3 + self.left_label)
-        } else {
-            content + 2 + route.channel * (3 + self.right_label)
-        }
-    }
-
-    fn width(&self, margin: usize, content: usize) -> usize {
-        if self.right_channels == 0 {
-            return content;
-        }
-        let outermost = Route {
-            edge: 0,
-            left: false,
-            channel: self.right_channels - 1,
-            upper_corner: false,
-            lower_corner: false,
-        };
-        self.column(&outermost, margin, content) + 1 + self.right_label
-    }
-}
-
-/// Plan the lines that run down the sides. Each takes the side where it crosses fewer of
-/// the lines placed before it (the right when it makes no difference; a line between two
-/// shapes of one row always the right), then the innermost channel on that side no line
-/// sharing any of its rows is using — so a line nests inside the longer ones around it,
-/// and lines that share no rows share a channel.
-fn side_plan(d: &Diagram) -> SidePlan {
-    let rows = |e: usize| {
-        let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
-        (d.nodes[u].row, d.nodes[l].row)
-    };
-    let crosses = |e: usize, f: usize| {
-        let ((a, b), (c, dd)) = (rows(e), rows(f));
-        (a < c && c < b && b < dd) || (c < a && a < dd && dd < b)
-    };
-    let overlaps = |e: usize, f: usize| {
-        let ((a, b), (c, dd)) = (rows(e), rows(f));
-        !(b < c || dd < a)
-    };
-    let mut side: Vec<usize> = (0..d.edges.len())
-        .filter(|&e| goes_sideways(d, e))
-        .collect();
-    // Whether edge `e` has an arrow head at shape `n`.
-    let headed = |e: usize, n: usize| {
-        let (u, l, au, al) = d.edges[e].vertical(&d.nodes);
-        (u == n && au) || (l == n && al)
-    };
-    // Shapes where one of the edges arrives with an arrow head and the other just leaves:
-    // on one side they would meet at the same point.
-    let conflicts = |e: usize, f: usize| {
-        let (u, l, _, _) = d.edges[e].vertical(&d.nodes);
-        let (fu, fl, _, _) = d.edges[f].vertical(&d.nodes);
-        [u, l]
-            .iter()
-            .filter(|&&n| (n == fu || n == fl) && headed(e, n) != headed(f, n))
-            .count()
-    };
-    // Longest lines pick their side first: the shorter ones then nest around them. Meeting
-    // another line at a shape counts for less than crossing one.
-    side.sort_by_key(|&e| {
-        let (a, b) = rows(e);
-        std::cmp::Reverse(b - a)
-    });
-    let mut left_of = vec![false; d.edges.len()];
-    let mut placed: Vec<usize> = Vec::new();
-    for &e in &side {
-        let (a, b) = rows(e);
-        if a != b {
-            let cost = |left: bool| {
-                placed
-                    .iter()
-                    .filter(|&&f| left_of[f] == left)
-                    .map(|&f| 2 * usize::from(crosses(e, f)) + conflicts(e, f))
-                    .sum::<usize>()
-            };
-            left_of[e] = cost(true) < cost(false);
-        }
-        placed.push(e);
-    }
-    side.sort_by_key(|&e| {
-        let (a, b) = rows(e);
-        b - a
-    });
-    let mut routes: Vec<Route> = Vec::new();
-    for &e in &side {
-        let left = left_of[e];
-        let mut channel = 0;
-        while routes
-            .iter()
-            .any(|r| r.left == left && r.channel == channel && overlaps(e, r.edge))
-        {
-            channel += 1;
-        }
-        routes.push(Route {
-            edge: e,
-            left,
-            channel,
-            upper_corner: false,
-            lower_corner: false,
-        });
-    }
-    // Whether some other line on that side arrives at shape `n` with an arrow head.
-    let headed_at = |routes: &[Route], i: usize, n: usize| {
-        routes.iter().enumerate().any(|(j, r)| {
-            let (c, dd) = rows(r.edge);
-            j != i && r.left == routes[i].left && c != dd && headed(r.edge, n)
-        })
-    };
-    for i in 0..routes.len() {
-        let (u, l, au, al) = d.edges[routes[i].edge].vertical(&d.nodes);
-        let (a, b) = rows(routes[i].edge);
-        if a == b {
-            continue;
-        }
-        routes[i].upper_corner = !au && headed_at(&routes, i, u);
-        routes[i].lower_corner = !al && headed_at(&routes, i, l);
-    }
-    routes.sort_by_key(|r| r.edge);
-    let label = |left: bool| {
-        routes
-            .iter()
-            .filter(|r| r.left == left)
-            .filter_map(|r| d.edges[r.edge].label.as_deref().map(UnicodeWidthStr::width))
-            .max()
-            .unwrap_or(0)
-    };
-    let channels = |left: bool| {
-        routes
-            .iter()
-            .filter(|r| r.left == left)
-            .map(|r| r.channel + 1)
-            .max()
-            .unwrap_or(0)
-    };
-    SidePlan {
-        left_channels: channels(true),
-        right_channels: channels(false),
-        left_label: label(true),
-        right_label: label(false),
-        routes,
     }
 }
 
@@ -728,6 +932,41 @@ struct Grid {
     cells: Vec<Vec<char>>,
 }
 
+/// The arms of a line character: up 1, down 2, left 4, right 8.
+fn arms(c: char) -> Option<u8> {
+    Some(match c {
+        '│' => 3,
+        '─' => 12,
+        '┌' => 10,
+        '┐' => 6,
+        '└' => 9,
+        '┘' => 5,
+        '├' => 11,
+        '┤' => 7,
+        '┬' => 14,
+        '┴' => 13,
+        '┼' => 15,
+        _ => return None,
+    })
+}
+
+fn line_char(arms: u8) -> char {
+    match arms {
+        1..=3 => '│',
+        4 | 8 | 12 => '─',
+        10 => '┌',
+        6 => '┐',
+        9 => '└',
+        5 => '┘',
+        11 => '├',
+        7 => '┤',
+        14 => '┬',
+        13 => '┴',
+        15 => '┼',
+        _ => ' ',
+    }
+}
+
 impl Grid {
     fn new(w: usize, h: usize) -> Grid {
         Grid {
@@ -735,10 +974,9 @@ impl Grid {
         }
     }
 
-    /// Place a character, turning a crossing of `─` and `│` into `┼`.
-    fn put(&mut self, x: usize, y: usize, c: char) {
+    fn reach(&mut self, x: usize, y: usize) -> bool {
         if y >= self.cells.len() {
-            return;
+            return false;
         }
         if x >= self.cells[y].len() {
             let extra = x + 1 - self.cells[y].len();
@@ -746,16 +984,30 @@ impl Grid {
                 row.extend(std::iter::repeat_n(' ', extra));
             }
         }
+        true
+    }
+
+    /// Place a character. Two lines meeting in a cell join: a crossing of `─` and `│` is
+    /// `┼`, a line running on through a corner makes a junction. Text, arrow heads and
+    /// shapes overwrite; a line never draws over them.
+    fn put(&mut self, x: usize, y: usize, c: char) {
+        if !self.reach(x, y) {
+            return;
+        }
         let cell = &mut self.cells[y][x];
-        *cell = match (*cell, c) {
-            ('─', '│') | ('│', '─') => '┼',
-            // A line running on through a corner makes a junction.
-            ('┐' | '┌', '─') | ('─', '┐' | '┌') => '┬',
-            ('┘' | '└', '─') | ('─', '┘' | '└') => '┴',
-            (' ', c) => c,
-            (_, c) if c != '─' && c != '│' => c,
-            (old, _) => old,
+        *cell = match (arms(*cell), arms(c)) {
+            (Some(old), Some(new)) => line_char(old | new),
+            _ if *cell == ' ' => c,
+            (_, None) => c,
+            _ => *cell,
         };
+    }
+
+    /// Place a character whatever is there.
+    fn set(&mut self, x: usize, y: usize, c: char) {
+        if self.reach(x, y) {
+            self.cells[y][x] = c;
+        }
     }
 
     fn text(&mut self, x: usize, y: usize, text: &str) {
@@ -775,28 +1027,26 @@ impl Grid {
 }
 
 fn draw(d: &Diagram) -> Vec<String> {
-    let content = d.nodes.iter().map(|n| n.x + n.w).max().unwrap_or(0);
-    let height = d.nodes.iter().map(|n| n.y + n.h).max().unwrap_or(0);
-    // Edges that skip rows, or join non-neighbouring shapes of a row, use channels down
-    // the sides.
-    let plan = side_plan(d);
-    let margin = plan.left_margin();
-    let mut g = Grid::new(plan.width(margin, content), height);
+    let right = d.gaps[d.columns];
+    let mut g = Grid::new(right.x + right.width, d.height);
 
     for n in &d.nodes {
         draw_shape(&mut g, n.x, n.y, n.w, n.shape, &n.label);
     }
-    for r in 0..d.rows.len().saturating_sub(1) {
+    for r in 0..region_count(d) {
         draw_region(&mut g, d, r);
     }
+    for route in &d.routes {
+        draw_side(&mut g, d, route, channel_x(d, route));
+    }
+    // Lines along the rows go last: their labels move out of the way of a channel's arm.
     for e in 0..d.edges.len() {
         let (u, l, au, al) = d.edges[e].vertical(&d.nodes);
         if d.nodes[u].row == d.nodes[l].row && neighbours(d, u, l) {
             draw_same_row(&mut g, d, u, l, au, al, d.edges[e].label.as_deref());
+        } else if d.through[e] {
+            draw_through(&mut g, d, e);
         }
-    }
-    for route in &plan.routes {
-        draw_side(&mut g, d, route, plan.column(route, margin, content));
     }
     g.lines()
 }
@@ -853,7 +1103,7 @@ fn draw_region(g: &mut Grid, d: &Diagram, r: usize) {
     };
 
     for &e in &plan.direct {
-        let (u, l, au, al) = d.edges[e].vertical(&d.nodes);
+        let (u, _, au, al) = d.edges[e].vertical(&d.nodes);
         let x = d.nodes[u].center();
         for y in top..bottom {
             g.put(x, y, '│');
@@ -865,7 +1115,6 @@ fn draw_region(g: &mut Grid, d: &Diagram, r: usize) {
         if let Some(label) = &d.edges[e].label {
             g.text(x + 2, entry_row, label);
         }
-        let _ = l;
     }
 
     for bus in &plan.buses {
@@ -880,19 +1129,19 @@ fn draw_region(g: &mut Grid, d: &Diagram, r: usize) {
             xs.iter().copied().min().unwrap_or(0),
             xs.iter().copied().max().unwrap_or(0),
         );
-        for x in lo..=hi {
-            g.put(x, bus_row, '─');
-        }
+        // Whether one of the bus's edges points an arrow head up into shape `n`.
+        let arrow_up = |n: usize| {
+            bus.edges.iter().any(|&e| {
+                let (u, l, au, al) = d.edges[e].vertical(&d.nodes);
+                (u == n && au) || (l == n && al && same_row(d, e))
+            })
+        };
         for &u in &bus.uppers {
             let x = d.nodes[u].center();
             for y in top..bus_row {
                 g.put(x, y, '│');
             }
-            let arrow_up = bus
-                .edges
-                .iter()
-                .any(|&e| d.edges[e].vertical(&d.nodes).0 == u && d.edges[e].vertical(&d.nodes).2);
-            if arrow_up {
+            if arrow_up(u) {
                 g.put(x, top, '▲');
             }
         }
@@ -907,25 +1156,18 @@ fn draw_region(g: &mut Grid, d: &Diagram, r: usize) {
                 .any(|&e| d.edges[e].vertical(&d.nodes).1 == l && d.edges[e].vertical(&d.nodes).3);
             g.put(x, arrow_row, if arrow_down { '▼' } else { '│' });
         }
-        // Junctions on the bus.
+        // The bus itself, with junctions where lines leave it.
         for x in lo..=hi {
-            let from_above = bus.uppers.iter().any(|&u| d.nodes[u].center() == x);
-            let to_below = bus.lowers.iter().any(|&l| d.nodes[l].center() == x);
-            let c = match (x == lo, x == hi, from_above, to_below) {
-                (_, _, true, true) => '┼',
-                (true, true, true, false) => '│',
-                (true, true, false, true) => '│',
-                (true, false, true, false) => '└',
-                (true, false, false, true) => '┌',
-                (false, true, true, false) => '┘',
-                (false, true, false, true) => '┐',
-                (_, _, true, false) => '┴',
-                (_, _, false, true) => '┬',
-                _ => continue,
-            };
-            g.put(x, bus_row, c);
+            let up = bus.uppers.iter().any(|&u| d.nodes[u].center() == x);
+            let down = bus.lowers.iter().any(|&l| d.nodes[l].center() == x);
+            let arms = u8::from(up)
+                | (u8::from(down) << 1)
+                | (u8::from(x > lo) << 2)
+                | (u8::from(x < hi) << 3);
+            g.put(x, bus_row, line_char(arms));
         }
-        // Labels sit on the segment that belongs to one edge only.
+        // Labels sit on the segment that belongs to one edge only; a loop's label beside
+        // where it leaves its shape.
         for &e in &bus.edges {
             let Some(label) = &d.edges[e].label else {
                 continue;
@@ -934,9 +1176,9 @@ fn draw_region(g: &mut Grid, d: &Diagram, r: usize) {
             let into_l = bus
                 .edges
                 .iter()
-                .filter(|&&o| d.edges[o].vertical(&d.nodes).1 == l)
+                .filter(|&&o| !same_row(d, o) && d.edges[o].vertical(&d.nodes).1 == l)
                 .count();
-            if into_l == 1 {
+            if !same_row(d, e) && into_l == 1 {
                 g.text(d.nodes[l].center() + 2, entry_row, label);
             } else {
                 g.text(d.nodes[u].center() + 2, top, label);
@@ -970,18 +1212,54 @@ fn draw_same_row(
         g.put(right.x - 1, y, '▶');
     }
     if let Some(label) = label {
-        // Centred over the line, which is what the gap was widened for.
-        let gap = right.x.saturating_sub(left.x + left.w);
-        let at = left.x + left.w + gap.saturating_sub(label.width()) / 2;
-        g.text(at, y - 1, label);
+        // Centred over the line, which is what the gap was widened for; before the channels
+        // when the gap holds some.
+        let (li, ri) = if d.nodes[a].x < d.nodes[b].x {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let g1 = d.span[li].1;
+        let mut room = right.x.saturating_sub(left.x + left.w);
+        if d.span[ri].0 == g1 && d.gaps[g1].channels > 0 {
+            room = d.gaps[g1].lead;
+        }
+        let at = left.x + left.w + room.saturating_sub(label.width()) / 2;
+        // Above the line, unless a channel's arm runs there: then below it.
+        let taken =
+            (at..at + label.width()).any(|x| g.cells[y - 1].get(x).is_some_and(|&c| c != ' '));
+        g.text(at, if taken { y + 1 } else { y - 1 }, label);
     }
 }
 
-/// An edge routed down (or up) a channel beside the diagram.
+/// An edge that skips rows drawn straight down its empty column; its label sits where a
+/// direct edge's would, on the entry row above the lower shape.
+fn draw_through(g: &mut Grid, d: &Diagram, e: usize) {
+    let (u, l, au, al) = d.edges[e].vertical(&d.nodes);
+    let (upper, lower) = (&d.nodes[u], &d.nodes[l]);
+    let x = upper.center();
+    let top = upper.y + upper.h;
+    for y in top..lower.y {
+        g.put(x, y, '│');
+    }
+    if au {
+        g.put(x, top, '▲');
+    }
+    if al {
+        g.put(x, lower.y - 1, '▼');
+    }
+    if let Some(label) = &d.edges[e].label {
+        g.text(x + 2, lower.y - 2, label);
+    }
+}
+
+/// An edge routed down (or up) a channel in a gap.
 fn draw_side(g: &mut Grid, d: &Diagram, route: &Route, col: usize) {
     let (u, l, au, al) = d.edges[route.edge].vertical(&d.nodes);
     let (upper, lower) = (&d.nodes[u], &d.nodes[l]);
-    let left = route.left;
+    // Whether the channel lies left of each shape: the arms may leave to different sides
+    // when the channel runs between their columns.
+    let (upper_left, lower_left) = (gap_left_of(d, u, route.gap), gap_left_of(d, l, route.gap));
     let uy = if route.upper_corner {
         upper.y + upper.h - 1
     } else {
@@ -992,53 +1270,42 @@ fn draw_side(g: &mut Grid, d: &Diagram, route: &Route, col: usize) {
     } else {
         lower.middle()
     };
-    // The arm from the shape to the channel, joined to a box's corner when it starts there
-    // (a diamond's top and bottom rows start with a blank cell before its edge).
-    let arm = |g: &mut Grid, n: &Node, y: usize, corner: Option<char>| {
-        let xs = if left { col + 1..n.x } else { n.x + n.w..col };
+    // The cell of the shape's outline the arm meets on row `y`: a diamond's top and bottom
+    // rows are a cell narrower on each side than its middle.
+    let boundary = |n: &Node, left: bool, y: usize| match (n.shape, left, y != n.middle()) {
+        (Shape::Diamond, true, true) => n.x + 1,
+        (Shape::Diamond, false, true) => n.x + n.w - 2,
+        (_, true, _) => n.x,
+        (_, false, _) => n.x + n.w - 1,
+    };
+    // The arm from the shape to the channel, ending in an arrow head or, when it leaves a
+    // box's corner, joined to it.
+    let arm = |g: &mut Grid, n: &Node, left: bool, y: usize, headed: bool, junction: char| {
+        let edge = boundary(n, left, y);
+        let xs = if left { col + 1..edge } else { edge + 1..col };
         for x in xs {
             g.put(x, y, '─');
         }
-        match (corner, n.shape) {
-            (None, _) => {}
-            (Some(_), Shape::Diamond) => {
-                if left {
-                    g.put(n.x, y, '─');
-                }
-            }
-            (Some(c), _) => g.put(if left { n.x } else { n.x + n.w - 1 }, y, c),
+        if headed {
+            g.put(
+                if left { edge - 1 } else { edge + 1 },
+                y,
+                if left { '▶' } else { '◀' },
+            );
+        } else if y != n.middle() && n.shape != Shape::Diamond {
+            g.set(edge, y, junction);
         }
     };
-    arm(g, upper, uy, route.upper_corner.then_some('┴'));
-    arm(g, lower, ly, route.lower_corner.then_some('┬'));
-    if uy == ly {
-        // Same row, not neighbours: loop out and back on the row below.
-        g.put(col, uy, '┐');
-        g.put(col, uy + 1, '│');
-        g.put(col, uy + 2, '┘');
-        return;
-    }
+    arm(g, upper, upper_left, uy, au, '┴');
+    arm(g, lower, lower_left, ly, al, '┬');
     for y in uy + 1..ly {
         g.put(col, y, '│');
     }
-    g.put(col, uy, if left { '┌' } else { '┐' });
-    g.put(col, ly, if left { '└' } else { '┘' });
-    let head = |g: &mut Grid, n: &Node, y: usize| {
-        if left {
-            g.put(n.x - 1, y, '▶');
-        } else {
-            g.put(n.x + n.w, y, '◀');
-        }
-    };
-    if au {
-        head(g, upper, uy);
-    }
-    if al {
-        head(g, lower, ly);
-    }
+    g.put(col, uy, if upper_left { '┌' } else { '┐' });
+    g.put(col, ly, if lower_left { '└' } else { '┘' });
     if let Some(label) = &d.edges[route.edge].label {
-        let y = (uy + ly) / 2;
-        if left {
+        let y = uy.midpoint(ly);
+        if route.gap == 0 {
             g.text(col - 1 - label.width(), y, label);
         } else {
             g.text(col + 2, y, label);
@@ -1426,5 +1693,113 @@ mod tests {
         );
         assert!(out[1].contains("│ A │─────────────▶│ B │"));
         assert!(!text.contains('┬'), "the columns still line up");
+    }
+
+    #[test]
+    fn a_skipping_line_runs_straight_through_an_empty_column() {
+        // The "No" line from the diamond skips the row holding only the pill, whose empty
+        // slot leaves the column free: it goes straight down instead of round the side.
+        let src = "a<Need affinity?>, b<Gift given?>, c[Give a gift]\n, d(Grind)\ne<Wear an item?>, f<In the bag?>, g[Equip]\na --> b | Yes\nb --> c | No\nb --> d | Yes\na --> e | No\ne --> f | Yes\nf --> g | Yes";
+        let out = render(src).unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert_eq!(
+            &out[3..12],
+            &[
+                "          │                      │",
+                "          │                      │ Yes",
+                "          │                      ▼",
+                "          │                  ╭───────╮",
+                "          │                  │ Grind │",
+                "          │                  ╰───────╯",
+                "          │",
+                "          │ No",
+                "          ▼",
+            ]
+        );
+        // Nothing left of the shapes or beyond the widest row: no line goes round.
+        assert!(
+            out.iter()
+                .all(|l| l.is_empty() || l.starts_with(' ') || l.starts_with('⟨'))
+        );
+        assert!(out.iter().all(|l| l.width() <= out[0].width()), "{text}");
+        // Grind spread over the whole row blocks the column: the line goes down the left
+        // margin, touching no shape.
+        let out = render(&src.replace(", d(Grind)", "d(Grind)")).unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(
+            out[1].starts_with("    ┌──⟨  Need affinity?  ⟩"),
+            "{}",
+            out[1]
+        );
+        assert!(text.contains("\n No │"), "label beside the channel");
+        let wear = out
+            .iter()
+            .position(|l| l.contains("Wear an item?"))
+            .unwrap();
+        assert!(
+            out[wear].starts_with("    └──▶⟨  Wear an item?  ⟩"),
+            "{}",
+            out[wear]
+        );
+    }
+
+    #[test]
+    fn lines_never_cross_a_shape() {
+        // From the right column to the left column two rows down: the only gap reachable
+        // from both ends without crossing a shape is the one between the columns, which
+        // widens to hold the channel and its label. The arm leaves Act 1's bottom corner
+        // because "yes" arrives at the side it would otherwise use.
+        let src = "a<Q1?>, b[Act 1]\nc<Q2?>, d[Act 2]\ne<Q3?>, f[Act 3]\na --> b | yes\na --> c | no\nb --> e | wide\nc --> d\nc --> e\ne --> f";
+        let out = render(src).unwrap();
+        println!("{}", joined(&out));
+        assert_eq!(
+            out,
+            vec![
+                " ╱‾‾‾‾‾╲  yes          ┌───────┐",
+                "⟨  Q1?  ⟩─────────────▶│ Act 1 │",
+                " ╲_____╱        ┌──────┴───────┘",
+                "    │           │",
+                "    │ no        │",
+                "    ▼           │",
+                " ╱‾‾‾‾‾╲        │ wide ┌───────┐",
+                "⟨  Q2?  ⟩───────┼─────▶│ Act 2 │",
+                " ╲_____╱        │      └───────┘",
+                "    │           │",
+                "    ▼           │",
+                " ╱‾‾‾‾‾╲◀───────┘      ┌───────┐",
+                "⟨  Q3?  ⟩─────────────▶│ Act 3 │",
+                " ╲_____╱               └───────┘",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_along_a_row_that_skips_a_shape_loops_under_it() {
+        let out = render("a[A], b[B], c[C]\na --> c | over").unwrap();
+        println!("{}", joined(&out));
+        assert_eq!(
+            out,
+            vec![
+                "┌───┐    ┌───┐    ┌───┐",
+                "│ A │    │ B │    │ C │",
+                "└───┘    └───┘    └───┘",
+                "  │ over            ▲",
+                "  └─────────────────┘",
+            ]
+        );
+        // With a row below, the loop shares a bus with the lines going down.
+        let out = render("a[A], b[B], c[C]\nd[D]\na --> c\na --> d\nc --> d").unwrap();
+        println!("{}", joined(&out));
+        assert_eq!(
+            &out[3..7],
+            &[
+                "  │                 ▲",
+                "  └────────┬────────┘",
+                "           │",
+                "           ▼",
+            ]
+        );
     }
 }

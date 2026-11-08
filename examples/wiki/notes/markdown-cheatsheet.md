@@ -80,9 +80,12 @@ stacked in a column line up. Empty slots pick a column instead: `,, z(End)` puts
 third column. `id[label]`
 is a box, `id(label)` a rounded pill, `id<label>` a diamond. Lines join ids with `-->`,
 `<--`, `<->` or `---`, can be chained, and take a label after `|`. Lines between neighbouring
-rows go straight down (fanning out and merging as needed); lines that skip rows run down
-channels beside the diagram: each takes the side where it crosses fewer other lines, nests
-inside the longer lines around it, and shares a channel with lines it shares no rows with. A
+rows go straight down (fanning out and merging as needed). A line that skips rows runs
+straight down too when its column is empty in between; otherwise it runs down a channel in a
+gap between columns or beside the diagram, which widens to make room. A line never crosses a
+shape: it only uses a gap it can reach along its rows, takes the gap where it crosses fewer
+other lines, nests inside the longer lines around it, and shares a channel with lines it
+shares no rows with. A line along a row that skips a shape loops under the row instead. A
 line that leaves a shape on a side where another line arrives leaves from the shape's corner,
 so the two never meet at one point. A block that does not parse shows its source with the
 problem. A diagram wider than the page scrolls sideways (`h` / `l`, the arrows, or a sideways
