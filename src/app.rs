@@ -421,6 +421,9 @@ impl App {
         self.scroll = 0;
         self.hscroll = 0;
         self.sel = None;
+        // A selection belongs to the page it was made on.
+        self.select = None;
+        self.drag_press = None;
         self.related_sel = 0;
         self.related_scroll = 0;
         self.toc_fresh = true;
@@ -565,6 +568,8 @@ impl App {
             self.render_current();
             self.scroll = scroll.min(self.max_scroll());
             self.sel = None;
+            // The lines rewrap, so the selected columns no longer mean anything.
+            self.select = None;
             self.rebuild_related();
         }
     }
@@ -3131,6 +3136,25 @@ mod tests {
         assert_eq!(word_columns("日本 go", 1), Some((0, 4)));
         assert_eq!(word_columns("日本 go", 5), Some((5, 7)));
         assert_eq!(word_columns("short", 40), None);
+    }
+
+    #[test]
+    fn opening_another_page_drops_the_selection() {
+        let mut app = app_with(
+            &[
+                ("index", "# Home\n\nSome words here [[other]]"),
+                ("other", "# Other\n\nMore"),
+            ],
+            "select",
+        );
+        app.select = Some(TextSelect {
+            anchor: (0, 0),
+            cursor: (0, 4),
+            keyboard: false,
+        });
+        assert_eq!(app.selected_text().as_deref(), Some("Some"));
+        app.open("other", true);
+        assert!(app.select.is_none());
     }
 
     #[test]
