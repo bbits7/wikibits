@@ -79,7 +79,8 @@ is centred in its column (a row with fewer shapes spreads them over the columns)
 stacked in a column line up. Empty slots pick a column instead: `,, z(End)` puts `z` in the
 third column. `id[label]`
 is a box, `id(label)` a rounded pill, `id<label>` a diamond; a label can hold commas
-(`a[Hello, world]`). Lines join ids with `-->`,
+(`a[Hello, world]`) and breaks over lines at `\n` (`a[Go to the\npet store]`), making the
+shape taller; a many-line diamond keeps its points on every row. Lines join ids with `-->`,
 `<--`, `<->` or `---`, can be chained, and take a label after `|`. Lines between neighbouring
 rows go straight down (fanning out and merging as needed). A line that skips rows runs
 straight down too when its column is empty in between, or down its empty column and across

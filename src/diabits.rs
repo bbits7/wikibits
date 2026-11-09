@@ -63,6 +63,20 @@ impl Node {
     fn middle(&self) -> usize {
         self.y + self.h / 2
     }
+    /// Whether grid row `y` is the shape's top or bottom outline row.
+    fn is_rim(&self, y: usize) -> bool {
+        y == self.y || y + 1 == self.y + self.h
+    }
+}
+
+/// A label's lines: `\n` in the source breaks a label over several rows of the shape.
+fn label_lines(label: &str) -> Vec<&str> {
+    label.split("\\n").map(str::trim).collect()
+}
+
+/// Rows a shape takes for its label: one per line, plus the outline.
+fn shape_height(label: &str) -> usize {
+    label_lines(label).len() + 2
 }
 
 #[derive(Debug)]
@@ -342,14 +356,22 @@ fn parse_shape(item: &str) -> Option<(&str, &str, Shape)> {
     };
     let body = &item[open + 1..];
     let label = body.strip_suffix(close)?;
-    (!label.trim().is_empty()).then_some((id, label, shape))
+    label_lines(label)
+        .iter()
+        .any(|l| !l.is_empty())
+        .then_some((id, label, shape))
 }
 
-/// Columns a shape takes for its label.
+/// Columns a shape takes for its label: its widest line plus the outline.
 fn shape_width(shape: Shape, label: &str) -> usize {
+    let width = label_lines(label)
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(0);
     match shape {
-        Shape::Box | Shape::Pill => label.width() + 4,
-        Shape::Diamond => label.width() + 6,
+        Shape::Box | Shape::Pill => width + 4,
+        Shape::Diamond => width + 6,
     }
 }
 
@@ -501,7 +523,7 @@ fn takes_elbow(d: &Diagram, e: usize) -> bool {
 fn layout(d: &mut Diagram) {
     for node in &mut d.nodes {
         node.w = shape_width(node.shape, &node.label);
-        node.h = 3;
+        node.h = shape_height(&node.label);
     }
     // A grid of columns: as many as the fullest row has shapes (or slots). A row with fewer
     // shapes spreads them over the columns (one shape spans them all) unless it used empty
@@ -611,13 +633,17 @@ fn layout(d: &mut Diagram) {
     }
     place(d, &widths, &gaps, gap_width(d.gaps[0], 0, columns));
     d.gaps[columns].width = gap_width(d.gaps[columns], columns, columns);
-    // Vertical positions: each gap between rows is as tall as its edges need.
+    // Vertical positions: a row is as tall as its tallest shape, the others centred on its
+    // middle row so a line along the row meets them all; each gap between rows is as tall
+    // as its edges need.
     let mut y = 0;
     for r in 0..d.rows.len() {
+        let tallest = d.rows[r].iter().map(|&n| d.nodes[n].h).max().unwrap_or(3);
         for &n in &d.rows[r] {
-            d.nodes[n].y = y;
+            let h = d.nodes[n].h;
+            d.nodes[n].y = y + tallest / 2 - h / 2;
         }
-        y += 3;
+        y += tallest;
         if r + 1 < region_count(d) + 1 {
             y += region_plan(d, r).height;
         }
@@ -1193,6 +1219,8 @@ fn neighbours(d: &Diagram, a: usize, b: usize) -> bool {
     matches!((ia, ib), (Some(ia), Some(ib)) if ia.abs_diff(ib) == 1)
 }
 
+/// A shape's outline with its label lines inside, one per row. A diamond with several
+/// lines keeps its pointed sides on every label row, so it comes out hexagon-like.
 fn draw_shape(g: &mut Grid, x: usize, y: usize, w: usize, shape: Shape, label: &str) {
     let inner = w - 2;
     let pad = |s: &str, width: usize| {
@@ -1200,6 +1228,8 @@ fn draw_shape(g: &mut Grid, x: usize, y: usize, w: usize, shape: Shape, label: &
         let left = extra / 2;
         format!("{}{}{}", " ".repeat(left), s, " ".repeat(extra - left))
     };
+    let lines = label_lines(label);
+    let bottom = y + lines.len() + 1;
     match shape {
         Shape::Box | Shape::Pill => {
             let (tl, tr, bl, br) = if shape == Shape::Box {
@@ -1208,14 +1238,18 @@ fn draw_shape(g: &mut Grid, x: usize, y: usize, w: usize, shape: Shape, label: &
                 ('╭', '╮', '╰', '╯')
             };
             g.text(x, y, &format!("{tl}{}{tr}", "─".repeat(inner)));
-            g.text(x, y + 1, &format!("│{}│", pad(label, inner)));
-            g.text(x, y + 2, &format!("{bl}{}{br}", "─".repeat(inner)));
+            for (i, line) in lines.iter().enumerate() {
+                g.text(x, y + 1 + i, &format!("│{}│", pad(line, inner)));
+            }
+            g.text(x, bottom, &format!("{bl}{}{br}", "─".repeat(inner)));
         }
         Shape::Diamond => {
             let inner = w - 4;
             g.text(x, y, &format!(" ╱{}╲", "‾".repeat(inner)));
-            g.text(x, y + 1, &format!("⟨{}⟩", pad(label, w - 2)));
-            g.text(x, y + 2, &format!(" ╲{}╱", "_".repeat(inner)));
+            for (i, line) in lines.iter().enumerate() {
+                g.text(x, y + 1 + i, &format!("⟨{}⟩", pad(line, w - 2)));
+            }
+            g.text(x, bottom, &format!(" ╲{}╱", "_".repeat(inner)));
         }
     }
 }
@@ -1228,7 +1262,6 @@ fn draw_region(g: &mut Grid, d: &Diagram, r: usize) {
         .max()
         .unwrap_or(0);
     let bottom = top + plan.height; // first row of the lower shapes
-    let arrow_row = bottom - 1;
     let entry_row = if plan.levels > 0 || plan.height > 2 {
         bottom - 2
     } else {
@@ -1236,15 +1269,19 @@ fn draw_region(g: &mut Grid, d: &Diagram, r: usize) {
     };
 
     for &e in &plan.direct {
-        let (u, _, au, al) = d.edges[e].vertical(&d.nodes);
-        let x = d.nodes[u].center();
-        for y in top..bottom {
+        let (u, l, au, al) = d.edges[e].vertical(&d.nodes);
+        let (upper, lower) = (&d.nodes[u], &d.nodes[l]);
+        let x = upper.center();
+        // Shapes shorter than their row are centred in it: the line runs from the upper
+        // shape's own bottom to the lower shape's own top.
+        let (exit, entry) = (upper.y + upper.h, lower.y);
+        for y in exit..entry {
             g.put(x, y, '│');
         }
         if au {
-            g.put(x, top, '▲');
+            g.put(x, exit, '▲');
         }
-        g.put(x, arrow_row, if al { '▼' } else { '│' });
+        g.put(x, entry - 1, if al { '▼' } else { '│' });
         if let Some(label) = &d.edges[e].label {
             g.text(x + 2, entry_row, label);
         }
@@ -1271,23 +1308,25 @@ fn draw_region(g: &mut Grid, d: &Diagram, r: usize) {
         };
         for &u in &bus.uppers {
             let x = d.nodes[u].center();
-            for y in top..bus_row {
+            let exit = d.nodes[u].y + d.nodes[u].h;
+            for y in exit..bus_row {
                 g.put(x, y, '│');
             }
             if arrow_up(u) {
-                g.put(x, top, '▲');
+                g.put(x, exit, '▲');
             }
         }
         for &l in &bus.lowers {
             let x = d.nodes[l].center();
-            for y in bus_row + 1..bottom {
+            let entry = d.nodes[l].y;
+            for y in bus_row + 1..entry {
                 g.put(x, y, '│');
             }
             let arrow_down = bus
                 .edges
                 .iter()
                 .any(|&e| d.edges[e].vertical(&d.nodes).1 == l && d.edges[e].vertical(&d.nodes).3);
-            g.put(x, arrow_row, if arrow_down { '▼' } else { '│' });
+            g.put(x, entry - 1, if arrow_down { '▼' } else { '│' });
         }
         // The bus itself, with junctions where lines leave it.
         for x in lo..=hi {
@@ -1444,8 +1483,8 @@ fn draw_side(g: &mut Grid, d: &Diagram, route: &Route, col: usize) {
         lower.middle()
     };
     // The cell of the shape's outline the arm meets on row `y`: a diamond's top and bottom
-    // rows are a cell narrower on each side than its middle.
-    let boundary = |n: &Node, left: bool, y: usize| match (n.shape, left, y != n.middle()) {
+    // rows are a cell narrower on each side than its label rows.
+    let boundary = |n: &Node, left: bool, y: usize| match (n.shape, left, n.is_rim(y)) {
         (Shape::Diamond, true, true) => n.x + 1,
         (Shape::Diamond, false, true) => n.x + n.w - 2,
         (_, true, _) => n.x,
@@ -1497,6 +1536,7 @@ struct TreeNode {
     x: usize,
     y: usize,
     w: usize,
+    h: usize,
 }
 
 /// Columns a child sits to the right of its parent.
@@ -1549,6 +1589,7 @@ fn parse_tree(source: &str) -> Result<Vec<TreeNode>, String> {
             x: 0,
             y: 0,
             w: 0,
+            h: 0,
         });
     }
     if nodes.is_empty() {
@@ -1557,14 +1598,15 @@ fn parse_tree(source: &str) -> Result<Vec<TreeNode>, String> {
     Ok(nodes)
 }
 
-/// Shapes in order, each three rows tall, children indented under their parent; a blank
-/// row separates one root's tree from the next.
+/// Shapes in order, each as tall as its label needs, children indented under their parent;
+/// a blank row separates one root's tree from the next.
 fn layout_tree(nodes: &mut [TreeNode]) {
     let mut y = 0;
     // Left edge of the current shape at each depth.
     let mut lefts: Vec<usize> = Vec::new();
     for (i, n) in nodes.iter_mut().enumerate() {
         n.w = shape_width(n.shape, &n.label);
+        n.h = shape_height(&n.label);
         if i > 0 && n.depth == 0 {
             y += 1;
         }
@@ -1576,13 +1618,13 @@ fn layout_tree(nodes: &mut [TreeNode]) {
         lefts.truncate(n.depth);
         lefts.push(n.x);
         n.y = y;
-        y += 3;
+        y += n.h;
     }
 }
 
 fn draw_tree(nodes: &[TreeNode]) -> Vec<String> {
     let width = nodes.iter().map(|n| n.x + n.w).max().unwrap_or(0);
-    let height = nodes.iter().map(|n| n.y + 3).max().unwrap_or(0);
+    let height = nodes.iter().map(|n| n.y + n.h).max().unwrap_or(0);
     let mut g = Grid::new(width, height);
     for n in nodes {
         draw_shape(&mut g, n.x, n.y, n.w, n.shape, &n.label);
@@ -1599,13 +1641,13 @@ fn draw_tree(nodes: &[TreeNode]) -> Vec<String> {
         };
         let trunk = n.x + TREE_TRUNK;
         if n.shape != Shape::Diamond {
-            g.put(trunk, n.y + 2, '┬');
+            g.put(trunk, n.y + n.h - 1, '┬');
         }
-        for y in n.y + 3..last.y + 1 {
+        for y in n.y + n.h..last.y + last.h / 2 {
             g.put(trunk, y, '│');
         }
         for child in &children {
-            let y = child.y + 1;
+            let y = child.y + child.h / 2;
             g.put(
                 trunk,
                 y,
@@ -1697,6 +1739,28 @@ mod tests {
                 .unwrap_err()
                 .contains("is not id[label]")
         );
+    }
+
+    #[test]
+    fn a_label_breaks_over_lines_at_backslash_n() {
+        let out = render("a[Go to the\\npet store]\nb<Cats or\\ndogs?>, s[Side]\na --> b\nb --- s")
+            .unwrap();
+        let text = joined(&out);
+        // Each line of the label on its own row, the shape as wide as the widest line.
+        assert!(text.contains("│ Go to the │\n"));
+        assert!(text.contains("│ pet store │\n"));
+        // A diamond keeps its pointed sides on every label row.
+        assert!(text.contains("⟨  Cats or  ⟩"));
+        assert!(text.contains("⟨   dogs?   ⟩────│ Side │"));
+        let tree =
+            render("diaType: tree\nroot(Live\\nGame State)\n.a[Hit\\nPoints]\n.b[Mana]").unwrap();
+        let text = joined(&tree);
+        assert!(text.contains("│    Live    │\n"));
+        assert!(text.contains("│ Game State │\n"));
+        assert!(text.contains("├──│ Points │"));
+        assert!(text.contains("└──│ Mana │"));
+        // A label of only breaks is still empty.
+        assert!(render("a[\\n]").unwrap_err().contains("is not id[label]"));
     }
 
     #[test]
