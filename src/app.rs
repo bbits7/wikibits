@@ -304,6 +304,8 @@ pub struct App {
     pub select: Option<TextSelect>,
     /// Where the left button went down on the page, until it comes up.
     drag_press: Option<(usize, u16)>,
+    /// When and where the last click on the page landed, to spot a double-click.
+    last_click: Option<(std::time::Instant, (u16, u16))>,
     /// `[[` context the user dismissed with Esc; do not reopen until it changes.
     complete_dismissed: Option<Pos>,
     /// Page id waiting for the create-page confirmation.
@@ -362,6 +364,7 @@ impl App {
             report: None,
             select: None,
             drag_press: None,
+            last_click: None,
             complete_dismissed: None,
             pending_create: None,
             new_page: String::new(),
@@ -2020,6 +2023,26 @@ impl App {
         Some((line, x - body.x + self.hscroll as u16))
     }
 
+    /// Select the word on the page under screen cell `(x, y)` and copy it.
+    fn select_word_at(&mut self, x: u16, y: u16) {
+        let Some((line, col)) = self.content_pos(x, y) else {
+            return;
+        };
+        let Some(text) = self.rendered.as_ref().map(|r| r.lines[line].to_string()) else {
+            return;
+        };
+        let Some((from, to)) = word_columns(&text, col) else {
+            self.status = "Nothing selected".into();
+            return;
+        };
+        self.select = Some(TextSelect {
+            anchor: (line, from),
+            cursor: (line, to),
+            keyboard: false,
+        });
+        self.copy_selection();
+    }
+
     fn selected_text(&self) -> Option<String> {
         let sel = self.select.as_ref()?;
         let rendered = self.rendered.as_ref()?;
@@ -2873,10 +2896,21 @@ impl App {
                 } else if rects.page_id.contains((x, y).into()) {
                     self.copy_page_id();
                 } else if rects.content.contains((x, y).into()) {
-                    // Decided on release: a drag selects text, a plain click activates.
                     self.focus = Focus::Content;
                     self.select = None;
-                    self.drag_press = self.content_pos(x, y);
+                    let now = std::time::Instant::now();
+                    let double = self
+                        .last_click
+                        .is_some_and(|(t, at)| at == (x, y) && now - t < DOUBLE_CLICK);
+                    self.last_click = if double { None } else { Some((now, (x, y))) };
+                    if double {
+                        // A double-click selects and copies the word under the pointer.
+                        self.drag_press = None;
+                        self.select_word_at(x, y);
+                    } else {
+                        // Decided on release: a drag selects text, a plain click activates.
+                        self.drag_press = self.content_pos(x, y);
+                    }
                 } else if rects.related.contains((x, y).into()) {
                     self.focus = Focus::Related;
                     let row = (y - rects.related.y) as usize + self.related_scroll;
@@ -2945,6 +2979,33 @@ impl App {
 /// `scroll` moved by `delta` rows, kept within `0..=max`.
 fn scrolled(scroll: usize, delta: isize, max: usize) -> usize {
     (scroll as isize + delta).clamp(0, max as isize) as usize
+}
+
+/// The display columns `(from, to)` of the word covering column `col` of `text`: letters,
+/// digits and underscores, so a double-click picks one word out of prose or code.
+fn word_columns(text: &str, col: u16) -> Option<(u16, u16)> {
+    use unicode_width::UnicodeWidthChar;
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    // Each character's start column and whether it is part of a word.
+    let mut cells = Vec::new();
+    let mut at = 0u16;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0) as u16;
+        cells.push((at, at.saturating_add(w), is_word(c)));
+        at = at.saturating_add(w);
+    }
+    let hit = cells
+        .iter()
+        .position(|&(s, e, word)| word && col >= s && col < e)?;
+    let start = cells[..hit]
+        .iter()
+        .rposition(|&(_, _, word)| !word)
+        .map_or(0, |i| i + 1);
+    let end = cells[hit..]
+        .iter()
+        .position(|&(_, _, word)| !word)
+        .map_or(cells.len(), |i| hit + i);
+    Some((cells[start].0, cells[end - 1].1))
 }
 
 /// The characters of `text` between display columns `from` and `to`.
@@ -3058,6 +3119,18 @@ mod tests {
         app.content_height = 10;
         app.set_size(40, 10);
         app
+    }
+
+    #[test]
+    fn a_word_is_picked_by_its_columns() {
+        assert_eq!(word_columns("Hello, wide_world!", 0), Some((0, 5)));
+        assert_eq!(word_columns("Hello, wide_world!", 4), Some((0, 5)));
+        assert_eq!(word_columns("Hello, wide_world!", 5), None);
+        assert_eq!(word_columns("Hello, wide_world!", 9), Some((7, 17)));
+        // A wide character takes two columns; a click on either picks it.
+        assert_eq!(word_columns("日本 go", 1), Some((0, 4)));
+        assert_eq!(word_columns("日本 go", 5), Some((5, 7)));
+        assert_eq!(word_columns("short", 40), None);
     }
 
     #[test]

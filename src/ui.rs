@@ -1005,7 +1005,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "V",
             "select text with the keyboard: arrows move, Shift+arrows extend, y copies",
         ),
-        ("mouse drag", "selects text on the page and copies it"),
+        (
+            "mouse drag",
+            "selects text on the page and copies it (a double-click: one word)",
+        ),
         ("e", "edit this page"),
         (
             "N",

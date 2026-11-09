@@ -54,7 +54,7 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `w` | wiki report: broken links, orphan pages and recently changed pages (`Enter` opens one) |
 | `y` | copy a `[[link]]` to the current page to the clipboard (or the selected text) |
 | `Y` | copy the current page's path (shown at the bottom right; clicking it there copies it too) |
-| `V` | select text with the keyboard: arrows move, `Shift`+arrows extend, `y` copies, `Esc` ends; dragging with the mouse selects and copies too |
+| `V` | select text with the keyboard: arrows move, `Shift`+arrows extend, `y` copies, `Esc` ends; dragging with the mouse selects and copies too, and a double-click selects and copies a word |
 | `h` / `l`, ← / → | collapse / expand a folder; in the page, scroll sideways when a diagram or code block is wider than it |
 | `J` / `K` | move the selected page or folder down / up within its folder (outside the pages column: the current page) |
 | `Ctrl+↑` / `Ctrl+↓` | move the page under the page or folder listed above it, as its last child (a plain page above becomes a folder with the page as its index) / out of its folder, to just after the folder; links to the page are rewritten as for a rename |
@@ -121,7 +121,8 @@ row sets the number of columns, each column is as wide as its widest shape, and 
 is centred in its column (a row with fewer shapes spreads them over the columns), so shapes
 stacked in a column line up. Empty slots pick a column instead: `,, z(End)` puts `z` in the
 third column. `id[label]`
-is a box, `id(label)` a rounded pill, `id<label>` a diamond. Lines join ids with `-->`,
+is a box, `id(label)` a rounded pill, `id<label>` a diamond; a label can hold commas
+(`a[Hello, world]`). Lines join ids with `-->`,
 `<--`, `<->` or `---`, can be chained, and take a label after `|`. Lines between neighbouring
 rows go straight down (fanning out and merging as needed). A line that skips rows runs
 straight down too when its column is empty in between, or down its empty column and across

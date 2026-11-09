@@ -251,7 +251,7 @@ fn parse(source: &str) -> Result<Diagram, String> {
         }
         let mut row = Vec::new();
         let mut empty_slots = false;
-        let items: Vec<&str> = line.split(',').map(str::trim).collect();
+        let items = split_shapes(line);
         for (slot, item) in items.iter().enumerate() {
             if item.is_empty() {
                 empty_slots = true;
@@ -298,6 +298,31 @@ fn parse(source: &str) -> Result<Diagram, String> {
         gaps: Vec::new(),
         height: 0,
     })
+}
+
+/// The shapes on a row, split at the commas between them: a comma inside a shape's
+/// brackets belongs to its label (`a[Hello, world], b(Hi)` is two shapes).
+fn split_shapes(line: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    // The bracket that would close the shape we are inside, if any.
+    let mut close = None;
+    for (i, c) in line.char_indices() {
+        match (close, c) {
+            (Some(end), _) if c == end => close = None,
+            (Some(_), _) => {}
+            (None, '[') => close = Some(']'),
+            (None, '(') => close = Some(')'),
+            (None, '<') => close = Some('>'),
+            (None, ',') => {
+                items.push(line[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(line[start..].trim());
+    items
 }
 
 fn parse_shape(item: &str) -> Option<(&str, &str, Shape)> {
@@ -1653,6 +1678,25 @@ mod tests {
             .filter(|l| l.ends_with('┐') || l.contains("┘"))
             .collect();
         assert!(!side_rows.is_empty());
+    }
+
+    #[test]
+    fn a_comma_inside_a_shape_belongs_to_its_label() {
+        let out = render("a[Hello, world], b(Yes, no), c<Go, stop?>\n,, d[Done]").unwrap();
+        let text = joined(&out);
+        assert!(text.contains("Hello, world"));
+        assert!(text.contains("Yes, no"));
+        assert!(text.contains("Go, stop?"));
+        assert_eq!(
+            split_shapes("a[Hello, world], b(Yes, no),, c<Go, stop?>"),
+            ["a[Hello, world]", "b(Yes, no)", "", "c<Go, stop?>"]
+        );
+        // An unclosed bracket still reads as one item and is reported.
+        assert!(
+            render("a[Hello, world")
+                .unwrap_err()
+                .contains("is not id[label]")
+        );
     }
 
     #[test]
