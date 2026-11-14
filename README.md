@@ -155,6 +155,36 @@ so the two never meet at one point. A block that does not parse shows its source
 problem. A diagram wider than the page scrolls sideways (`h` / `l`, the arrows, or a sideways
 wheel).
 
+A line can be told where to leave and enter its shapes when the default route is not the one
+you want. Put a side after the id, in brackets: `a(R) --> b(T)` leaves the right of `a` and
+enters the top of `b`, with `T`, `B`, `L` or `R` for top, bottom, left or right. Each side
+has three anchors, and `a(T:R) --> b(B:L)` picks one: `L`, `M` or `R` along the top and
+bottom, `T`, `M` or `B` down the left and right; without one the line takes the middle.
+Either end can be left plain (`a(R) --> b`) and takes whichever side makes the shorter line.
+
+```diaBits
+a(First)
+b(Second)
+c(Third)
+d(Fourth)
+
+a --> b --> c --> d
+c(R) --> b(R) | inner right
+d(R) --> a(R) | outer right
+c(L:T) --> b(L) | inner left
+c(L:B) --> a(L:T) | middle left
+d(L) --> a(L:T) | outer left
+```
+
+These lines are drawn after the others, shortest first, each by the clear path with the
+fewest corners, then the shortest: a longer line runs outside the shorter ones it spans, a
+line crosses another only when going round would take more corners, and none runs through a
+shape or a label. The diagram grows to give them room. Two lines told to use the same anchor
+share it: the second runs straight into the stretch of the first that enters the shape, and
+they reach it together (`outer left` and `middle left` above, each with two corners). An anchor that an ordinary line already uses gives way to the next
+one on that side. Ids, sides and anchors are matched whatever their case: `A(l:t)` is
+`a(L:T)`.
+
 `diaType: tree` draws a tree instead: one shape per line, with leading dots saying how deep
 it sits (one more than its parent), and the lines from a parent down and across to its
 children drawn for you. Any number of roots (no dots) can follow each other:

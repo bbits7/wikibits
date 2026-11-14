@@ -235,6 +235,9 @@ main.page { padding: 18px clamp(16px, 4vw, 48px) 80px; min-width: 0; container-t
 .content th { background: var(--panel); text-align: left; }
 .content td img { max-width: min(50cqw, 100%); display: block; }
 .content mark { background: var(--mark); color: inherit; border-radius: 2px; }
+/* Text the page itself highlights with <mark>…</mark>. */
+.content .hl, .content .hl code, .content .hl a { background: #ffe14d; color: #000; }
+.content .hl { border-radius: 2px; padding: 0 1px; }
 pre.diabits {
   background: none; border: 1px dashed var(--line);
   color: var(--diagram); line-height: 1.2; width: max-content; max-width: 100%;
@@ -512,11 +515,33 @@ const diaBits = (() => {
     const body = item.slice(open + 1);
     if (!body.endsWith(close)) return null;
     const label = body.slice(0, -1);
-    return label.trim() ? { id, label, shape } : null;
+    return labelLines(label).some((l) => l) ? { id, label, shape } : null;
+  }
+
+  // A label's lines: \n in the source breaks a label over several rows of the shape.
+  const labelLines = (label) => label.split("\\n").map((l) => l.trim());
+  // Rows a shape takes for its label: one per line, plus the outline.
+  const shapeHeight = (label) => labelLines(label).length + 2;
+
+  // The shapes on a row, split at the commas between them: a comma inside a shape's
+  // brackets belongs to its label (a[Hello, world], b(Hi) is two shapes).
+  function splitShapes(line) {
+    const items = [];
+    let start = 0, close = null;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (close != null) { if (c === close) close = null; }
+      else if (c === "[") close = "]";
+      else if (c === "(") close = ")";
+      else if (c === "<") close = ">";
+      else if (c === ",") { items.push(line.slice(start, i).trim()); start = i + 1; }
+    }
+    items.push(line.slice(start).trim());
+    return items;
   }
 
   function parse(source) {
-    const nodes = [], edges = [], rows = [], explicit = [], ids = new Map();
+    const nodes = [], edges = [], pinned = [], rows = [], explicit = [], ids = new Map();
     const lines = source.split("\n");
     if (lines.length && lines[lines.length - 1] === "") lines.pop();
     for (let number = 0; number < lines.length; number++) {
@@ -535,26 +560,58 @@ const diaBits = (() => {
           const [fromId, op, toId] = [tokens[2 * i], tokens[2 * i + 1], tokens[2 * i + 2]];
           const arrows = { "-->": [false, true], "<--": [true, false], "<->": [true, true], "---": [false, false] }[op];
           if (!arrows) throw `line ${at}: '${op}' is not one of --> <-- <-> ---`;
-          const lookup = (id) => {
-            if (!ids.has(id)) throw `line ${at}: no shape named '${id}' (define it first)`;
-            return ids.get(id);
+          // `id`, `id(side)` or `id(side:anchor)`: the side of the shape the line uses (T, B,
+          // L or R) and the anchor on it (L, M or R along the top and bottom; T, M or B down
+          // the left and right), as { side, anchor } with anchor 0, 1, 2 or null.
+          const lookup = (token) => {
+            let id = token, side = null;
+            const open = token.indexOf("(");
+            if (token.endsWith(")") && open >= 0) {
+              id = token.slice(0, open);
+              const place = token.slice(open + 1, -1);
+              const colon = place.indexOf(":");
+              const name = colon >= 0 ? place.slice(0, colon) : place;
+              const anchorName = colon >= 0 ? place.slice(colon + 1).toUpperCase() : null;
+              const which = "TBLR".indexOf(name.toUpperCase());
+              if (name.length !== 1 || which < 0) throw `line ${at}: side '${name}' of '${id}' is not T, B, L or R`;
+              const across = which < 2;
+              let anchor = null;
+              if (anchorName != null) {
+                anchor = anchorName === "M" ? 1
+                  : across && anchorName === "L" ? 0 : across && anchorName === "R" ? 2
+                  : !across && anchorName === "T" ? 0 : !across && anchorName === "B" ? 2 : -1;
+                if (anchor < 0) {
+                  throw `line ${at}: anchor '${anchorName}' on side ${name.toUpperCase()} of '${id}' is not ${across ? "L, M or R" : "T, M or B"}`;
+                }
+              }
+              side = { side: which, anchor };
+            }
+            if (!ids.has(id.toLowerCase())) throw `line ${at}: no shape named '${id}' (define it first)`;
+            return [ids.get(id.toLowerCase()), side];
           };
-          const from = lookup(fromId), to = lookup(toId);
+          const [from, fromSide] = lookup(fromId), [to, toSide] = lookup(toId);
           if (from === to) throw `line ${at}: a line from a shape to itself`;
           // A label on a chain goes on its last line.
-          edges.push({ from, to, arrowFrom: arrows[0], arrowTo: arrows[1], label: i + 1 === count ? label : null });
+          const edge = {
+            from, to, arrowFrom: arrows[0], arrowTo: arrows[1], label: i + 1 === count ? label : null,
+            fromSide, toSide, text: `${fromId} ${op} ${toId}`,
+          };
+          // Lines told which side of a shape to use take no part in the planning of the
+          // others: they are routed last, round whatever is drawn by then.
+          (fromSide || toSide ? pinned : edges).push(edge);
         }
         continue;
       }
       const row = [];
       let emptySlots = false;
-      const items = line.split(",").map((s) => s.trim());
+      const items = splitShapes(line);
       items.forEach((item, slot) => {
         if (!item) { emptySlots = true; return; }
         const shape = parseShape(item);
         if (!shape) throw `line ${at}: '${item}' is not id[label], id(label) or id<label>`;
-        if (ids.has(shape.id)) throw `line ${at}: '${shape.id}' is defined twice`;
-        ids.set(shape.id, nodes.length);
+        // Ids are matched whatever their case: `A` and `a` name the same shape.
+        if (ids.has(shape.id.toLowerCase())) throw `line ${at}: '${shape.id}' is defined twice`;
+        ids.set(shape.id.toLowerCase(), nodes.length);
         row.push(nodes.length);
         nodes.push({ label: shape.label.trim(), shape: shape.shape, row: rows.length, slot, x: 0, y: 0, w: 0, h: 0 });
       });
@@ -563,17 +620,18 @@ const diaBits = (() => {
       rows.push(row);
     }
     if (!nodes.length) throw "no shapes: add lines like id[label]";
-    return { nodes, edges, rows, explicit };
+    return { nodes, edges, pinned, rows, explicit };
   }
 
-  // Columns a shape takes for its label.
-  const shapeWidth = (shape, label) => width(label) + (shape === "diamond" ? 6 : 4);
+  // Columns a shape takes for its label: its widest line plus the outline.
+  const shapeWidth = (shape, label) =>
+    Math.max(0, ...labelLines(label).map(width)) + (shape === "diamond" ? 6 : 4);
 
   // ----- layout -----
   function layout(d) {
     for (const n of d.nodes) {
       n.w = shapeWidth(n.shape, n.label);
-      n.h = 3;
+      n.h = shapeHeight(n.label);
     }
     // A grid of columns: as many as the fullest row has shapes (or slots). A row with fewer
     // shapes spreads them over the columns unless it used empty slots to pick columns, and
@@ -641,17 +699,57 @@ const diaBits = (() => {
     d.elbow = d.edges.map(() => false);
     for (let e = 0; e < d.edges.length; e++) d.elbow[e] = takesElbow(d, e);
     channelPlan(d);
-    for (let g = 1; g < columns; g++) gaps[g - 1] = Math.max(gaps[g - 1], gapWidth(d.gaps[g], g, columns));
-    place(gapWidth(d.gaps[0], 0, columns));
-    d.gaps[columns].width = gapWidth(d.gaps[columns], columns, columns);
-    // Vertical positions: each gap between rows is as tall as its edges need.
-    let y = 0;
+    // Lines with a chosen side are routed once everything else is drawn; they get room of
+    // their own beside and between the shapes they leave or enter.
+    const [extraColumns, extraRows] = pinnedRoom(d);
+    for (let g = 1; g < columns; g++) gaps[g - 1] = Math.max(gaps[g - 1], gapWidth(d.gaps[g], g, columns)) + extraColumns[g];
+    place(gapWidth(d.gaps[0], 0, columns) + extraColumns[0]);
+    d.gaps[columns].width = gapWidth(d.gaps[columns], columns, columns) + extraColumns[columns];
+    // Vertical positions: a row is as tall as its tallest shape, the others centred on its
+    // middle row so a line along the row meets them all; each gap between rows is as tall
+    // as its edges need.
+    let y = extraRows[0];
     for (let r = 0; r < d.rows.length; r++) {
-      for (const n of d.rows[r]) d.nodes[n].y = y;
-      y += 3;
+      const tallest = Math.max(...d.rows[r].map((n) => d.nodes[n].h));
+      for (const n of d.rows[r]) d.nodes[n].y = y + Math.floor(tallest / 2) - Math.floor(d.nodes[n].h / 2);
+      y += tallest;
       if (r < regionCount(d)) y += regionPlan(d, r).height;
+      y += extraRows[r + 1];
     }
     d.height = y;
+  }
+
+  // Room for the lines with a chosen side: columns to add to each gap (gap 0 is left of the
+  // first column) and rows to add above each row of shapes (the last entry is under the last
+  // row). A line leaving a side needs a column or row there to turn in, and a labelled line
+  // room for its label. Round the outside there is room for every such line and label to
+  // pass; draw() trims what they do not use.
+  function pinnedRoom(d) {
+    const gapPins = new Array(d.columns + 1).fill(0), gapLabel = new Array(d.columns + 1).fill(0);
+    const rowPins = new Array(d.rows.length + 1).fill(0);
+    for (const e of d.pinned) {
+      const label = e.label == null ? 0 : width(e.label);
+      for (const [n, side] of [[e.from, e.fromSide], [e.to, e.toSide]]) {
+        if (!side) continue;
+        if (side.side === 0) { rowPins[d.nodes[n].row]++; continue; }
+        if (side.side === 1) { rowPins[d.nodes[n].row + 1]++; continue; }
+        const gap = side.side === 2 ? d.span[n][0] : d.span[n][1];
+        gapPins[gap]++;
+        gapLabel[gap] = Math.max(gapLabel[gap], label);
+      }
+    }
+    const around = sum(d.pinned.map((e) => 3 + (e.label == null ? 0 : width(e.label) + 2)));
+    const columns = gapPins.map((pins, g) => {
+      if (g === 0 || g === d.columns) return around;
+      if (pins === 0) return 0;
+      const label = gapLabel[g] > 0 ? gapLabel[g] + 2 : 0;
+      // The gap between two columns is wide enough for one line as it is.
+      return (d.gaps[g].channels > 0 ? 2 * pins : 2 * (pins - 1)) + label;
+    });
+    const last = d.rows.length;
+    const rows = rowPins.map((pins, r) =>
+      (r === 0 || r === last) && d.pinned.length ? 2 * d.pinned.length + 1 : pins);
+    return [columns, rows];
   }
 
   // Whether an edge asks for a channel in a gap rather than a bus between its rows: edges
@@ -1049,7 +1147,289 @@ const diaBits = (() => {
       else if (d.through[e]) drawThrough(g, d, e);
       else if (d.elbow[e]) drawElbow(g, d, e);
     }
-    return g.cells.map((row) => row.join("").replace(/\s+$/, ""));
+    // Lines with a chosen side find their way round everything drawn so far: the shortest
+    // first, so a longer line runs outside the shorter ones it spans instead of crossing them.
+    const order = d.pinned.map((_, i) => i);
+    const key = (i) => {
+      const e = d.pinned[i];
+      return [Math.abs(d.nodes[e.from].row - d.nodes[e.to].row), Math.abs(d.span[e.from][0] - d.span[e.to][0]), i];
+    };
+    order.sort((a, b) => { const ka = key(a), kb = key(b); return ka[0] - kb[0] || ka[1] - kb[1] || ka[2] - kb[2]; });
+    const drawn = { paths: [], ends: [], text: new Set(), band: new Set() };
+    for (const i of order) drawPinned(g, d, d.pinned[i], drawn);
+    let lines = g.cells.map((row) => row.join("").replace(/\s+$/, ""));
+    if (d.pinned.length) {
+      // The room kept round the drawing for these lines: drop what they left empty.
+      let first = lines.findIndex((l) => l !== "");
+      if (first < 0) first = 0;
+      let last = lines.length;
+      while (last > first && lines[last - 1] === "") last--;
+      lines = lines.slice(first, last);
+      const indent = Math.min(...lines.filter((l) => l !== "").map((l) => l.length - l.trimStart().length), Infinity);
+      if (Number.isFinite(indent)) lines = lines.map((l) => l.slice(indent));
+    }
+    return lines;
+  }
+
+  // ----- lines with a chosen side -----
+  // One cell in each direction: up, down, left, right; and arrow heads pointing that way.
+  const STEPS = [[0, -1], [0, 1], [-1, 0], [1, 0]];
+  const HEADS = ["▲", "▼", "◀", "▶"];
+  // What a path pays, besides one per cell, to turn a corner, to cross another line, to run
+  // right beside a shape, to run down beside another line, and to run through the room kept
+  // beside a line for its label.
+  const TURN_COST = 8, CROSS_COST = 10, NEAR_COST = 2, BESIDE_COST = 2, BAND_COST = 6;
+  const isRim = (n, y) => y === n.y || y + 1 === n.y + n.h;
+  const cellKey = (x, y) => y * 65536 + x;
+
+  // The cells just outside side `side` (0 top, 1 bottom, 2 left, 3 right) of shape `n` where
+  // a line can join it, best first. Each side has three anchors: left, middle and right along
+  // the top and bottom (the outer two a quarter of the way in), and top, middle and bottom
+  // down the left and right (the outer two on the outline rows; on a diamond those are the
+  // empty cells at its corners). The anchor asked for comes first, else the middle; then the
+  // middle and the anchor nearer shape `other`, for when that place is taken.
+  function attachPoints(n, side, other, anchor) {
+    let places, toward;
+    if (side < 2) {
+      const row = side === 0 ? n.y - 1 : n.y + n.h;
+      const inset = Math.max(Math.floor(n.w / 4), n.shape === "diamond" ? 2 : 1);
+      places = [n.x + inset, center(n), n.x + n.w - 1 - inset].map((col) => [col, row]);
+      toward = center(other) < center(n) ? 0 : 2;
+    } else {
+      const col = (row) => {
+        const corner = n.shape === "diamond" && isRim(n, row) ? 1 : 0;
+        return side === 2 ? n.x - 1 + corner : n.x + n.w - corner;
+      };
+      places = [n.y, middle(n), n.y + n.h - 1].map((row) => [col(row), row]);
+      toward = middle(other) < middle(n) ? 0 : 2;
+    }
+    const points = [];
+    for (const i of [anchor ?? 1, 1, toward, 2 - toward]) {
+      if (!points.some((p) => p[0] === places[i][0] && p[1] === places[i][1])) points.push(places[i]);
+    }
+    return points;
+  }
+
+  // The cells of a w by h drawing that shapes take up, and the cells right beside a shape.
+  function shapeCells(d, w, h) {
+    const solid = new Array(w * h).fill(false), near = new Array(w * h).fill(false);
+    for (const n of d.nodes) {
+      for (let y = Math.max(0, n.y - 1); y < Math.min(n.y + n.h + 1, h); y++) {
+        for (let x = Math.max(0, n.x - 1); x < Math.min(n.x + n.w + 1, w); x++) {
+          const inside = y >= n.y && y < n.y + n.h && x >= n.x && x < n.x + n.w;
+          // The cells at a diamond's corners are empty: a line can end in one.
+          const corner = n.shape === "diamond" && isRim(n, y) && (x === n.x || x + 1 === n.x + n.w);
+          if (inside && !corner) solid[y * w + x] = true;
+          else near[y * w + x] = true;
+        }
+      }
+    }
+    return [solid, near];
+  }
+
+  // Draw a line that was told which side of a shape to leave or enter, and its label. It
+  // takes the cheapest path over the empty cells of the drawing from the one place to the
+  // other: short, with few corners, crossing other lines only straight on and only when
+  // going round costs more, never through a shape or a label. An end without a chosen side
+  // takes whichever side makes the path cheapest; a chosen place that is taken gives way to
+  // the next anchor on that side. The line leaves and enters a shape straight on. Two lines
+  // told to use the same anchor of a shape share it: the later one runs into the last straight
+  // stretch of the earlier one, the part that enters the shape.
+  function drawPinned(g, d, edge, drawn) {
+    const w = g.cells[0].length, h = g.cells.length;
+    const [solid, near] = shapeCells(d, w, h);
+    const empty = (x, y) => x >= 0 && y >= 0 && x < w && y < h && g.cells[y][x] === " " &&
+      !solid[y * w + x] && !drawn.text.has(cellKey(x, y));
+    // The earlier line that already holds the anchor this end asks for, if any.
+    const shared = (n, other, side, headed) => {
+      if (!side || side.anchor == null) return null;
+      const [x, y] = attachPoints(d.nodes[n], side.side, d.nodes[other], side.anchor)[0];
+      const end = drawn.ends.find((e) => e.node === n && e.headed === headed && e.x === x && e.y === y);
+      return end ? [end.path, drawn.paths[end.path][0][0] === x && drawn.paths[end.path][0][1] === y] : null;
+    };
+    // The line runs from a to b; when it joins an earlier line, that is at b.
+    let ends = [[edge.from, edge.fromSide, edge.arrowFrom], [edge.to, edge.toSide, edge.arrowTo]];
+    let join = shared(edge.to, edge.from, edge.toSide, edge.arrowTo);
+    if (join == null) {
+      join = shared(edge.from, edge.to, edge.fromSide, edge.arrowFrom);
+      if (join != null) ends = [ends[1], ends[0]];
+    }
+    const [[ai, aSide, aHead], [bi, bSide, bHead]] = ends;
+    const a = d.nodes[ai], b = d.nodes[bi];
+    // Where the line may join a shape: the first free anchor on its chosen side, or the
+    // middle of every side that is free. Each is a cell and the direction out of the shape.
+    const joins = (n, other, side) => {
+      const found = [];
+      for (const s of side ? [side.side] : [0, 1, 2, 3]) {
+        const points = attachPoints(n, s, other, side ? side.anchor : null);
+        const point = points.slice(0, side ? points.length : 1).find(([x, y]) => empty(x, y));
+        if (point) found.push([point[1] * w + point[0], s]);
+      }
+      return found;
+    };
+    const starts = joins(a, b, aSide);
+    // Dijkstra over (cell, direction of travel). The line arrives at its last cell
+    // travelling into the shape, or anywhere on the line it joins.
+    const goal = new Uint8Array(w * h * 4), joining = new Uint8Array(w * h);
+    if (join != null) {
+      // The straight stretch of that line next to the shape, up to its first corner.
+      const cells = drawn.paths[join[0]].slice();
+      if (!join[1]) cells.reverse();
+      const level = cells.every((c) => c[1] === cells[0][1]) || (cells.length > 1 && cells[1][1] === cells[0][1]);
+      for (const [x, y] of cells) {
+        if (level ? y !== cells[0][1] : x !== cells[0][0]) break;
+        const there = ARMS[g.cells[y][x]];
+        if (there != null && there !== 15) joining[y * w + x] = 1;
+      }
+    } else {
+      for (const [cell, out] of joins(b, a, bSide)) goal[cell * 4 + (out ^ 1)] = 1;
+    }
+    const noRoom = `no room to draw the line ${edge.text}: try another side, or a row or column further apart`;
+    const isStart = new Uint8Array(w * h);
+    const dist = new Array(w * h * 4).fill(Infinity), prev = new Int32Array(w * h * 4).fill(-1);
+    // A binary heap of [cost, state], smallest cost first, then smallest state.
+    const heap = [];
+    const less = (p, q) => p[0] < q[0] || (p[0] === q[0] && p[1] < q[1]);
+    const push = (item) => {
+      let i = heap.push(item) - 1;
+      while (i > 0) {
+        const up = (i - 1) >> 1;
+        if (!less(heap[i], heap[up])) break;
+        [heap[i], heap[up]] = [heap[up], heap[i]];
+        i = up;
+      }
+    };
+    const pop = () => {
+      const top = heap[0], tail = heap.pop();
+      if (heap.length) {
+        heap[0] = tail;
+        let i = 0;
+        for (;;) {
+          let least = i;
+          for (const c of [2 * i + 1, 2 * i + 2]) if (c < heap.length && less(heap[c], heap[least])) least = c;
+          if (least === i) break;
+          [heap[i], heap[least]] = [heap[least], heap[i]];
+          i = least;
+        }
+      }
+      return top;
+    };
+    for (const [cell, out] of starts) {
+      isStart[cell] = 1;
+      dist[cell * 4 + out] = 0;
+      push([0, cell * 4 + out]);
+    }
+    const upright = (c) => ARMS[c] != null && (ARMS[c] & 3) !== 0;
+    let last = -1;
+    while (heap.length) {
+      const [cost, state] = pop();
+      if (cost > dist[state]) continue;
+      const cell = state >> 2, dir = state & 3;
+      if (goal[state] || joining[cell]) { last = state; break; }
+      const x = cell % w, y = Math.floor(cell / w);
+      const crossing = g.cells[y][x] !== " ";
+      for (let next = 0; next < 4; next++) {
+        // No turning back, no corner on another line, and straight out of a shape.
+        if (next === (dir ^ 1) || (next !== dir && (crossing || isStart[cell]))) continue;
+        const nx = x + STEPS[next][0], ny = y + STEPS[next][1];
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        const to = ny * w + nx;
+        if (solid[to] || drawn.text.has(cellKey(nx, ny))) continue;
+        const there = g.cells[ny][nx];
+        let step;
+        if (joining[to] || there === " ") step = 1;
+        else if ((there === "│" && next >= 2) || (there === "─" && next < 2)) step = 1 + CROSS_COST;
+        else continue;
+        if (near[to]) step += NEAR_COST;
+        if (next < 2 && drawn.band.has(cellKey(nx, ny))) step += BAND_COST;
+        if (next < 2 && !joining[to] &&
+            ((nx > 0 && upright(g.cells[ny][nx - 1])) || (nx + 1 < w && upright(g.cells[ny][nx + 1])))) {
+          step += BESIDE_COST;
+        }
+        if (next !== dir) step += TURN_COST;
+        const then = to * 4 + next;
+        if (cost + step < dist[then]) {
+          dist[then] = cost + step;
+          prev[then] = state;
+          push([cost + step, then]);
+        }
+      }
+    }
+    if (last < 0) throw noRoom;
+    const states = [last];
+    while (prev[states[states.length - 1]] >= 0) states.push(prev[states[states.length - 1]]);
+    states.reverse();
+    const path = states.map((s) => [(s >> 2) % w, Math.floor((s >> 2) / w)]);
+    // The direction out of each shape at its end of the path.
+    const outA = states[0] & 3, outB = (last & 3) ^ 1;
+    const toward = (from, to) => to[1] < from[1] ? 1 : to[1] > from[1] ? 2 : to[0] < from[0] ? 4 : 8;
+    path.forEach(([x, y], i) => {
+      const back = i === 0 ? 1 << (outA ^ 1) : toward([x, y], path[i - 1]);
+      if (i + 1 < path.length) g.put(x, y, lineChar(back | toward([x, y], path[i + 1])));
+      // Run into the line it joins: one more arm on that cell.
+      else if (join != null) g.set(x, y, lineChar((ARMS[g.cells[y][x]] ?? 0) | back));
+      else g.put(x, y, lineChar(back | (1 << (outB ^ 1))));
+    });
+    // Arrow heads point into the shapes; a line that leaves the top or bottom outline row
+    // of a box without one is joined to its corner.
+    const finish = (n, [x, y], out, headed) => {
+      if (headed) g.set(x, y, HEADS[out ^ 1]);
+      else if (out >= 2 && isRim(n, y) && n.shape !== "diamond") {
+        g.set(out === 2 ? n.x : n.x + n.w - 1, y, y === n.y ? "┬" : "┴");
+      }
+    };
+    const index = drawn.paths.length;
+    const tail = path[path.length - 1];
+    finish(a, path[0], outA, aHead);
+    drawn.ends.push({ x: path[0][0], y: path[0][1], node: ai, headed: aHead, path: index });
+    if (join == null) {
+      finish(b, tail, outB, bHead);
+      drawn.ends.push({ x: tail[0], y: tail[1], node: bi, headed: bHead, path: index });
+    }
+
+    if (edge.label != null) {
+      // The label goes beside the line, as near its middle as there is room: right or left
+      // of a part running up and down, above or under a part running across.
+      const wide = width(edge.label);
+      const clear = (x0, x1, y) => {
+        if (x0 < 0 || y < 0 || y >= h) return false;
+        for (let x = x0; x <= x1; x++) if (x < w && !empty(x, y)) return false;
+        return true;
+      };
+      const mid = Math.floor(path.length / 2);
+      const order = path.map((_, i) => i).sort((p, q) => Math.abs(p - mid) - Math.abs(q - mid) || p - q);
+      let place = null, beside = null;
+      for (const i of order) {
+        const [x, y] = path[i];
+        const up = [i - 1, i + 1].some((j) => path[j] && path[j][0] === x);
+        const half = Math.floor(wide / 2);
+        // Beside an upright part the label goes on the side away from the shapes when the
+        // line runs left of them both, so it reads as that line's and not its neighbour's.
+        const outside = x < Math.min(center(a), center(b));
+        const spots = !up ? [[x - half, y - 1], [x - half, y + 1]]
+          : outside ? [[x - 1 - wide, y], [x + 2, y]] : [[x + 2, y], [x - 1 - wide, y]];
+        const spot = spots.find(([at, row]) => clear(at - 1, at + wide, row));
+        if (spot) { place = spot; beside = up ? i : null; break; }
+      }
+      // Nowhere beside the line: out to the right of the drawing, level with its middle.
+      const [at, row] = place ?? [w + 1, path[mid][1]];
+      g.text(at, row, edge.label);
+      const x0 = Math.max(0, at - 1), x1 = at + wide;
+      for (let x = x0; x <= x1; x++) drawn.text.add(cellKey(x, row));
+      // Beside an upright part: keep later lines out of the label's columns all the way
+      // along that part.
+      if (beside != null) {
+        const x = path[beside][0];
+        let i0 = beside, i1 = beside;
+        while (i0 > 0 && path[i0 - 1][0] === x) i0--;
+        while (i1 + 1 < path.length && path[i1 + 1][0] === x) i1++;
+        const y0 = i0 === beside ? row : path[i0][1], y1 = i1 === beside ? row : path[i1][1];
+        for (let y = Math.min(y0, y1); y <= Math.max(y0, y1); y++) {
+          for (let cx = x0; cx <= x1; cx++) drawn.band.add(cellKey(cx, y));
+        }
+      }
+    }
+    drawn.paths.push(path);
   }
 
   function pad(s, w) {
@@ -1058,33 +1438,40 @@ const diaBits = (() => {
     return " ".repeat(left) + s + " ".repeat(extra - left);
   }
 
+  // A shape's outline with its label lines inside, one per row. A diamond with several
+  // lines keeps its pointed sides on every label row, so it comes out hexagon-like.
   function drawShape(g, x, y, w, shape, label) {
     const inner = w - 2;
+    const lines = labelLines(label);
+    const bottom = y + lines.length + 1;
     if (shape === "diamond") {
       g.text(x, y, ` ╱${"‾".repeat(w - 4)}╲`);
-      g.text(x, y + 1, `⟨${pad(label, w - 2)}⟩`);
-      g.text(x, y + 2, ` ╲${"_".repeat(w - 4)}╱`);
+      lines.forEach((line, i) => g.text(x, y + 1 + i, `⟨${pad(line, w - 2)}⟩`));
+      g.text(x, bottom, ` ╲${"_".repeat(w - 4)}╱`);
       return;
     }
     const [tl, tr, bl, br] = shape === "box" ? ["┌", "┐", "└", "┘"] : ["╭", "╮", "╰", "╯"];
     g.text(x, y, `${tl}${"─".repeat(inner)}${tr}`);
-    g.text(x, y + 1, `│${pad(label, inner)}│`);
-    g.text(x, y + 2, `${bl}${"─".repeat(inner)}${br}`);
+    lines.forEach((line, i) => g.text(x, y + 1 + i, `│${pad(line, inner)}│`));
+    g.text(x, bottom, `${bl}${"─".repeat(inner)}${br}`);
   }
 
   function drawRegion(g, d, r) {
     const plan = regionPlan(d, r);
     const top = Math.max(0, ...d.rows[r].map((n) => d.nodes[n].y + d.nodes[n].h));
-    const bottom = top + plan.height;
-    const arrowRow = bottom - 1;
+    const bottom = top + plan.height; // first row of the lower shapes
     const entryRow = plan.levels > 0 || plan.height > 2 ? bottom - 2 : top;
 
     for (const e of plan.direct) {
-      const [u, , au, al] = vertical(d, e);
-      const x = center(d.nodes[u]);
-      for (let y = top; y < bottom; y++) g.put(x, y, "│");
-      if (au) g.put(x, top, "▲");
-      g.put(x, arrowRow, al ? "▼" : "│");
+      const [u, l, au, al] = vertical(d, e);
+      const upper = d.nodes[u], lower = d.nodes[l];
+      const x = center(upper);
+      // Shapes shorter than their row are centred in it: the line runs from the upper
+      // shape's own bottom to the lower shape's own top.
+      const exit = upper.y + upper.h, entry = lower.y;
+      for (let y = exit; y < entry; y++) g.put(x, y, "│");
+      if (au) g.put(x, exit, "▲");
+      g.put(x, entry - 1, al ? "▼" : "│");
       if (d.edges[e].label != null) g.text(x + 2, entryRow, d.edges[e].label);
     }
 
@@ -1099,14 +1486,16 @@ const diaBits = (() => {
       });
       for (const u of bus.uppers) {
         const x = center(d.nodes[u]);
-        for (let y = top; y < busRow; y++) g.put(x, y, "│");
-        if (arrowUp(u)) g.put(x, top, "▲");
+        const exit = d.nodes[u].y + d.nodes[u].h;
+        for (let y = exit; y < busRow; y++) g.put(x, y, "│");
+        if (arrowUp(u)) g.put(x, exit, "▲");
       }
       for (const l of bus.lowers) {
         const x = center(d.nodes[l]);
-        for (let y = busRow + 1; y < bottom; y++) g.put(x, y, "│");
+        const entry = d.nodes[l].y;
+        for (let y = busRow + 1; y < entry; y++) g.put(x, y, "│");
         const down = bus.edges.some((e) => vertical(d, e)[1] === l && vertical(d, e)[3]);
-        g.put(x, arrowRow, down ? "▼" : "│");
+        g.put(x, entry - 1, down ? "▼" : "│");
       }
       // The bus itself, with junctions where lines leave it.
       for (let x = lo; x <= hi; x++) {
@@ -1196,9 +1585,9 @@ const diaBits = (() => {
     const uy = route.upperCorner ? upper.y + upper.h - 1 : middle(upper);
     const ly = route.lowerCorner ? lower.y : middle(lower);
     // The cell of the shape's outline the arm meets on row y: a diamond's top and bottom
-    // rows are a cell narrower on each side than its middle.
+    // rows are a cell narrower on each side than its label rows.
     const boundary = (n, left, y) => {
-      if (n.shape === "diamond" && y !== middle(n)) return left ? n.x + 1 : n.x + n.w - 2;
+      if (n.shape === "diamond" && isRim(n, y)) return left ? n.x + 1 : n.x + n.w - 2;
       return left ? n.x : n.x + n.w - 1;
     };
     // The arm from the shape to the channel, ending in an arrow head or, when it leaves a
@@ -1243,33 +1632,34 @@ const diaBits = (() => {
       if (depth > above + 1) throw `line ${at}: ${depth} dots, but the shape above has ${above}: one more dot per level`;
       const shape = parseShape(item);
       if (!shape) throw `line ${at}: '${item}' is not id[label], id(label) or id<label>`;
-      if (ids.has(shape.id)) throw `line ${at}: '${shape.id}' is defined twice`;
-      ids.set(shape.id, nodes.length);
-      nodes.push({ label: shape.label.trim(), shape: shape.shape, depth, x: 0, y: 0, w: 0 });
+      if (ids.has(shape.id.toLowerCase())) throw `line ${at}: '${shape.id}' is defined twice`;
+      ids.set(shape.id.toLowerCase(), nodes.length);
+      nodes.push({ label: shape.label.trim(), shape: shape.shape, depth, x: 0, y: 0, w: 0, h: 0 });
     }
     if (!nodes.length) throw "no shapes: add lines like id[label] and .child[label]";
     return nodes;
   }
 
-  // Shapes in order, each three rows tall, children indented under their parent; a blank
+  // Shapes in order, each as tall as its label needs, children indented under their parent; a blank
   // row separates one root's tree from the next.
   function layoutTree(nodes) {
     let y = 0;
     const lefts = []; // left edge of the current shape at each depth
     nodes.forEach((n, i) => {
       n.w = shapeWidth(n.shape, n.label);
+      n.h = shapeHeight(n.label);
       if (i > 0 && n.depth === 0) y += 1;
       n.x = n.depth === 0 ? 0 : lefts[n.depth - 1] + TREE_INDENT;
       lefts.length = n.depth;
       lefts.push(n.x);
       n.y = y;
-      y += 3;
+      y += n.h;
     });
   }
 
   function drawTree(nodes) {
     const w = Math.max(0, ...nodes.map((n) => n.x + n.w));
-    const h = Math.max(0, ...nodes.map((n) => n.y + 3));
+    const h = Math.max(0, ...nodes.map((n) => n.y + n.h));
     const g = new Grid(w, h);
     for (const n of nodes) drawShape(g, n.x, n.y, n.w, n.shape, n.label);
     nodes.forEach((n, i) => {
@@ -1281,10 +1671,10 @@ const diaBits = (() => {
       if (!children.length) return;
       const last = children[children.length - 1];
       const trunk = n.x + TREE_TRUNK;
-      if (n.shape !== "diamond") g.put(trunk, n.y + 2, "┬");
-      for (let y = n.y + 3; y < last.y + 1; y++) g.put(trunk, y, "│");
+      if (n.shape !== "diamond") g.put(trunk, n.y + n.h - 1, "┬");
+      for (let y = n.y + n.h; y < last.y + Math.floor(last.h / 2); y++) g.put(trunk, y, "│");
       for (const child of children) {
-        const y = child.y + 1;
+        const y = child.y + Math.floor(child.h / 2);
         g.put(trunk, y, child === last ? "└" : "├");
         for (let x = trunk + 1; x < child.x; x++) g.put(x, y, "─");
       }
@@ -1313,7 +1703,8 @@ if (typeof module !== "undefined") module.exports = diaBits;
 "use strict";
 // ======================================================================================
 // The wiki model: a port of the rules in src/wiki.rs (page ids, titles, link resolution,
-// index pages standing for their folders, .order files, backlinks, search).
+// index pages (or pages named like their folder) standing for their folders, .order files,
+// backlinks, search).
 // ======================================================================================
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
@@ -1350,7 +1741,9 @@ function escapeLinkPipes(text) {
 // What a page is parsed from: its text past the front matter, link pipes escaped.
 const parsable = (text) => escapeLinkPipes(stripFrontMatter(text));
 
-// The first `# Heading` in the file, skipping YAML front matter.
+// The page's `# Heading`, if that is the first line of the file (YAML front matter and blank
+// lines before it aside). A `# Heading` further down is an ordinary heading, and the page is
+// then named after its file.
 function extractTitle(text) {
   const lines = text.split(/\r?\n/);
   let i = 0;
@@ -1359,13 +1752,11 @@ function extractTitle(text) {
     while (i < lines.length && lines[i].trim() !== "---") i++;
     i++;
   }
-  for (; i < lines.length; i++) {
-    const t = lines[i].trimStart();
-    if (!t.startsWith("# ")) continue;
-    const heading = t.slice(2).trim();
-    if (heading) return heading.replace(/#+$/, "").trim();
-  }
-  return null;
+  while (i < lines.length && !lines[i].trim()) i++;
+  const t = (lines[i] || "").trimStart();
+  if (!t.startsWith("# ")) return null;
+  const heading = t.slice(2).trim();
+  return heading ? heading.replace(/#+$/, "").trim() : null;
 }
 
 function normalize(path) {
@@ -1379,16 +1770,8 @@ function normalize(path) {
 }
 
 const isIndexId = (id) => id === "index" || id.endsWith("/index");
-const indexId = (folder) => (folder ? folder + "/index" : "index");
 const dirOf = (id) => (id.includes("/") ? id.slice(0, id.lastIndexOf("/")) : "");
 const lastSegment = (p) => p.split("/").pop();
-
-// The link target that reaches a page: the folder for an index page ("/" for the root).
-function linkTargetFor(id) {
-  if (id === "index") return "/";
-  if (id.endsWith("/index")) return id.slice(0, -6);
-  return id;
-}
 
 function decodeHref(href) {
   if (!/%[0-9a-f]{2}/i.test(href)) return href;
@@ -1397,8 +1780,11 @@ function decodeHref(href) {
 
 class Wiki {
   // files: Map of path (relative to the wiki root) -> { text?: string } for every file.
-  constructor(files) {
+  // `rootName` is the name of the wiki's own folder: a root page with that name is the home
+  // page when there is no root index.md.
+  constructor(files, rootName = "") {
     this.files = files;
+    this.rootName = rootName;
     this.pages = new Map();
     this.orders = new Map();
     const ids = [];
@@ -1416,6 +1802,7 @@ class Wiki {
       const text = files.get(id + ".md").text || "";
       this.pages.set(id, { id, text, title: extractTitle(text) || prettify(id), links: extractLinks(text) });
     }
+    this.folderPages = this.findFolderPages();
     this.backlinks = new Map();
     for (const page of this.pages.values()) {
       for (const raw of page.links) {
@@ -1431,7 +1818,48 @@ class Wiki {
   title(id) { return this.pages.get(id)?.title ?? prettify(id); }
   backlinksOf(id) { return this.backlinks.get(id) || []; }
 
+  // The page that stands for each folder ("" is the root). `index` wins; without one, a page
+  // inside the folder with the folder's own name does (recipes/recipes, any case), exact
+  // case first; without that, the page beside the folder with its name (recipes.md next to
+  // recipes/, the layout Azure DevOps wikis use).
+  findFolderPages() {
+    const found = new Map();
+    const rank = (name, folderName) => name === "index" ? 0
+      : name === folderName ? 1
+      : folderName && name.toLowerCase() === folderName.toLowerCase() ? 2 : null;
+    for (const id of this.pages.keys()) {
+      const folder = dirOf(id);
+      const folderName = folder ? lastSegment(folder) : this.rootName;
+      const r = rank(lastSegment(id), folderName);
+      if (r == null) continue;
+      const old = found.has(folder) ? rank(lastSegment(found.get(folder)), folderName) : null;
+      if (old == null || r < old) found.set(folder, id);
+    }
+    for (const id of this.pages.keys()) {
+      for (let folder = dirOf(id); folder; folder = dirOf(folder)) {
+        if (this.pages.has(folder) && !found.has(folder)) found.set(folder, folder);
+      }
+    }
+    return found;
+  }
+
+  // The folder a page stands for ("" for the root), or null if it is an ordinary page: the
+  // folder it is in, or for a page beside its folder, the folder with the page's own path.
+  folderOfPage(id) {
+    const folder = dirOf(id);
+    if (this.folderPages.get(folder) === id) return folder;
+    return this.folderPages.get(id) === id ? id : null;
+  }
+
+  // The link target that reaches a page: the folder for a folder's page ("/" for the root).
+  linkTarget(id) {
+    const folder = this.folderOfPage(id);
+    return folder == null ? id : folder === "" ? "/" : folder;
+  }
+
   landingPage() {
+    const home = this.folderIndex("");
+    if (home) return home;
     for (const name of ["index", "home", "readme"]) {
       for (const id of this.pages.keys()) if (id.toLowerCase() === name) return id;
     }
@@ -1465,20 +1893,18 @@ class Wiki {
   }
 
   findPage(candidate) {
-    const index = indexId(candidate);
     if (this.pages.has(candidate)) return candidate;
-    if (this.pages.has(index)) return index;
-    const lc = candidate.toLowerCase(), li = index.toLowerCase();
-    for (const id of this.pages.keys()) {
-      const l = id.toLowerCase();
-      if (l === lc || l === li) return id;
-    }
+    if (this.folderPages.has(candidate)) return this.folderPages.get(candidate);
+    const lc = candidate.toLowerCase();
+    for (const id of this.pages.keys()) if (id.toLowerCase() === lc) return id;
+    for (const [folder, id] of this.folderPages) if (folder.toLowerCase() === lc) return id;
     return null;
   }
 
+  // The page that stands for a folder ("" for the root): its index page, else the page
+  // named like the folder.
   folderIndex(folder) {
-    const id = indexId(folder);
-    return this.pages.has(id) ? id : null;
+    return this.folderPages.get(folder) ?? null;
   }
 
   // An image path written in page `from`: relative to the page's folder, else to the root.
@@ -1512,8 +1938,8 @@ class Wiki {
     const fold = (nodes) => {
       for (const n of nodes) {
         if (n.type !== "folder") continue;
-        const wanted = indexId(n.path);
-        const pos = n.children.findIndex((c) => c.type === "page" && c.id === wanted);
+        const wanted = this.folderPages.get(n.path);
+        const pos = wanted == null ? -1 : n.children.findIndex((c) => c.type === "page" && c.id === wanted);
         if (pos >= 0) {
           const [page] = n.children.splice(pos, 1);
           n.name = page.title;
@@ -1521,12 +1947,21 @@ class Wiki {
         }
         fold(n.children);
       }
+      // A page beside its folder (b.md next to b/) folds into the folder row the same way.
+      for (const page of nodes.filter((n) => n.type === "page" && this.folderPages.get(n.id) === n.id)) {
+        const folder = nodes.find((n) => n.type === "folder" && n.path === page.id);
+        if (!folder) continue;
+        folder.name = page.title;
+        folder.index = page.id;
+        nodes.splice(nodes.indexOf(page), 1);
+      }
     };
     fold(root);
     const sortTree = (nodes, folder) => {
       const order = this.orders.get(folder) || [];
       const rank = (name) => { const i = order.indexOf(name); return i < 0 ? Infinity : i; };
-      const key = (n) => n.type === "page" && n.id === "index"
+      const home = this.folderPages.get("");
+      const key = (n) => n.type === "page" && n.id === home
         ? [0, 0, ""]
         : n.type === "folder"
           ? [1, rank(lastSegment(n.path)), n.name.toLowerCase()]
@@ -1576,7 +2011,7 @@ class Wiki {
   }
 
   orphanPages() {
-    return [...this.pages.keys()].filter((id) => id !== "index" && !this.backlinksOf(id).length);
+    return [...this.pages.keys()].filter((id) => this.folderOfPage(id) !== "" && !this.backlinksOf(id).length);
   }
 }
 
@@ -1599,7 +2034,10 @@ const wikiLinkExtension = {
     const body = m[1].replace(/\\\|/g, "|"), bar = body.indexOf("|");
     return { type: "wikilink", raw: m[0], target: bar < 0 ? body : body.slice(0, bar), label: bar < 0 ? null : body.slice(bar + 1) };
   },
-  renderer(token) { return render.wikiLink(token); },
+  renderer(token) {
+    const html = render.wikiLink(token);
+    return token.marked ? `<span class="hl">${html}</span>` : html;
+  },
 };
 
 // A literal \n in the text breaks the line, as <br> does (code spans keep it as written).
@@ -1664,7 +2102,7 @@ const render = {
   },
 
   hrefFor(target) {
-    const route = "#/" + encodeURI(linkTargetFor(target.id).replace(/^\/$/, ""));
+    const route = "#/" + encodeURI(this.wiki.linkTarget(target.id).replace(/^\/$/, ""));
     return target.anchor ? route + "#" + encodeURI(target.anchor) : route;
   },
 
@@ -1747,8 +2185,18 @@ md.use({
       const label = lang ? `<span class="lang">${esc(lang)}</span>` : "";
       return `<pre>${label}<code>${esc(token.text)}</code></pre>\n`;
     },
+    // Text between <mark> and </mark> (flagged by markHighlights) is highlighted.
+    text(token) {
+      if (!token.marked) return false;
+      return `<span class="hl">${token.escaped ? token.text : esc(token.text)}</span>`;
+    },
+    codespan(token) {
+      if (!token.marked) return false;
+      return `<span class="hl"><code>${esc(token.text)}</code></span>`;
+    },
     html(token) {
       if (!token.block && /^<br\s*\/?>$/i.test(token.text.trim())) return "<br>";
+      if (token.markTag) return "";
       return token.block ? `<p>${esc(token.text)}</p>\n` : esc(token.text);
     },
     listitem(item) {
@@ -1890,6 +2338,37 @@ function fixTable(table) {
   table.replaceChildren(...(headerEmpty ? [] : [thead]), tbody);
 }
 
+// Whether an inline HTML tag opens (true) or closes (false) a highlight; null for any other.
+function markTag(html) {
+  const m = /^<(\/?)mark(\s[^>]*)?>$/i.exec(html.trim());
+  return m ? !m[1] : null;
+}
+
+// <mark>text</mark> highlights the text. The tags themselves are dropped and the text,
+// code spans and wiki links between them are flagged, so the highlight follows the words
+// however the tags sit among bold or link marks. A <mark> left open ends with its
+// paragraph, heading, list item or table cell.
+function markHighlights(tokens) {
+  const run = (inline, state) => {
+    for (const t of inline || []) {
+      const tag = t.type === "html" && !t.block ? markTag(t.text) : null;
+      if (tag != null) {
+        t.markTag = true;
+        state.open = tag ? state.open + 1 : Math.max(0, state.open - 1);
+      } else if (t.tokens && t.tokens.length) run(t.tokens, state);
+      else if (state.open && ["text", "escape", "codespan", "wikilink"].includes(t.type)) t.marked = true;
+    }
+  };
+  md.walkTokens(tokens, (t) => {
+    if (t.type === "table") {
+      for (const cell of [...t.header, ...t.rows.flat()]) run(cell.tokens, { open: 0 });
+    } else if (t.type === "paragraph" || t.type === "heading" || (t.type === "text" && t.tokens)) {
+      // (An inline text token has no tokens of its own, so only block text gets here.)
+      run(t.tokens, { open: 0 });
+    }
+  });
+}
+
 function renderPage(wiki, source, id) {
   const page = wiki.pages.get(id);
   render.wiki = wiki;
@@ -1907,6 +2386,7 @@ function renderPage(wiki, source, id) {
     titleId = "title";
     render.headings.push({ depth: 1, text: t.text, id: titleId, title: true });
   }
+  markHighlights(tokens);
   const html = md.parser(tokens);
   return { html, headings: render.headings, links: render.links };
 }
@@ -2008,6 +2488,10 @@ class GitHubSource {
   get label() {
     return `${this.owner}/${this.repo}${this.root ? "/" + this.root : ""} @ ${this.ref}`;
   }
+  // The name of the wiki's own folder: the last folder of its path, or the repository.
+  get rootName() {
+    return this.root ? lastSegment(this.root) : this.repo;
+  }
 
   webUrl(path) {
     const full = (this.root ? this.root + "/" : "") + path;
@@ -2095,6 +2579,7 @@ class LocalSource {
     this.name = first;
   }
   get label() { return `${this.name} (on this computer)`; }
+  get rootName() { return this.name; }
   webUrl() { return null; }
   async load(progress) {
     const files = new Map();
@@ -2173,7 +2658,7 @@ async function openSource(source) {
   source.files = files;
   state.source = source;
   state.files = files;
-  state.wiki = new Wiki(files);
+  state.wiki = new Wiki(files, source.rootName);
   state.open = new Set();
   $("start").classList.add("hidden");
   $("app").classList.remove("hidden");
@@ -2238,7 +2723,7 @@ function showPage(id, path, anchor) {
   const out = renderPage(state.wiki, state.source, id);
   const web = state.source.webUrl(id + ".md");
   main.innerHTML = `
-    <div class="crumbs">${id === "index" ? "&nbsp;" : crumbs(id)}</div>
+    <div class="crumbs">${state.wiki.folderOfPage(id) === "" ? "&nbsp;" : crumbs(id)}</div>
     <div class="page-head">
       <h1 id="h-title">${esc(page.title)}</h1>
       <div class="page-tools">
@@ -2328,12 +2813,13 @@ function highlight(root, words) {
   return first;
 }
 
-// The home page (the root index.md) heads the tree, with every other page and folder nested
+// The home page (the root folder's page) heads the tree, with every other page and folder nested
 // under it, so the whole wiki reads as one tree under its name.
 function nestUnderHome(nodes) {
-  if (!nodes.length || nodes[0].type !== "page" || nodes[0].id !== "index") return nodes;
+  const homeId = state.wiki.folderIndex("");
+  if (!nodes.length || nodes[0].type !== "page" || nodes[0].id !== homeId) return nodes;
   const [home, ...rest] = nodes;
-  return [{ type: "folder", name: home.title, path: "", index: "index", children: rest }];
+  return [{ type: "folder", name: home.title, path: "", index: homeId, children: rest }];
 }
 
 function drawTree() {
@@ -2343,7 +2829,7 @@ function drawTree() {
   const ancestors = new Set();
   let f = dirOf(cur);
   while (f) { ancestors.add(f); f = dirOf(f); }
-  if (cur.endsWith("/index")) ancestors.add(cur.slice(0, -6));
+  if (wiki.folderOfPage(cur)) ancestors.add(wiki.folderOfPage(cur));
   const openAll = wiki.pages.size <= 40;
   const isOpen = (path) => (path === "" && !state.open.has("!")) || state.open.has(path) || ancestors.has(path) || (openAll && !state.open.has("!" + path));
   const build = (nodes) => {
@@ -2352,7 +2838,7 @@ function drawTree() {
       const li = document.createElement("li");
       if (n.type === "page") {
         const a = document.createElement("a");
-        a.href = "#/" + encodeURI(linkTargetFor(n.id).replace(/^\/$/, ""));
+        a.href = "#/" + encodeURI(state.wiki.linkTarget(n.id).replace(/^\/$/, ""));
         a.textContent = n.title;
         a.title = n.id;
         if (n.id === cur) a.className = "current";
@@ -2421,7 +2907,7 @@ function drawRelated(id, out) {
   parts.push(`<h3>Backlinks</h3>`);
   const back = wiki.backlinksOf(id);
   if (back.length) {
-    parts.push(`<ul>` + back.map((b) => `<li><a href="#/${esc(encodeURI(linkTargetFor(b).replace(/^\/$/, "")))}" title="${esc(b)}">${esc(wiki.title(b))}</a></li>`).join("") + `</ul>`);
+    parts.push(`<ul>` + back.map((b) => `<li><a href="#/${esc(encodeURI(state.wiki.linkTarget(b).replace(/^\/$/, "")))}" title="${esc(b)}">${esc(wiki.title(b))}</a></li>`).join("") + `</ul>`);
   } else parts.push(`<div class="empty">Nothing links here</div>`);
   $("related").innerHTML = parts.join("");
 }
@@ -2429,7 +2915,7 @@ function drawRelated(id, out) {
 function showReport() {
   const wiki = state.wiki;
   state.current = null;
-  const href = (id) => "#/" + encodeURI(linkTargetFor(id).replace(/^\/$/, ""));
+  const href = (id) => "#/" + encodeURI(state.wiki.linkTarget(id).replace(/^\/$/, ""));
   const broken = wiki.brokenLinks();
   const orphans = wiki.orphanPages();
   $("page").innerHTML = `
@@ -2460,7 +2946,7 @@ function drawResults() {
   selected = Math.min(selected, Math.max(0, hits.length - 1));
   box.classList.remove("hidden");
   if (!hits.length) { box.innerHTML = `<div class="none">No pages match</div>`; return; }
-  box.innerHTML = hits.map((h, i) => `<a href="#/${esc(encodeURI(linkTargetFor(h.id).replace(/^\/$/, "")))}" data-i="${i}" class="${i === selected ? "sel" : ""}">
+  box.innerHTML = hits.map((h, i) => `<a href="#/${esc(encodeURI(state.wiki.linkTarget(h.id).replace(/^\/$/, "")))}" data-i="${i}" class="${i === selected ? "sel" : ""}">
       <div class="t">${esc(h.title)}</div><div class="p">${esc(h.id)}</div>${h.snippet ? `<div class="s">${esc(h.snippet)}</div>` : ""}</a>`).join("");
 }
 function openHit(a) {

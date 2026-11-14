@@ -17,7 +17,12 @@
 //!
 //! Each line of shapes is a row of the diagram, top to bottom; shapes on one line share the
 //! row. `id[label]` is a box, `id(label)` a pill, `id<label>` a diamond. Lines are `-->`,
-//! `<--`, `<->` or `---` between ids, chainable, with `| label` at the end.
+//! `<--`, `<->` or `---` between ids, chainable, with `| label` at the end. An id in a line
+//! can name the side of the shape the line leaves or enters: `a(R) --> b(T)`, with `T`, `B`,
+//! `L` or `R` for the top, bottom, left or right. Each side has three anchors, and
+//! `a(T:R) --> b(B:L)` picks one: `L`, `M` or `R` along the top and bottom, `T`, `M` or `B`
+//! down the left and right. Such a line is drawn after the others, by the shortest clear
+//! path between those places.
 //!
 //! ```text
 //! diaType: tree
@@ -31,7 +36,7 @@
 //! parent, and the lines from a parent down and across to its children are implied. Any
 //! number of roots (no dots) can follow each other.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use unicode_width::UnicodeWidthStr;
 
@@ -79,6 +84,39 @@ fn shape_height(label: &str) -> usize {
     label_lines(label).len() + 2
 }
 
+/// A side of a shape, chosen for a line with `id(T)`, `id(B)`, `id(L)` or `id(R)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+const SIDES: [Side; 4] = [Side::Top, Side::Bottom, Side::Left, Side::Right];
+
+impl Side {
+    fn parse(text: &str) -> Option<Side> {
+        Some(match text.to_ascii_uppercase().as_str() {
+            "T" => Side::Top,
+            "B" => Side::Bottom,
+            "L" => Side::Left,
+            "R" => Side::Right,
+            _ => return None,
+        })
+    }
+
+    /// The direction a line leaves the shape in: 0 up, 1 down, 2 left, 3 right.
+    fn out(self) -> usize {
+        match self {
+            Side::Top => 0,
+            Side::Bottom => 1,
+            Side::Left => 2,
+            Side::Right => 3,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Edge {
     from: usize,
@@ -86,6 +124,12 @@ struct Edge {
     arrow_from: bool,
     arrow_to: bool,
     label: Option<String>,
+    /// The side of each shape the line was told to use, if any, and the anchor on that side:
+    /// 0 for the first (left or top), 1 for the middle, 2 for the last (right or bottom).
+    from_side: Option<(Side, Option<usize>)>,
+    to_side: Option<(Side, Option<usize>)>,
+    /// The line as written (`a(R) --> b`), for messages.
+    text: String,
 }
 
 impl Edge {
@@ -102,6 +146,9 @@ impl Edge {
 struct Diagram {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+    /// Lines told which side of a shape to use. They take no part in the planning of the
+    /// others: they are routed last, round whatever is drawn by then.
+    pinned: Vec<Edge>,
     rows: Vec<Vec<usize>>,
     /// For each row: `Some(slot count)` when the line used empty slots (`,, z(End)`) to put
     /// shapes in explicit columns; `None` when its shapes spread over the columns.
@@ -191,7 +238,7 @@ pub fn render(source: &str) -> Result<Vec<String>, String> {
         Kind::Flowchart => {
             let mut diagram = parse(source)?;
             layout(&mut diagram);
-            Ok(draw(&diagram))
+            draw(&diagram)
         }
         Kind::Tree => {
             let mut nodes = parse_tree(source)?;
@@ -206,6 +253,7 @@ pub fn render(source: &str) -> Result<Vec<String>, String> {
 fn parse(source: &str) -> Result<Diagram, String> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges = Vec::new();
+    let mut pinned = Vec::new();
     let mut rows: Vec<Vec<usize>> = Vec::new();
     let mut explicit: Vec<Option<usize>> = Vec::new();
     let mut ids: HashMap<String, usize> = HashMap::new();
@@ -243,23 +291,65 @@ fn parse(source: &str) -> Result<Diagram, String> {
                         ));
                     }
                 };
-                let lookup = |id: &str| {
-                    ids.get(id).copied().ok_or_else(|| {
+                // `id`, `id(side)` or `id(side:anchor)`.
+                type Place = Option<(Side, Option<usize>)>;
+                let lookup = |token: &str| -> Result<(usize, Place), String> {
+                    let (id, side) = match token.strip_suffix(')').and_then(|t| t.split_once('('))
+                    {
+                        Some((id, place)) => {
+                            let (name, anchor) = match place.split_once(':') {
+                                Some((name, anchor)) => (name, Some(anchor)),
+                                None => (place, None),
+                            };
+                            let side = Side::parse(name).ok_or_else(|| {
+                                format!("line {at}: side '{name}' of '{id}' is not T, B, L or R")
+                            })?;
+                            let across = matches!(side, Side::Top | Side::Bottom);
+                            let anchor = match anchor.map(|a| a.to_ascii_uppercase()).as_deref() {
+                                None => None,
+                                Some("M") => Some(1),
+                                Some("L") if across => Some(0),
+                                Some("R") if across => Some(2),
+                                Some("T") if !across => Some(0),
+                                Some("B") if !across => Some(2),
+                                Some(other) => {
+                                    return Err(format!(
+                                        "line {at}: anchor '{other}' on side {} of '{id}' is not {}",
+                                        name.to_ascii_uppercase(),
+                                        if across { "L, M or R" } else { "T, M or B" }
+                                    ));
+                                }
+                            };
+                            (id, Some((side, anchor)))
+                        }
+                        None => (token, None),
+                    };
+                    let node = ids.get(&id.to_lowercase()).copied().ok_or_else(|| {
                         format!("line {at}: no shape named '{id}' (define it first)")
-                    })
+                    })?;
+                    Ok((node, side))
                 };
-                let (from, to) = (lookup(from)?, lookup(to)?);
+                let text = format!("{from} {op} {to}");
+                let ((from, from_side), (to, to_side)) = (lookup(from)?, lookup(to)?);
                 if from == to {
                     return Err(format!("line {at}: a line from a shape to itself"));
                 }
-                edges.push(Edge {
+                let edge = Edge {
                     from,
                     to,
                     arrow_from,
                     arrow_to,
                     // A label on a chain goes on its last line.
                     label: if i + 1 == count { label.clone() } else { None },
-                });
+                    from_side,
+                    to_side,
+                    text,
+                };
+                if from_side.is_some() || to_side.is_some() {
+                    pinned.push(edge);
+                } else {
+                    edges.push(edge);
+                }
             }
             continue;
         }
@@ -274,10 +364,11 @@ fn parse(source: &str) -> Result<Diagram, String> {
             let (id, label, shape) = parse_shape(item).ok_or_else(|| {
                 format!("line {at}: '{item}' is not id[label], id(label) or id<label>")
             })?;
-            if ids.contains_key(id) {
+            // Ids are matched whatever their case: `A` and `a` name the same shape.
+            if ids.contains_key(&id.to_lowercase()) {
                 return Err(format!("line {at}: '{id}' is defined twice"));
             }
-            ids.insert(id.to_string(), nodes.len());
+            ids.insert(id.to_lowercase(), nodes.len());
             row.push(nodes.len());
             nodes.push(Node {
                 label: label.trim().to_string(),
@@ -302,6 +393,7 @@ fn parse(source: &str) -> Result<Diagram, String> {
     Ok(Diagram {
         nodes,
         edges,
+        pinned,
         rows,
         explicit,
         columns: 0,
@@ -628,15 +720,23 @@ fn layout(d: &mut Diagram) {
         d.elbow[e] = takes_elbow(d, e);
     }
     channel_plan(d);
+    // Lines with a chosen side are routed once everything else is drawn; they get room of
+    // their own beside and between the shapes they leave or enter.
+    let (extra_columns, extra_rows) = pinned_room(d);
     for g in 1..columns {
-        gaps[g - 1] = gaps[g - 1].max(gap_width(d.gaps[g], g, columns));
+        gaps[g - 1] = gaps[g - 1].max(gap_width(d.gaps[g], g, columns)) + extra_columns[g];
     }
-    place(d, &widths, &gaps, gap_width(d.gaps[0], 0, columns));
-    d.gaps[columns].width = gap_width(d.gaps[columns], columns, columns);
+    place(
+        d,
+        &widths,
+        &gaps,
+        gap_width(d.gaps[0], 0, columns) + extra_columns[0],
+    );
+    d.gaps[columns].width = gap_width(d.gaps[columns], columns, columns) + extra_columns[columns];
     // Vertical positions: a row is as tall as its tallest shape, the others centred on its
     // middle row so a line along the row meets them all; each gap between rows is as tall
     // as its edges need.
-    let mut y = 0;
+    let mut y = extra_rows[0];
     for r in 0..d.rows.len() {
         let tallest = d.rows[r].iter().map(|&n| d.nodes[n].h).max().unwrap_or(3);
         for &n in &d.rows[r] {
@@ -647,8 +747,71 @@ fn layout(d: &mut Diagram) {
         if r + 1 < region_count(d) + 1 {
             y += region_plan(d, r).height;
         }
+        y += extra_rows[r + 1];
     }
     d.height = y;
+}
+
+/// Room for the lines with a chosen side: columns to add to each gap (gap 0 is left of the
+/// first column) and rows to add above each row of shapes (the last entry is under the last
+/// row). A line leaving a side needs a column or row there to turn in, and a labelled line
+/// room for its label. Round the outside there is room for every such line and label to
+/// pass; `draw` trims what they do not use.
+fn pinned_room(d: &Diagram) -> (Vec<usize>, Vec<usize>) {
+    let mut gap_pins = vec![0usize; d.columns + 1];
+    let mut gap_label = vec![0usize; d.columns + 1];
+    let mut row_pins = vec![0usize; d.rows.len() + 1];
+    for e in &d.pinned {
+        let label = e.label.as_deref().map_or(0, UnicodeWidthStr::width);
+        for (n, side) in [(e.from, e.from_side), (e.to, e.to_side)] {
+            let gap = match side.map(|(side, _)| side) {
+                Some(Side::Top) => {
+                    row_pins[d.nodes[n].row] += 1;
+                    continue;
+                }
+                Some(Side::Bottom) => {
+                    row_pins[d.nodes[n].row + 1] += 1;
+                    continue;
+                }
+                Some(Side::Left) => d.span[n].0,
+                Some(Side::Right) => d.span[n].1,
+                None => continue,
+            };
+            gap_pins[gap] += 1;
+            gap_label[gap] = gap_label[gap].max(label);
+        }
+    }
+    let around: usize = d
+        .pinned
+        .iter()
+        .map(|e| 3 + e.label.as_deref().map_or(0, |l| l.width() + 2))
+        .sum();
+    let columns = (0..=d.columns)
+        .map(|g| {
+            if g == 0 || g == d.columns {
+                return around;
+            }
+            let pins = gap_pins[g];
+            if pins == 0 {
+                return 0;
+            }
+            let label = if gap_label[g] > 0 { gap_label[g] + 2 } else { 0 };
+            if d.gaps[g].channels > 0 {
+                2 * pins + label
+            } else {
+                // The gap between two columns is wide enough for one line as it is.
+                2 * (pins - 1) + label
+            }
+        })
+        .collect();
+    let last = d.rows.len();
+    let rows = (0..=last)
+        .map(|r| match row_pins[r] {
+            _ if (r == 0 || r == last) && !d.pinned.is_empty() => 2 * d.pinned.len() + 1,
+            pins => pins,
+        })
+        .collect();
+    (columns, rows)
 }
 
 /// Columns a gap needs for its channels: outside the shapes a channel sits two columns out
@@ -1183,7 +1346,7 @@ impl Grid {
     }
 }
 
-fn draw(d: &Diagram) -> Vec<String> {
+fn draw(d: &Diagram) -> Result<Vec<String>, String> {
     let right = d.gaps[d.columns];
     let mut g = Grid::new(right.x + right.width, d.height);
 
@@ -1207,7 +1370,41 @@ fn draw(d: &Diagram) -> Vec<String> {
             draw_elbow(&mut g, d, e);
         }
     }
-    g.lines()
+    // Lines with a chosen side find their way round everything drawn so far, in written
+    // order.
+    // The shortest first, so a longer line runs outside the shorter ones it spans instead
+    // of crossing them.
+    let mut order: Vec<usize> = (0..d.pinned.len()).collect();
+    order.sort_by_key(|&i| {
+        let e = &d.pinned[i];
+        (
+            d.nodes[e.from].row.abs_diff(d.nodes[e.to].row),
+            d.span[e.from].0.abs_diff(d.span[e.to].0),
+            i,
+        )
+    });
+    let mut drawn = Pinned::default();
+    for i in order {
+        draw_pinned(&mut g, d, &d.pinned[i], &mut drawn)?;
+    }
+    let mut lines = g.lines();
+    if !d.pinned.is_empty() {
+        // The room kept round the drawing for these lines: drop what they left empty.
+        let blank = |l: &String| l.is_empty();
+        let first = lines.iter().position(|l| !blank(l)).unwrap_or(0);
+        let last = lines.iter().rposition(|l| !blank(l)).map_or(0, |i| i + 1);
+        lines = lines[first..last.max(first)].to_vec();
+        let indent = lines
+            .iter()
+            .filter(|l| !blank(l))
+            .map(|l| l.chars().take_while(|&c| c == ' ').count())
+            .min()
+            .unwrap_or(0);
+        for line in &mut lines {
+            *line = line.chars().skip(indent).collect();
+        }
+    }
+    Ok(lines)
 }
 
 fn neighbours(d: &Diagram, a: usize, b: usize) -> bool {
@@ -1525,6 +1722,393 @@ fn draw_side(g: &mut Grid, d: &Diagram, route: &Route, col: usize) {
     }
 }
 
+// ----- lines with a chosen side ---------------------------------------------------------
+
+/// One cell in each direction: up, down, left, right.
+const STEPS: [(isize, isize); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+/// Arrow heads pointing up, down, left, right.
+const HEADS: [char; 4] = ['▲', '▼', '◀', '▶'];
+/// What a path pays, besides one per cell, to turn a corner, to cross another line, to run
+/// right beside a shape, and to run down beside another line.
+const TURN_COST: u32 = 8;
+const CROSS_COST: u32 = 10;
+const NEAR_COST: u32 = 2;
+const BESIDE_COST: u32 = 2;
+/// What it pays to run up or down through the room kept beside a line for its label.
+const BAND_COST: u32 = 6;
+
+/// The cells just outside side `side` of shape `n` where a line can join it, best first.
+/// Each side has three anchors: left, middle and right along the top and bottom (the outer
+/// two a quarter of the way in), and top, middle and bottom down the left and right (the
+/// outer two on the outline rows; on a diamond those are the empty cells at its corners).
+/// The anchor asked for comes first, else the middle; then the middle and the anchor
+/// nearer shape `other`, for when that place is taken.
+fn attach_points(n: &Node, side: Side, other: &Node, anchor: Option<usize>) -> Vec<(isize, isize)> {
+    let (x, y, w, h) = (n.x as isize, n.y as isize, n.w as isize, n.h as isize);
+    let (places, toward) = match side {
+        Side::Top | Side::Bottom => {
+            let row = if side == Side::Top { y - 1 } else { y + h };
+            let inset = (w / 4).max(if n.shape == Shape::Diamond { 2 } else { 1 });
+            let places = [x + inset, n.center() as isize, x + w - 1 - inset].map(|col| (col, row));
+            (places, if other.center() < n.center() { 0 } else { 2 })
+        }
+        Side::Left | Side::Right => {
+            let col = |row: isize| {
+                let corner = n.shape == Shape::Diamond && n.is_rim(row as usize);
+                match side {
+                    Side::Left => x - 1 + isize::from(corner),
+                    _ => x + w - isize::from(corner),
+                }
+            };
+            let places = [y, n.middle() as isize, y + h - 1].map(|row| (col(row), row));
+            (places, if other.middle() < n.middle() { 0 } else { 2 })
+        }
+    };
+    let mut points: Vec<(isize, isize)> = Vec::new();
+    for i in [anchor.unwrap_or(1), 1, toward, 2 - toward] {
+        if !points.contains(&places[i]) {
+            points.push(places[i]);
+        }
+    }
+    points
+}
+
+/// The cells of a `w` by `h` drawing that shapes take up, and the cells right beside a
+/// shape.
+fn shape_cells(d: &Diagram, w: usize, h: usize) -> (Vec<bool>, Vec<bool>) {
+    let mut solid = vec![false; w * h];
+    let mut near = vec![false; w * h];
+    for n in &d.nodes {
+        for y in n.y.saturating_sub(1)..(n.y + n.h + 1).min(h) {
+            for x in n.x.saturating_sub(1)..(n.x + n.w + 1).min(w) {
+                let inside = (n.y..n.y + n.h).contains(&y) && (n.x..n.x + n.w).contains(&x);
+                // The cells at a diamond's corners are empty: a line can end in one.
+                let corner = n.shape == Shape::Diamond
+                    && n.is_rim(y)
+                    && (x == n.x || x + 1 == n.x + n.w);
+                if inside && !corner {
+                    solid[y * w + x] = true;
+                } else {
+                    near[y * w + x] = true;
+                }
+            }
+        }
+    }
+    (solid, near)
+}
+
+/// What the lines with a chosen side have drawn so far.
+#[derive(Default)]
+struct Pinned {
+    /// The cells of each line, from one shape to the other (or to the line it joins).
+    paths: Vec<Vec<(usize, usize)>>,
+    /// Where those lines meet a shape: the cell, the shape, whether an arrow head is there,
+    /// and which path it is.
+    ends: Vec<((usize, usize), usize, bool, usize)>,
+    /// Cells holding a label, spaces included: no line passes.
+    text: HashSet<(usize, usize)>,
+    /// Cells beside a line, above and below its label: a later line does not run up or down
+    /// them if it can help it, so it runs outside the label instead of stepping round it.
+    band: HashSet<(usize, usize)>,
+}
+
+/// Draw a line that was told which side of a shape to leave or enter, and its label. It
+/// takes the cheapest path over the empty cells of the drawing from the one place to the
+/// other: short, with few corners, crossing other lines only straight on and only when
+/// going round costs more, never through a shape or a label. An end without a chosen side
+/// takes whichever side makes the path cheapest; a chosen place that is taken gives way to
+/// the next anchor on that side. The line leaves and enters a shape straight on.
+///
+/// Two lines told to use the same anchor of a shape share it: the later one runs into the
+/// last straight stretch of the earlier one, the part that enters the shape, and they reach
+/// the shape together.
+fn draw_pinned(g: &mut Grid, d: &Diagram, edge: &Edge, drawn: &mut Pinned) -> Result<(), String> {
+    let (w, h) = (g.cells[0].len(), g.cells.len());
+    let (solid, near) = shape_cells(d, w, h);
+    let empty = |g: &Grid, text: &HashSet<(usize, usize)>, x: isize, y: isize| {
+        x >= 0
+            && y >= 0
+            && (x as usize) < w
+            && (y as usize) < h
+            && g.cells[y as usize][x as usize] == ' '
+            && !solid[y as usize * w + x as usize]
+            && !text.contains(&(x as usize, y as usize))
+    };
+    // The earlier line that already holds the anchor this end asks for, if any.
+    let shared = |n: usize, other: usize, side: Option<(Side, Option<usize>)>, headed: bool| {
+        let (side, anchor) = side?;
+        anchor?;
+        let (x, y) = attach_points(&d.nodes[n], side, &d.nodes[other], anchor)[0];
+        drawn
+            .ends
+            .iter()
+            .find(|&&(cell, node, head, _)| {
+                node == n && head == headed && cell == (x as usize, y as usize)
+            })
+            .map(|&(cell, _, _, path)| (path, drawn.paths[path][0] == cell))
+    };
+    // The line runs from `a` to `b`; when it joins an earlier line, that is at `b`.
+    let mut ends = [
+        (edge.from, edge.from_side, edge.arrow_from),
+        (edge.to, edge.to_side, edge.arrow_to),
+    ];
+    let mut join = shared(edge.to, edge.from, edge.to_side, edge.arrow_to);
+    if join.is_none() {
+        join = shared(edge.from, edge.to, edge.from_side, edge.arrow_from);
+        if join.is_some() {
+            ends.swap(0, 1);
+        }
+    }
+    let [(ai, a_side, a_head), (bi, b_side, b_head)] = ends;
+    let (a, b) = (&d.nodes[ai], &d.nodes[bi]);
+    // Where the line may join a shape: the first free anchor on its chosen side, or the
+    // middle of every side that is free. Each is a cell and the direction out of the shape.
+    let joins = |g: &Grid,
+                 n: &Node,
+                 other: &Node,
+                 side: Option<(Side, Option<usize>)>|
+     -> Vec<(usize, usize)> {
+        let sides: &[Side] = match &side {
+            Some((side, _)) => std::slice::from_ref(side),
+            None => &SIDES,
+        };
+        sides
+            .iter()
+            .filter_map(|&s| {
+                let points = attach_points(n, s, other, side.and_then(|(_, anchor)| anchor));
+                let take = if side.is_some() { points.len() } else { 1 };
+                points
+                    .into_iter()
+                    .take(take)
+                    .find(|&(x, y)| empty(g, &drawn.text, x, y))
+                    .map(|(x, y)| (y as usize * w + x as usize, s.out()))
+            })
+            .collect()
+    };
+    let starts = joins(g, a, b, a_side);
+    // Dijkstra over (cell, direction of travel). The line arrives at its last cell
+    // travelling into the shape, or anywhere on the line it joins.
+    let mut goal = vec![false; w * h * 4];
+    let mut joining = vec![false; w * h];
+    match join {
+        Some((path, at_start)) => {
+            // The straight stretch of that line next to the shape, up to its first corner.
+            let mut cells = drawn.paths[path].clone();
+            if !at_start {
+                cells.reverse();
+            }
+            let level = cells.iter().all(|c| c.1 == cells[0].1)
+                || cells.get(1).is_some_and(|c| c.1 == cells[0].1);
+            let stretch = cells
+                .iter()
+                .take_while(|c| if level { c.1 == cells[0].1 } else { c.0 == cells[0].0 });
+            for &(x, y) in stretch {
+                if arms(g.cells[y][x]).is_some_and(|a| a != 15) {
+                    joining[y * w + x] = true;
+                }
+            }
+        }
+        None => {
+            for (cell, out) in joins(g, b, a, b_side) {
+                goal[cell * 4 + (out ^ 1)] = true;
+            }
+        }
+    }
+    let no_room = || {
+        format!(
+            "no room to draw the line {}: try another side, or a row or column further apart",
+            edge.text
+        )
+    };
+    let mut is_start = vec![false; w * h];
+    let mut dist = vec![u32::MAX; w * h * 4];
+    let mut prev = vec![usize::MAX; w * h * 4];
+    let mut heap = std::collections::BinaryHeap::new();
+    for &(cell, out) in &starts {
+        is_start[cell] = true;
+        dist[cell * 4 + out] = 0;
+        heap.push(std::cmp::Reverse((0u32, cell * 4 + out)));
+    }
+    let upright = |c: char| arms(c).is_some_and(|a| a & 3 != 0);
+    let mut found = None;
+    while let Some(std::cmp::Reverse((cost, state))) = heap.pop() {
+        if cost > dist[state] {
+            continue;
+        }
+        let (cell, dir) = (state / 4, state % 4);
+        if goal[state] || joining[cell] {
+            found = Some(state);
+            break;
+        }
+        let (x, y) = (cell % w, cell / w);
+        let crossing = g.cells[y][x] != ' ';
+        for (next, step) in STEPS.iter().enumerate() {
+            // No turning back, no corner on another line, and straight out of a shape.
+            if next == dir ^ 1 || (next != dir && (crossing || is_start[cell])) {
+                continue;
+            }
+            let (nx, ny) = (x as isize + step.0, y as isize + step.1);
+            if nx < 0 || ny < 0 || nx as usize >= w || ny as usize >= h {
+                continue;
+            }
+            let (nx, ny) = (nx as usize, ny as usize);
+            let to = ny * w + nx;
+            if solid[to] || drawn.text.contains(&(nx, ny)) {
+                continue;
+            }
+            let there = g.cells[ny][nx];
+            let mut step = match there {
+                _ if joining[to] => 1,
+                ' ' => 1,
+                '│' if next >= 2 => 1 + CROSS_COST,
+                '─' if next < 2 => 1 + CROSS_COST,
+                _ => continue,
+            };
+            if near[to] {
+                step += NEAR_COST;
+            }
+            if next < 2 && drawn.band.contains(&(nx, ny)) {
+                step += BAND_COST;
+            }
+            if next < 2
+                && !joining[to]
+                && ((nx > 0 && upright(g.cells[ny][nx - 1]))
+                    || (nx + 1 < w && upright(g.cells[ny][nx + 1])))
+            {
+                step += BESIDE_COST;
+            }
+            if next != dir {
+                step += TURN_COST;
+            }
+            let state = to * 4 + next;
+            if cost + step < dist[state] {
+                dist[state] = cost + step;
+                prev[state] = cell * 4 + dir;
+                heap.push(std::cmp::Reverse((cost + step, state)));
+            }
+        }
+    }
+    let Some(last) = found else {
+        return Err(no_room());
+    };
+    let mut states = vec![last];
+    while prev[states[states.len() - 1]] != usize::MAX {
+        states.push(prev[states[states.len() - 1]]);
+    }
+    states.reverse();
+    let path: Vec<(usize, usize)> = states.iter().map(|s| (s / 4 % w, s / 4 / w)).collect();
+    // The direction out of each shape at its end of the path.
+    let (out_a, out_b) = (states[0] % 4, (last % 4) ^ 1);
+
+    let toward = |from: (usize, usize), to: (usize, usize)| -> u8 {
+        if to.1 < from.1 {
+            1
+        } else if to.1 > from.1 {
+            2
+        } else if to.0 < from.0 {
+            4
+        } else {
+            8
+        }
+    };
+    for (i, &(x, y)) in path.iter().enumerate() {
+        let back = match i {
+            0 => 1 << (out_a ^ 1),
+            _ => toward((x, y), path[i - 1]),
+        };
+        match path.get(i + 1) {
+            Some(&next) => g.put(x, y, line_char(back | toward((x, y), next))),
+            // Run into the line it joins: one more arm on that cell.
+            None if join.is_some() => {
+                let there = arms(g.cells[y][x]).unwrap_or(0);
+                g.set(x, y, line_char(there | back));
+            }
+            None => g.put(x, y, line_char(back | (1 << (out_b ^ 1)))),
+        }
+    }
+    // Arrow heads point into the shapes; a line that leaves the top or bottom outline row
+    // of a box without one is joined to its corner.
+    let finish = |g: &mut Grid, n: &Node, (x, y): (usize, usize), out: usize, headed: bool| {
+        if headed {
+            g.set(x, y, HEADS[out ^ 1]);
+        } else if out >= 2 && n.is_rim(y) && n.shape != Shape::Diamond {
+            let edge = if out == 2 { n.x } else { n.x + n.w - 1 };
+            g.set(edge, y, if y == n.y { '┬' } else { '┴' });
+        }
+    };
+    let index = drawn.paths.len();
+    finish(g, a, path[0], out_a, a_head);
+    drawn.ends.push((path[0], ai, a_head, index));
+    if join.is_none() {
+        finish(g, b, path[path.len() - 1], out_b, b_head);
+        drawn.ends.push((path[path.len() - 1], bi, b_head, index));
+    }
+
+    if let Some(label) = &edge.label {
+        // The label goes beside the line, as near its middle as there is room: beside a part
+        // running up and down, above or under a part running across.
+        let width = label.width() as isize;
+        let clear = |g: &Grid, x0: isize, x1: isize, y: isize| {
+            x0 >= 0
+                && y >= 0
+                && (y as usize) < h
+                && (x0..=x1).all(|x| x as usize >= w || empty(g, &drawn.text, x, y))
+        };
+        let middle = path.len() / 2;
+        let mut order: Vec<usize> = (0..path.len()).collect();
+        order.sort_by_key(|&i| i.abs_diff(middle));
+        let mut place = None;
+        for i in order {
+            let (x, y) = (path[i].0 as isize, path[i].1 as isize);
+            let upright = [i.wrapping_sub(1), i + 1]
+                .iter()
+                .any(|&j| path.get(j).is_some_and(|p| p.0 as isize == x));
+            // Beside an upright part the label goes on the side away from the shapes when
+            // the line runs left of them both, so it reads as that line's and not its
+            // neighbour's.
+            let outside = (x as usize) < a.center().min(b.center());
+            let spots = if upright && outside {
+                [(x - 1 - width, y), (x + 2, y)]
+            } else if upright {
+                [(x + 2, y), (x - 1 - width, y)]
+            } else {
+                [(x - width / 2, y - 1), (x - width / 2, y + 1)]
+            };
+            if let Some(&spot) = spots
+                .iter()
+                .find(|&&(at, row)| clear(g, at - 1, at + width, row))
+            {
+                place = Some((spot, upright.then_some(i)));
+                break;
+            }
+        }
+        // Nowhere beside the line: out to the right of the drawing, level with its middle.
+        let ((at, row), beside) =
+            place.unwrap_or(((w as isize + 1, path[middle].1 as isize), None));
+        let (at, row) = (at as usize, row as usize);
+        g.text(at, row, label);
+        let columns = at.saturating_sub(1)..=at + width as usize;
+        drawn.text.extend(columns.clone().map(|x| (x, row)));
+        // Beside an upright part: keep later lines out of the label's columns all the way
+        // along that part.
+        if let Some(i) = beside {
+            let x = path[i].0;
+            let run = |range: &mut dyn Iterator<Item = usize>| {
+                range
+                    .take_while(|&j| path[j].0 == x)
+                    .last()
+                    .map_or(row, |j| path[j].1)
+            };
+            let (y0, y1) = (run(&mut (0..i).rev()), run(&mut (i + 1..path.len())));
+            for y in y0.min(y1)..=y0.max(y1) {
+                drawn.band.extend(columns.clone().map(|x| (x, y)));
+            }
+        }
+    }
+    drawn.paths.push(path);
+    Ok(())
+}
+
 // ----- trees --------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -1578,10 +2162,10 @@ fn parse_tree(source: &str) -> Result<Vec<TreeNode>, String> {
         let (id, label, shape) = parse_shape(item).ok_or_else(|| {
             format!("line {at}: '{item}' is not id[label], id(label) or id<label>")
         })?;
-        if ids.contains_key(id) {
+        if ids.contains_key(&id.to_lowercase()) {
             return Err(format!("line {at}: '{id}' is defined twice"));
         }
-        ids.insert(id.to_string(), nodes.len());
+        ids.insert(id.to_lowercase(), nodes.len());
         nodes.push(TreeNode {
             label: label.trim().to_string(),
             shape,
@@ -1671,6 +2255,105 @@ mod tests {
 
     fn joined(lines: &[String]) -> String {
         lines.join("\n")
+    }
+
+    #[test]
+    fn lines_with_sides_nest_and_share_an_anchor() {
+        // Written longest first, drawn shortest first: none crosses another. Ids, sides and
+        // anchors match whatever their case. Two lines into the same anchor join on the
+        // stretch that enters the shape, so the outer one turns only twice.
+        let src = "a(First)\nb(Second)\nc(Third)\nd(Forth)\n\na --> b\nb --> c\nc --> d\nc(R) --> b(R) | inner right\nd(R) --> a(R) | outer right\nd(L:M) --> a(L:T) | outer left\nc(l:b) --> A(L:t) | middle left\nc(L:T) --> B(L) | inner left";
+        let out = render(src).unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        let want = [
+            "           ┌─────────────┬──────────────▶╭───────╮",
+            "           │             │               │ First │◀──────────────┐",
+            "           │             │               ╰───────╯               │",
+            "           │             │                   │                   │",
+            "           │             │                   ▼                   │",
+            "           │             │              ╭────────╮               │",
+            "           │ middle left │            ┌▶│ Second │◀┐             │",
+            "           │             │            │ ╰────────╯ │             │",
+            "           │             │ inner left │      │     │ inner right │ outer right",
+            "           │             │            │      ▼     │             │",
+            "           │             │            └──┬───────╮ │             │",
+            "           │             │               │ Third │─┘             │",
+            "           │             └───────────────┴───────╯               │",
+            "           │                                 │                   │",
+            "           │                                 ▼                   │",
+            "outer left │                             ╭───────╮               │",
+            "           └─────────────────────────────│ Forth │───────────────┘",
+            "                                         ╰───────╯",
+        ];
+        assert_eq!(text, want.join("\n"));
+        assert!(!text.contains('┼'), "no line crosses another");
+        assert!(render("a[A]\nA[Again]").unwrap_err().contains("defined twice"));
+    }
+
+    #[test]
+    fn a_line_takes_the_side_it_is_told() {
+        // Up the right-hand side instead of the default channel.
+        let out = render("a[Alpha]\nb[Beta]\nc[Gamma]\na --> b --> c\nc(R) --> a(r) | again").unwrap();
+        assert_eq!(
+            joined(&out),
+            "┌───────┐\n│ Alpha │◀┐\n└───────┘ │\n    │     │\n    ▼     │\n┌──────┐  │\n│ Beta │  │ again\n└──────┘  │\n    │     │\n    ▼     │\n┌───────┐ │\n│ Gamma │─┘\n└───────┘"
+        );
+        // Over and under a row, with room made above and below it.
+        let out = render("a[Alpha], b[Beta], c[Gamma]\na --> b --> c\na(T) --> c(T) | over\nc(B) --> a(B)").unwrap();
+        assert_eq!(
+            joined(&out),
+            "               over\n    ┌────────────────────────┐\n    │                        ▼\n┌───────┐    ┌──────┐    ┌───────┐\n│ Alpha │───▶│ Beta │───▶│ Gamma │\n└───────┘    └──────┘    └───────┘\n    ▲                        │\n    └────────────────────────┘"
+        );
+        // Only one end told: the other takes the side that makes the shorter path.
+        let out = render("a[A], b[B]\nc[C]\na(R) --> b").unwrap();
+        assert_eq!(out[1], "│ A │───▶│ B │");
+    }
+
+    #[test]
+    fn a_side_has_three_anchors() {
+        let src = "a[One thing\\nand another\\nand more], b[Two]\nc[Three]\na(R:T) --> b(L)\na(B:L) --> c(T:L)\na(B:R) --> c(T:R)";
+        let out = render(src).unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        // The top anchor of the right side is the outline row, joined to the corner.
+        assert!(out[0].starts_with("┌─────────────┬──"), "{}", out[0]);
+        // Left and right anchors of the bottom: a quarter of the way in from each end.
+        let below = &out[5];
+        let cols: Vec<usize> = below
+            .chars()
+            .enumerate()
+            .filter(|&(_, c)| c == '│')
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(cols, [3, 11], "{below}");
+        assert_eq!(text.matches('▼').count(), 2);
+        assert_eq!(text.matches('▶').count(), 1);
+        // A taken anchor gives way to the next: the default line already has the middle.
+        let out = render("a[A]\nb[B]\nc[C]\na --> b\na(B:M) --> c(T) | skip").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(text.contains("skip") && text.matches('▼').count() == 2);
+        // A line never runs through a shape, whatever side it was given.
+        assert!(!text.contains("│ B ┼") && text.contains("│ B │"));
+    }
+
+    #[test]
+    fn sides_and_anchors_are_checked() {
+        let err = |src: &str| render(src).unwrap_err();
+        assert_eq!(
+            err("a[A]\nb[B]\na(X) --> b"),
+            "line 3: side 'X' of 'a' is not T, B, L or R"
+        );
+        assert_eq!(
+            err("a[A]\nb[B]\na(T:T) --> b"),
+            "line 3: anchor 'T' on side T of 'a' is not L, M or R"
+        );
+        assert_eq!(
+            err("a[A]\nb[B]\na --> b(l:r)"),
+            "line 3: anchor 'R' on side L of 'b' is not T, M or B"
+        );
+        assert!(err("a[A]\nb[B]\na --> z(T)").contains("no shape named 'z'"));
     }
 
     #[test]
