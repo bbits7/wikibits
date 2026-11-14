@@ -1203,7 +1203,7 @@ impl App {
                 TreeKind::Page { id } => id.clone(),
                 TreeKind::Folder { path, .. } => path.clone(),
             },
-            _ => wiki::link_target_for(self.current.as_deref()?),
+            _ => self.wiki.link_target(self.current.as_deref()?),
         };
         if item.is_empty() || item == "/" {
             return None;
@@ -1522,8 +1522,9 @@ impl App {
         }
     }
 
-    /// One crumb per folder above the current page, each named after the folder's `index`
-    /// page when it has one. A folder index page is its folder's crumb, not an extra one.
+    /// One crumb per folder above the current page, each named after the folder's page (its
+    /// `index`, or the page named like it) when it has one. A folder's page is its folder's
+    /// crumb, not an extra one.
     fn rebuild_crumbs(&mut self) {
         let root_name = self
             .wiki
@@ -1553,7 +1554,9 @@ impl App {
                     folder: Some(folder.clone()),
                 });
             }
-            if page != ["index"] {
+            // A folder's page inside the folder is the folder's crumb already; a page beside
+            // its folder still gets its own.
+            if !page.is_empty() && self.wiki.folder_of_page(id).is_none_or(|f| f == id) {
                 crumbs.push(Crumb {
                     label: self.wiki.title(id),
                     folder: None,
@@ -1834,7 +1837,7 @@ impl App {
                     return None;
                 };
                 // Index pages are offered as their folder, which is how they are linked.
-                Some((rank, p.title.clone(), wiki::link_target_for(&p.id)))
+                Some((rank, p.title.clone(), self.wiki.link_target(&p.id)))
             })
             .collect();
         hits.sort_by_cached_key(|(rank, title, id)| (*rank, title.to_lowercase(), id.clone()));
@@ -1912,12 +1915,13 @@ impl App {
                     .into();
             return;
         }
-        // Creating the page for an existing folder means its index page.
-        let id = &if self.wiki.root.join(id).is_dir() {
-            format!("{id}/index")
-        } else {
-            id.to_string()
-        };
+        // Creating the page for an existing folder means the folder's page: the one it has,
+        // else a new page beside the folder, named after it.
+        let id = &self
+            .wiki
+            .folder_index(id)
+            .filter(|_| self.wiki.root.join(id).is_dir())
+            .unwrap_or_else(|| id.to_string());
         let path = self.wiki.root.join(format!("{id}.md"));
         if path.exists() {
             self.open(id, true);
@@ -1925,15 +1929,8 @@ impl App {
             return;
         }
         let title = wiki::prettify(id);
-        // A parent that is a plain page becomes its folder's index page first.
-        let moved = match self.wiki.promote_ancestors_to_folders(id) {
-            Ok(moved) => moved,
-            Err(err) => {
-                self.status = format!("Could not create {id}: {err:#}");
-                return;
-            }
-        };
-        self.note_moved_pages(&moved);
+        // A parent that is a plain page stays as it is, beside the folder made here: it is
+        // that folder's page.
         let result = path
             .parent()
             .map(fs::create_dir_all)
@@ -1955,10 +1952,6 @@ impl App {
             editor.cursor_to_end();
         }
         self.status = format!("Created {id}");
-        for (old, new) in &moved {
-            self.status
-                .push_str(&format!("; {old} is now the folder page {new}"));
-        }
         self.commit(&format!("Create {id}"));
     }
 
@@ -2001,7 +1994,7 @@ impl App {
         }
     }
 
-    /// Keep history pointing at pages that became folder indexes.
+    /// Keep history pointing at folder index pages that became plain pages.
     fn note_moved_pages(&mut self, moved: &[(String, String)]) {
         for (old, new) in moved {
             for h in self.history.iter_mut().chain(self.future.iter_mut()) {
@@ -2226,7 +2219,7 @@ impl App {
     /// Put `[[page]]` for the current page on the clipboard.
     fn copy_link(&mut self) {
         let Some(id) = &self.current else { return };
-        let link = format!("[[{}]]", wiki::link_target_for(id));
+        let link = format!("[[{}]]", self.wiki.link_target(id));
         let ok = Command::new("wl-copy")
             .arg(&link)
             .stdin(Stdio::null())
@@ -2353,7 +2346,7 @@ impl App {
             },
             _ => self.current.clone()?,
         };
-        if id.is_empty() || wiki::is_index_id(&id) {
+        if id.is_empty() || self.wiki.is_folder_page(&id) {
             self.status = "A folder stays put: move its pages one at a time".into();
             return None;
         }
@@ -2361,7 +2354,7 @@ impl App {
     }
 
     /// `Ctrl+Up` moves the page under the sibling listed above it (a plain page above
-    /// becomes a folder); `Ctrl+Down` moves it out of its folder, to just after the folder.
+    /// stays, beside the new folder); `Ctrl+Down` moves it out of its folder, to just after the folder.
     fn move_page(&mut self, into: bool) {
         let Some(id) = self.move_target() else {
             return;
@@ -2388,7 +2381,6 @@ impl App {
                 h.id = new.clone();
             }
         }
-        self.note_moved_pages(&moved.promoted);
         if self.current.as_deref() == Some(old) {
             self.open(&new, false);
         } else if let Some(id) = self.current.clone() {
@@ -2402,10 +2394,6 @@ impl App {
             1 => format!("{verb} to {new}; updated the link in 1 page"),
             n => format!("{verb} to {new}; updated links in {n} pages"),
         };
-        for (old, new) in &moved.promoted {
-            self.status
-                .push_str(&format!("; {old} is now the folder page {new}"));
-        }
         self.demote_folders();
         // Last: redrawing the open page puts the tree cursor back on it.
         self.reveal_in_tree(&new);
@@ -2673,7 +2661,7 @@ impl App {
                 // A child of the current page: its folder path is the page itself (or the
                 // folder, for a folder's index page).
                 self.prompt = Prompt::NewPage;
-                let parent = wiki::link_target_for(self.current.as_deref().unwrap_or(""));
+                let parent = self.wiki.link_target(self.current.as_deref().unwrap_or(""));
                 self.new_page = if parent == "/" {
                     String::new()
                 } else {

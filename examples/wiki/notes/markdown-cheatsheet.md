@@ -11,6 +11,9 @@ column width, keeping words whole.
 
 A `<br>` or a literal `\n` breaks the line<br>like this,\nor this.
 
+`<mark>` and `</mark>` around text <mark>highlight it in yellow</mark>, in a paragraph, a list
+item, a heading or a table cell.
+
 ## Lists
 
 - Bullets

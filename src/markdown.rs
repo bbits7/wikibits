@@ -103,6 +103,7 @@ pub fn render(markdown: &str, width: u16, height: u16, ctx: &mut dyn Context) ->
         prefixes: Vec::new(),
         first_prefix: None,
         styles: vec![Style::default()],
+        marks: 0,
         links: Vec::new(),
         cur_link: None,
         images: Vec::new(),
@@ -278,6 +279,19 @@ fn is_br(html: &str) -> bool {
     tag.is_some_and(|rest| rest.trim_end().trim_end_matches('/').trim().is_empty())
 }
 
+/// Whether an inline HTML tag opens (`Some(true)`) or closes (`Some(false)`) a highlight:
+/// `<mark>`, `</mark>`, any case, attributes ignored.
+fn mark_tag(html: &str) -> Option<bool> {
+    let tag = html.trim().to_ascii_lowercase();
+    let tag = tag.strip_prefix('<')?.strip_suffix('>')?;
+    let (open, tag) = match tag.strip_prefix('/') {
+        Some(rest) => (false, rest),
+        None => (true, tag),
+    };
+    let rest = tag.strip_prefix("mark")?;
+    (rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace())).then_some(open)
+}
+
 /// Narrowest a text column is squeezed to when a table is wider than the page.
 const MIN_TABLE_COLUMN: usize = 10;
 
@@ -296,6 +310,8 @@ struct Renderer<'a> {
     /// Replaces the innermost prefix on the next line only (the list bullet).
     first_prefix: Option<Span<'static>>,
     styles: Vec<Style>,
+    /// How many `<mark>` tags are open; text written meanwhile is highlighted.
+    marks: usize,
     links: Vec<Link>,
     cur_link: Option<usize>,
     images: Vec<ImageSlot>,
@@ -343,6 +359,9 @@ pub const EXTERNAL_LINK: Style = Style::new()
     .fg(Color::Blue)
     .add_modifier(Modifier::UNDERLINED);
 const CODE: Style = Style::new().fg(Color::Magenta);
+/// Text between `<mark>` and `</mark>`. It replaces the text's own colour (a link's, a code
+/// span's) so the words stay readable on yellow; bold, underline and the rest are kept.
+const MARK: Style = Style::new().fg(Color::Black).bg(Color::Yellow);
 /// First of the private-use characters that stand in for links in a diagram's source.
 const DIAGRAM_LINK_MARK: u32 = 0xE000;
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
@@ -439,6 +458,11 @@ impl Renderer<'_> {
         if text.is_empty() {
             return;
         }
+        let style = if self.marks > 0 && text != "\n" {
+            style.patch(MARK)
+        } else {
+            style
+        };
         for name in self.pending_anchors.drain(..) {
             self.anchors.push((name, self.lines.len()));
         }
@@ -1412,6 +1436,13 @@ impl Renderer<'_> {
                 self.items.push(Item::Task(self.tasks.len() - 1));
             }
             Event::InlineHtml(html) if is_br(&html) => self.line_break(),
+            Event::InlineHtml(html) if mark_tag(&html).is_some() => {
+                if mark_tag(&html) == Some(true) {
+                    self.marks += 1;
+                } else {
+                    self.marks = self.marks.saturating_sub(1);
+                }
+            }
             Event::Html(html) | Event::InlineHtml(html) => {
                 let style = self.style().patch(DIM);
                 let link = self.cur_link;
@@ -1558,6 +1589,13 @@ impl Renderer<'_> {
     }
 
     fn end(&mut self, tag: TagEnd) {
+        // A `<mark>` left open ends with its paragraph, heading, list item or table cell.
+        if matches!(
+            tag,
+            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item | TagEnd::TableCell
+        ) {
+            self.marks = 0;
+        }
         match tag {
             TagEnd::Paragraph | TagEnd::HtmlBlock | TagEnd::FootnoteDefinition => self.end_block(),
             TagEnd::Heading(_) => {
@@ -1791,6 +1829,34 @@ mod tests {
             r.anchors,
             vec![("second".to_string(), row2), ("third".to_string(), row2)]
         );
+    }
+
+    #[test]
+    fn mark_tags_highlight_their_text() {
+        let marked = |r: &Rendered| -> Vec<String> {
+            r.lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .filter(|s| s.style.bg == Some(Color::Yellow))
+                .map(|s| s.content.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let src = "plain <mark>one **two** [[a/b|three]]</mark> after <MARK>four\n\nnot this\n\n\
+                   | H |\n|---|\n| a <mark>cell</mark> b |\n\n`<mark>code</mark>` </mark>x";
+        let r = render(src, 80, 40, &mut Ctx);
+        let lines = text(&r);
+        println!("{}", lines.join("\n"));
+        assert_eq!(marked(&r), ["one", "two", "three", "four", "cell"]);
+        assert_eq!(lines[0].trim_end(), "plain one two three after four");
+        assert!(lines.iter().any(|l| l.contains("<mark>code</mark>")));
+        let two = r.lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.trim() == "two")
+            .unwrap();
+        assert_eq!(two.style.fg, Some(Color::Black));
+        assert!(two.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

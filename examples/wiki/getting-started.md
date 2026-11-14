@@ -2,12 +2,15 @@
 
 ## Pages
 
-A page is a `.md` file. Its **title** is the first `# Heading` in the file, and the file name
-is a slug: this page is `getting-started.md` but shows as "Getting started".
+A page is a `.md` file. Its **title** is the `# Heading` on the first line of the file, and the
+file name is a slug: this page is `getting-started.md` but shows as "Getting started".
 
 Folders group pages. The tree on the left mirrors the folder structure, and the breadcrumbs
 above the page show where it lives. Give a folder an `index.md` and it stands for the folder:
-opening the folder shows it, and a link to the folder opens it too: [[/notes]].
+opening the folder shows it, and a link to the folder opens it too: [[/notes]]. A file named
+after its folder, inside it (`notes/notes.md`) or beside it (`notes.md` next to `notes/`), does
+the same job when the folder has no `index.md`. That last layout is the one wikiBits makes:
+give the page `notes.md` a child and it creates `notes/` beside it, leaving `notes.md` alone.
 
 ## Links
 

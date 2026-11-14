@@ -71,6 +71,10 @@ pub struct Wiki {
     pub backlinks: HashMap<String, Vec<String>>,
     /// Folder path (`""` for the root) -> the names in its order file.
     pub orders: HashMap<String, Vec<String>>,
+    /// Folder path (`""` for the root) -> the page that stands for it: its `index` page,
+    /// else the page named like the folder inside it (`recipes/recipes`, any case), else
+    /// the page beside it (`recipes.md` next to `recipes/`).
+    folder_pages: HashMap<String, String>,
 }
 
 impl Wiki {
@@ -83,6 +87,7 @@ impl Wiki {
             pages: BTreeMap::new(),
             backlinks: HashMap::new(),
             orders: HashMap::new(),
+            folder_pages: HashMap::new(),
         };
         wiki.reload()?;
         Ok(wiki)
@@ -126,6 +131,7 @@ impl Wiki {
         }
         self.pages = pages;
         self.orders = orders;
+        self.folder_pages = self.find_folder_pages();
 
         let mut backlinks: HashMap<String, Vec<String>> = HashMap::new();
         for page in self.pages.values() {
@@ -178,15 +184,91 @@ impl Wiki {
         self.backlinks.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// The page to show first: `index`, `home` or `readme` at the root, else the first page.
+    /// The page that stands for each folder. `index` wins; without one, a page inside the
+    /// folder with the folder's own name does (the root's is named after the wiki folder),
+    /// exact case first; without that, the page beside the folder with its name
+    /// (`recipes.md` next to `recipes/`, the layout Azure DevOps wikis use).
+    fn find_folder_pages(&self) -> HashMap<String, String> {
+        let root_name = self
+            .root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut found: HashMap<String, String> = HashMap::new();
+        for id in self.pages.keys() {
+            let (folder, name) = split_id(id);
+            let folder_name = if folder.is_empty() {
+                root_name.as_str()
+            } else {
+                last_segment(folder)
+            };
+            // 0 = index, 1 = the folder's name exactly, 2 = the folder's name in another case.
+            let rank = |name: &str| match name {
+                "index" => Some(0),
+                n if n == folder_name => Some(1),
+                n if n.eq_ignore_ascii_case(folder_name) => Some(2),
+                _ => None,
+            };
+            let Some(new) = rank(name) else { continue };
+            let better = found
+                .get(folder)
+                .and_then(|old| rank(last_segment(old)))
+                .is_none_or(|old| new < old);
+            if better {
+                found.insert(folder.to_string(), id.clone());
+            }
+        }
+        // A page beside a folder of the same name: `a/b.md` next to `a/b/`.
+        for id in self.pages.keys() {
+            let mut folder = split_id(id).0;
+            while !folder.is_empty() {
+                if self.pages.contains_key(folder) && !found.contains_key(folder) {
+                    found.insert(folder.to_string(), folder.to_string());
+                }
+                folder = split_id(folder).0;
+            }
+        }
+        found
+    }
+
+    /// The folder a page stands for (`""` for the root), if it is a folder's page: the
+    /// folder it is in, or for a page beside its folder, the folder with the page's own path.
+    pub fn folder_of_page<'a>(&self, id: &'a str) -> Option<&'a str> {
+        let is_page_of = |folder: &str| self.folder_pages.get(folder).map(String::as_str) == Some(id);
+        let (folder, _) = split_id(id);
+        if is_page_of(folder) {
+            Some(folder)
+        } else {
+            is_page_of(id).then_some(id)
+        }
+    }
+
+    /// Whether a page stands for its folder: an `index` page, or one named like the folder.
+    pub fn is_folder_page(&self, id: &str) -> bool {
+        self.folder_of_page(id).is_some()
+    }
+
+    /// The link target that reaches a page: the folder for a folder's page (`/` for the
+    /// root), the page id otherwise.
+    pub fn link_target(&self, id: &str) -> String {
+        match self.folder_of_page(id) {
+            Some("") => "/".to_string(),
+            Some(folder) => folder.to_string(),
+            None => id.to_string(),
+        }
+    }
+
+    /// The page to show first: the root folder's page, else `home` or `readme` at the root,
+    /// else the first page.
     pub fn landing_page(&self) -> Option<String> {
-        ["index", "home", "readme"]
-            .iter()
-            .find_map(|name| {
-                self.pages
-                    .keys()
-                    .find(|id| id.eq_ignore_ascii_case(name))
-                    .cloned()
+        self.folder_index("")
+            .or_else(|| {
+                ["index", "home", "readme"].iter().find_map(|name| {
+                    self.pages
+                        .keys()
+                        .find(|id| id.eq_ignore_ascii_case(name))
+                        .cloned()
+                })
             })
             .or_else(|| self.pages.keys().next().cloned())
     }
@@ -242,26 +324,31 @@ impl Wiki {
         LinkTarget::Missing(raw.to_string())
     }
 
-    /// The page with this exact id, or the `index` page of the folder with this path
-    /// (`""` is the root), either matched exactly or ignoring case.
+    /// The page with this exact id, or the page of the folder with this path (`""` is the
+    /// root), either matched exactly or ignoring case.
     fn find_page(&self, candidate: &str) -> Option<String> {
-        let index = index_id(candidate);
         if self.pages.contains_key(candidate) {
             return Some(candidate.to_string());
         }
-        if self.pages.contains_key(&index) {
-            return Some(index);
+        if let Some(page) = self.folder_pages.get(candidate) {
+            return Some(page.clone());
         }
         self.pages
             .keys()
-            .find(|id| id.eq_ignore_ascii_case(candidate) || id.eq_ignore_ascii_case(&index))
+            .find(|id| id.eq_ignore_ascii_case(candidate))
+            .or_else(|| {
+                self.folder_pages
+                    .iter()
+                    .find(|(folder, _)| folder.eq_ignore_ascii_case(candidate))
+                    .map(|(_, page)| page)
+            })
             .cloned()
     }
 
-    /// The `index` page of a folder (`""` for the root), if it exists.
+    /// The page that stands for a folder (`""` for the root), if it has one: its `index`
+    /// page, else the page named like the folder.
     pub fn folder_index(&self, folder: &str) -> Option<String> {
-        let index = index_id(folder);
-        self.pages.contains_key(&index).then_some(index)
+        self.folder_pages.get(folder).cloned()
     }
 
     /// Image files under the root (hidden folders excluded) whose file name no page mentions.
@@ -364,35 +451,7 @@ impl Wiki {
         Ok(())
     }
 
-    /// Make room for a page under `id`: every ancestor that is a plain page (`backlog.md`)
-    /// becomes that folder's index (`backlog/index.md`). Returns the ids that moved, old to
-    /// new. Does not reload.
-    pub fn promote_ancestors_to_folders(&self, id: &str) -> Result<Vec<(String, String)>> {
-        let mut moved = Vec::new();
-        let parts: Vec<&str> = id.split('/').collect();
-        for depth in 1..parts.len() {
-            let folder = parts[..depth].join("/");
-            let page_file = self.root.join(format!("{folder}.md"));
-            let index_file = self.root.join(&folder).join("index.md");
-            if page_file.is_file() && !index_file.exists() {
-                fs::create_dir_all(self.root.join(&folder))?;
-                fs::rename(&page_file, &index_file).with_context(|| {
-                    format!(
-                        "cannot move {} to {}",
-                        page_file.display(),
-                        index_file.display()
-                    )
-                })?;
-                let parent = folder.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-                self.rebase_page_links(&index_file, parent, &folder)?;
-                moved.push((folder.clone(), format!("{folder}/index")));
-            }
-        }
-        Ok(moved)
-    }
-
-    /// The opposite of promotion: a folder holding nothing but `index.md` becomes the plain
-    /// page `folder.md` again, and links to `folder/index` are rewritten to `folder`. Checks
+    /// A folder holding nothing but `index.md` becomes the plain page `folder.md` again, and links to `folder/index` are rewritten to `folder`. Checks
     /// the deepest folders first so a whole chain collapses. Returns the moves, old to new.
     pub fn demote_lonely_folders(&mut self) -> Result<Vec<(String, String)>> {
         let mut folders: Vec<PathBuf> = WalkDir::new(&self.root)
@@ -497,7 +556,7 @@ impl Wiki {
     pub fn orphan_pages(&self) -> Vec<String> {
         self.pages
             .keys()
-            .filter(|id| id.as_str() != "index" && self.backlinks_of(id).is_empty())
+            .filter(|id| self.folder_of_page(id) != Some("") && self.backlinks_of(id).is_empty())
             .cloned()
             .collect()
     }
@@ -528,7 +587,8 @@ impl Wiki {
     }
 
     /// Move a page to a new id (`folder/name`) and rewrite the links that point at it in the
-    /// other pages. Reports the plain pages that became folder indexes to make room.
+    /// other pages. A plain page above the new place stays where it is: `notes.md` beside the
+    /// new `notes/` folder is that folder's page.
     pub fn rename_page(&mut self, old: &str, new: &str) -> Result<Moved> {
         if !self.pages.contains_key(old) {
             anyhow::bail!("no page {old}");
@@ -536,11 +596,6 @@ impl Wiki {
         let target = self.root.join(format!("{new}.md"));
         if target.exists() {
             anyhow::bail!("a page named {new} already exists");
-        }
-        let promoted = self.promote_ancestors_to_folders(new)?;
-        if !promoted.is_empty() {
-            // A promoted page may link to this one: its file moved, so forget the old path.
-            self.reload()?;
         }
         let page = self
             .pages
@@ -582,13 +637,12 @@ impl Wiki {
         Ok(Moved {
             id: new.to_string(),
             updated,
-            promoted,
         })
     }
 
     /// Move the page `id` under the sibling listed just above it in the tree, as that
     /// sibling's last child: with `[notes, todo]`, moving `todo` makes `notes/todo`, and a
-    /// plain `notes` page becomes the folder's index. `None` when nothing is above it.
+    /// plain `notes` page stays beside the new folder as its page. `None` when nothing is above it.
     pub fn move_into_previous(&mut self, id: &str) -> Result<Option<Moved>> {
         let (folder, name) = split_id(id);
         let names = self.sibling_names(folder);
@@ -700,7 +754,7 @@ impl Wiki {
         for page in self.pages.values() {
             insert_into_tree(&mut root, "", &page.id, page);
         }
-        fold_indexes(&mut root);
+        fold_indexes(&mut root, &self.folder_pages);
         sort_tree(&mut root, "", &self.orders);
         root
     }
@@ -722,7 +776,7 @@ impl Wiki {
         Ok(true)
     }
 
-    /// Names of the pages and subfolders of `folder` in tree order (the root `index` page,
+    /// Names of the pages and subfolders of `folder` in tree order (the root folder's page,
     /// which always leads, left out).
     fn sibling_names(&self, folder: &str) -> Vec<String> {
         let mut nodes = self.tree();
@@ -744,7 +798,7 @@ impl Wiki {
         nodes
             .iter()
             .filter_map(|n| match n {
-                TreeNode::Page { id, .. } if id == "index" => None,
+                TreeNode::Page { id, .. } if self.folder_of_page(id) == Some("") => None,
                 TreeNode::Page { id, .. } => Some(last_segment(id).to_string()),
                 TreeNode::Folder { path, .. } => Some(last_segment(path).to_string()),
             })
@@ -835,8 +889,6 @@ pub struct Moved {
     pub id: String,
     /// How many pages had links to it rewritten.
     pub updated: usize,
-    /// Plain pages that became folder indexes to hold it, old id to new.
-    pub promoted: Vec<(String, String)>,
 }
 
 fn last_segment(path: &str) -> &str {
@@ -863,7 +915,8 @@ fn read_order(dir: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// Whether an id names an index page (`index` or `folder/index`).
+/// Whether an id names an index page (`index` or `folder/index`). For a page that exists,
+/// `Wiki::is_folder_page` also knows the pages named like their folder.
 pub fn is_index_id(id: &str) -> bool {
     id == "index" || id.ends_with("/index")
 }
@@ -877,17 +930,8 @@ pub fn link_target_for(id: &str) -> String {
     }
 }
 
-/// Id of the `index` page of a folder (`""` for the root).
-fn index_id(folder: &str) -> String {
-    if folder.is_empty() {
-        "index".to_string()
-    } else {
-        format!("{folder}/index")
-    }
-}
-
-fn fold_indexes(nodes: &mut [TreeNode]) {
-    for node in nodes {
+fn fold_indexes(nodes: &mut Vec<TreeNode>, folder_pages: &HashMap<String, String>) {
+    for node in nodes.iter_mut() {
         if let TreeNode::Folder {
             name,
             path,
@@ -895,16 +939,39 @@ fn fold_indexes(nodes: &mut [TreeNode]) {
             children,
         } = node
         {
-            let wanted = index_id(path);
-            if let Some(pos) = children
-                .iter()
-                .position(|c| matches!(c, TreeNode::Page { id, .. } if *id == wanted))
+            if let Some(wanted) = folder_pages.get(path.as_str())
+                && let Some(pos) = children
+                    .iter()
+                    .position(|c| matches!(c, TreeNode::Page { id, .. } if id == wanted))
                 && let TreeNode::Page { id, title } = children.remove(pos)
             {
                 *name = title;
                 *index = Some(id);
             }
-            fold_indexes(children);
+            fold_indexes(children, folder_pages);
+        }
+    }
+    // A page beside its folder (`b.md` next to `b/`) folds into the folder row the same way.
+    let beside: Vec<(String, String)> = nodes
+        .iter()
+        .filter_map(|n| match n {
+            TreeNode::Page { id, title } if folder_pages.get(id.as_str()) == Some(id) => {
+                Some((id.clone(), title.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    for (page, title) in beside {
+        let folder = nodes.iter_mut().find_map(|n| match n {
+            TreeNode::Folder {
+                name, path, index, ..
+            } if *path == page => Some((name, index)),
+            _ => None,
+        });
+        if let Some((name, index)) = folder {
+            *name = title;
+            *index = Some(page.clone());
+            nodes.retain(|n| !matches!(n, TreeNode::Page { id, .. } if *id == page));
         }
     }
 }
@@ -1081,7 +1148,9 @@ pub fn prettify(slug: &str) -> String {
     chars.into_iter().collect()
 }
 
-/// The first `# Heading` in the file, skipping YAML front matter.
+/// The page's `# Heading`, if that is the first line of the file (YAML front matter and
+/// blank lines before it aside). A `# Heading` further down is an ordinary heading, and the
+/// page is then named after its file.
 fn extract_title(text: &str) -> Option<String> {
     let mut lines = text.lines().peekable();
     if lines.peek().is_some_and(|l| l.trim() == "---") {
@@ -1092,10 +1161,9 @@ fn extract_title(text: &str) -> Option<String> {
             }
         }
     }
-    lines.find_map(|line| {
-        let heading = line.trim_start().strip_prefix("# ")?.trim();
-        (!heading.is_empty()).then(|| heading.trim_end_matches('#').trim().to_string())
-    })
+    let line = lines.find(|line| !line.trim().is_empty())?;
+    let heading = line.trim_start().strip_prefix("# ")?.trim();
+    (!heading.is_empty()).then(|| heading.trim_end_matches('#').trim().to_string())
 }
 
 pub fn parser_options() -> Options {
@@ -1268,11 +1336,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn title_comes_from_first_heading() {
+    fn title_comes_from_a_heading_on_the_first_line() {
         assert_eq!(
-            extract_title("intro\n\n# My Page #\n## sub").as_deref(),
+            extract_title("\n# My Page #\n## sub").as_deref(),
             Some("My Page")
         );
+        // A heading further down does not name the page.
+        assert_eq!(extract_title("intro\n\n# My Page\n## sub"), None);
+        assert_eq!(extract_title("## Section\n\n# Later"), None);
         assert_eq!(
             extract_title("---\ntitle: x\n---\n# Real").as_deref(),
             Some("Real")
@@ -1340,6 +1411,99 @@ mod tests {
         assert_eq!(link_target_for("index"), "/");
         assert_eq!(link_target_for("projects/calcbits"), "projects/calcbits");
         assert!(is_index_id("a/b/index") && is_index_id("index") && !is_index_id("indexes"));
+    }
+
+    #[test]
+    fn a_page_named_like_its_folder_stands_for_the_folder() {
+        let dir = std::env::temp_dir().join(format!("wikibits-named-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("garden");
+        fs::create_dir_all(root.join("Recipes/soups")).unwrap();
+        fs::create_dir_all(root.join("both")).unwrap();
+        fs::write(root.join("garden.md"), "# The Garden\n[[Recipes]] [[both]]").unwrap();
+        fs::write(root.join("Recipes/recipes.md"), "# All Recipes\n[[soups]]").unwrap();
+        fs::write(root.join("Recipes/cake.md"), "# Cake\n[[/]]").unwrap();
+        fs::write(root.join("Recipes/soups/soups.md"), "Just soup, no heading.").unwrap();
+        fs::write(root.join("both/index.md"), "# Both Index").unwrap();
+        fs::write(root.join("both/both.md"), "# Both Named").unwrap();
+        let wiki = Wiki::load(&root).unwrap();
+
+        // Folder links, the home link and the landing page reach the named pages.
+        assert_eq!(wiki.landing_page().as_deref(), Some("garden"));
+        assert_eq!(wiki.folder_index("").as_deref(), Some("garden"));
+        assert_eq!(wiki.folder_index("Recipes").as_deref(), Some("Recipes/recipes"));
+        assert_eq!(
+            wiki.resolve("garden", "recipes"),
+            LinkTarget::Page("Recipes/recipes".into())
+        );
+        assert_eq!(
+            wiki.resolve("Recipes/recipes", "soups"),
+            LinkTarget::Page("Recipes/soups/soups".into())
+        );
+        assert_eq!(
+            wiki.resolve("Recipes/cake", "/"),
+            LinkTarget::Page("garden".into())
+        );
+        assert_eq!(wiki.link_target("Recipes/soups/soups"), "Recipes/soups");
+        assert_eq!(wiki.link_target("garden"), "/");
+        assert_eq!(wiki.link_target("Recipes/cake"), "Recipes/cake");
+        assert_eq!(wiki.backlinks_of("Recipes/recipes"), ["garden"]);
+        assert!(!wiki.orphan_pages().contains(&"garden".to_string()));
+
+        // A page beside its folder stands for it too, as Azure DevOps wikis lay pages out.
+        fs::create_dir_all(root.join("Data/Card")).unwrap();
+        fs::write(root.join("Data/Card.md"), "# The Card\n[[Card/detail]]").unwrap();
+        fs::write(root.join("Data/Card/detail.md"), "# Detail\n[[Data/Card]]").unwrap();
+        fs::write(root.join("Data/plain.md"), "# Plain").unwrap();
+        let wiki = Wiki::load(&root).unwrap();
+        assert_eq!(wiki.folder_index("Data/Card").as_deref(), Some("Data/Card"));
+        assert_eq!(wiki.folder_of_page("Data/Card"), Some("Data/Card"));
+        assert_eq!(wiki.link_target("Data/Card"), "Data/Card");
+        assert!(!wiki.is_folder_page("Data/plain") && !wiki.is_folder_page("Data/Card/detail"));
+        assert_eq!(
+            wiki.resolve("Data/Card/detail", "Data/Card"),
+            LinkTarget::Page("Data/Card".into())
+        );
+        assert_eq!(wiki.backlinks_of("Data/Card"), ["Data/Card/detail"]);
+
+        // An index page wins; the page named like the folder is then an ordinary page.
+        assert_eq!(wiki.folder_index("both").as_deref(), Some("both/index"));
+        assert!(wiki.is_folder_page("both/index") && !wiki.is_folder_page("both/both"));
+
+        // The tree folds each one into its folder row.
+        let tree = wiki.tree();
+        let folder = |nodes: &[TreeNode], want: &str| {
+            nodes
+                .iter()
+                .find_map(|n| match n {
+                    TreeNode::Folder {
+                        name,
+                        path,
+                        index,
+                        children,
+                    } if path == want => Some((name.clone(), index.clone(), children.clone())),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let (name, index, children) = folder(&tree, "Recipes");
+        assert_eq!(name, "All Recipes");
+        assert_eq!(index.as_deref(), Some("Recipes/recipes"));
+        assert_eq!(children.len(), 2, "cake and the soups folder");
+        let (name, index, children) = folder(&children, "Recipes/soups");
+        assert_eq!(name, "Soups", "no heading on its first line: named after the file");
+        assert_eq!(index.as_deref(), Some("Recipes/soups/soups"));
+        assert!(children.is_empty());
+        let (_, _, data) = folder(&tree, "Data");
+        assert_eq!(data.len(), 2, "the Card folder and the plain page, not Card twice");
+        let (name, index, children) = folder(&data, "Data/Card");
+        assert_eq!(name, "The Card");
+        assert_eq!(index.as_deref(), Some("Data/Card"));
+        assert_eq!(children.len(), 1);
+        let (_, index, children) = folder(&tree, "both");
+        assert_eq!(index.as_deref(), Some("both/index"));
+        assert_eq!(children.len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1516,37 +1680,42 @@ mod tests {
     }
 
     #[test]
-    fn a_page_becomes_a_folder_index_when_it_gets_a_child() {
-        let dir = std::env::temp_dir().join(format!("wikibits-promote-{}", std::process::id()));
+    fn a_page_stays_beside_the_folder_of_its_children() {
+        let dir = std::env::temp_dir().join(format!("wikibits-beside-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("index.md"),
-            "# Home\n[[backlog]] [[backlog/history]]",
+            "# Home\n[[backlog]] [[backlog/history]] [[old]]",
         )
         .unwrap();
-        fs::write(dir.join("backlog.md"), "# Backlog").unwrap();
+        fs::write(dir.join("backlog.md"), "# Backlog\n[h](index.md)").unwrap();
+        fs::write(dir.join("old.md"), "# Old").unwrap();
         let mut wiki = Wiki::load(&dir).unwrap();
 
-        let moved = wiki
-            .promote_ancestors_to_folders("backlog/history")
-            .unwrap();
+        // A child arrives: the parent page is not moved or rewritten.
+        let moved = wiki.rename_page("old", "backlog/history").unwrap();
+        assert_eq!(moved.id, "backlog/history");
+        assert!(dir.join("backlog/history.md").is_file());
+        assert!(!dir.join("backlog/index.md").exists());
         assert_eq!(
-            moved,
-            vec![("backlog".to_string(), "backlog/index".to_string())]
+            fs::read_to_string(dir.join("backlog.md")).unwrap(),
+            "# Backlog\n[h](index.md)"
         );
-        assert!(dir.join("backlog/index.md").is_file());
-        assert!(!dir.join("backlog.md").exists());
-        wiki.reload().unwrap();
+        assert_eq!(wiki.folder_index("backlog").as_deref(), Some("backlog"));
         assert_eq!(
             wiki.resolve("index", "backlog"),
-            LinkTarget::Page("backlog/index".into())
+            LinkTarget::Page("backlog".into())
         );
-        assert!(
-            wiki.promote_ancestors_to_folders("backlog/history")
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(wiki.link_target("backlog"), "backlog");
+        // One row for the page and its folder.
+        assert_eq!(wiki.sibling_names(""), ["backlog"]);
+
+        // The last child leaves: the folder goes, the page is a plain page again.
+        wiki.rename_page("backlog/history", "old").unwrap();
+        assert!(wiki.demote_lonely_folders().unwrap().is_empty());
+        assert!(!dir.join("backlog").exists() && dir.join("backlog.md").is_file());
+        assert!(!wiki.is_folder_page("backlog"));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1573,20 +1742,15 @@ mod tests {
         let moved = wiki.move_into_previous("todo").unwrap().unwrap();
         assert_eq!(moved.id, "notes/todo");
         assert_eq!(moved.updated, 2);
-        assert_eq!(
-            moved.promoted,
-            vec![("notes".to_string(), "notes/index".to_string())]
-        );
-        assert!(dir.join("notes/index.md").is_file());
         assert!(dir.join("notes/todo.md").is_file());
         assert!(
-            !dir.join("notes.md").exists(),
-            "the promoted page left no copy behind"
+            !dir.join("notes/index.md").exists(),
+            "the page above stays beside the new folder"
         );
         assert_eq!(
-            fs::read_to_string(dir.join("notes/index.md")).unwrap(),
+            fs::read_to_string(dir.join("notes.md")).unwrap(),
             "# Notes\n[[notes/todo#Soon|soon]] [b](notes/todo.md#Soon)",
-            "the promoted page's links follow, anchors kept"
+            "its links follow the moved page, anchors kept"
         );
         assert_eq!(
             fs::read_to_string(dir.join("index.md")).unwrap(),
@@ -1596,7 +1760,6 @@ mod tests {
         // Into an existing folder: last, ahead of the alphabet.
         let moved = wiki.move_into_previous("zed").unwrap().unwrap();
         assert_eq!(moved.id, "notes/zed");
-        assert!(moved.promoted.is_empty());
         fs::write(dir.join("notes/apple.md"), "# Apple").unwrap();
         wiki.reload().unwrap();
         assert_eq!(wiki.sibling_names("notes"), ["todo", "zed", "apple"]);
@@ -1718,9 +1881,8 @@ mod tests {
         // Becoming a folder and back again keeps the place: the name does not change.
         wiki.rename_page("apple", "banana/apple").unwrap();
         assert_eq!(wiki.sibling_names(""), ["banana", "notes", "aardvark"]);
-        assert!(dir.join("banana/index.md").is_file());
+        assert!(dir.join("banana.md").is_file() && dir.join("banana/apple.md").is_file());
         wiki.rename_page("banana/apple", "zebra").unwrap();
-        wiki.demote_lonely_folders().unwrap();
         assert!(dir.join("banana.md").is_file() && !dir.join("banana").exists());
         assert_eq!(
             wiki.sibling_names(""),

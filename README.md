@@ -17,7 +17,8 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 ## Pages and links
 
 - A page is a `.md` file; folders group pages.
-- The page's title is its first `# Heading`. Without one, the file name is used
+- The page's title is the `# Heading` on its first line. If the page starts with anything
+  else, the file name is used, even when a `# Heading` comes later
   (`my-wiki-page` shows as "My wiki page").
 - `[[folder/page]]` links to a page by its path from the wiki root, without `.md`,
   and displays that page's title. `[[folder/page|label]]` shows your own text.
@@ -27,11 +28,28 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
   line it sits on — so a link can point at a paragraph that has no heading. `{#name|text}`
   draws its text in place. In a table cell an anchor marks the row, and a cell can hold
   links to headings and anchors like any other text.
+- `<mark>text</mark>` highlights the text in yellow (black on the terminal's yellow). It
+  works within a paragraph, list item, heading or table cell; a `<mark>` left open ends
+  there.
+- The terminal window's title is `wiki-folder: Page title`, so a window list or a tab in a
+  window group says which wiki and page it holds. The page title is kept whole; the folder
+  name is shortened with `…` when the two pass 64 characters together, and left out when
+  there is no room for it.
 - Ordinary Markdown links to `.md` files work too; `http(s)` links open in the browser.
 - A folder's `index.md` stands for the folder: the folder takes its title in the tree,
   opening the folder shows it, and `[[/projects]]` links to it. The root `index.md` is the
   wiki's home page (`[[/]]`). Index pages are only linked through their folder: a direct
   `[[projects/index]]` shows as a missing link, and `[[` completion offers the folder path.
+- A folder without an `index.md` can keep its page in a file named after the folder
+  instead, inside it or beside it: `recipes/recipes.md` (any case) or `recipes.md` next to
+  `recipes/` (the layout Azure DevOps wikis use) stands for the folder in every way an index
+  page would, so the tree shows one row, not a page and a folder. A file named after the
+  wiki's own folder (`Wiki.md` in `~/Wiki`) is the home page. When a folder has more than
+  one, `index.md` wins, then the file inside, then the file beside; the others are ordinary
+  pages.
+- wikiBits itself uses the file beside the folder: giving the page `backlog.md` a child
+  creates `backlog/` next to it and leaves `backlog.md` where it is, untouched. It never
+  creates an `index.md`; folders that already have one keep working as before.
 - The pages column sorts each folder alphabetically by title until you reorder it with
   `J` / `K`. The order is kept in a hidden `.order` file in that folder: one page or
   subfolder name per line (`backlog`, without `.md` or `/`). Names it leaves out follow,
@@ -57,7 +75,7 @@ kitty or iTerm2 graphics. Files are re-read when they change on disk.
 | `V` | select text with the keyboard: arrows move, `Shift`+arrows extend, `y` copies, `Esc` ends; dragging with the mouse selects and copies too, and a double-click selects and copies a word |
 | `h` / `l`, ← / → | collapse / expand a folder; in the page, scroll sideways when a diagram or code block is wider than it |
 | `J` / `K` | move the selected page or folder down / up within its folder (outside the pages column: the current page) |
-| `Ctrl+↑` / `Ctrl+↓` | move the page under the page or folder listed above it, as its last child (a plain page above becomes a folder with the page as its index) / out of its folder, to just after the folder; links to the page are rewritten as for a rename |
+| `Ctrl+↑` / `Ctrl+↓` | move the page under the page or folder listed above it, as its last child (a plain page above stays where it is, beside the new folder, as the folder's page) / out of its folder, to just after the folder; links to the page are rewritten as for a rename |
 | `b`, `Backspace` / `f` | back / forward, to the place on the page you left: after a link to a heading or anchor, `b` lands on that link, and a jump within the page is a step too |
 | `H` | home page |
 | `r` | reload |
@@ -174,10 +192,12 @@ images no page mentions any more are moved to `.trash/` in the wiki folder (neve
 outright), and the status bar says which. `Ctrl-S` saves and returns to the rendered page; `Esc` returns, asking first
 if there are unsaved changes. `N` creates a page from a `folder/name` path, and following a
 link to a page that does not exist offers to create it. Creating `backlog/history` when
-`backlog.md` is a plain page turns it into a folder: the page becomes `backlog/index.md`, so
-links to `backlog` keep working and the tree shows it as a folder. The reverse happens too:
-after a delete or rename, a folder left with nothing but `index.md` becomes the plain page
-again, and links written as `[[backlog/index]]` are rewritten to `[[backlog]]`. `R` renames or moves the page (type
+`backlog.md` is a plain page creates the folder `backlog/` beside it: `backlog.md` is not
+moved or changed, links to `backlog` keep working, and the tree shows the page and its folder
+as one row. When the last child is deleted or moved away the empty folder is removed and the
+page is a plain page again. A folder from before this rule that is left with nothing but
+`index.md` still becomes the plain page `folder.md`, and links written as `[[backlog/index]]`
+are rewritten to `[[backlog]]`. `R` renames or moves the page (type
 the new `folder/name`; every `[[link]]` to it in other pages is rewritten, and emptied folders
 are removed) and `D` moves it to `.trash/` after a confirmation that mentions how many pages
 link to it.

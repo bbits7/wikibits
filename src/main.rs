@@ -20,6 +20,8 @@ use ratatui::crossterm::event::{
     Event, KeyEventKind,
 };
 use ratatui::crossterm::execute;
+use ratatui::crossterm::style::Print;
+use ratatui::crossterm::terminal::SetTitle;
 use ratatui_image::picker::Picker;
 
 use crate::app::App;
@@ -106,16 +108,28 @@ fn main() -> Result<()> {
 
     let mut terminal = ratatui::init();
     let picker = query_image_support();
-    let _ = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste);
+    // Remember the terminal's window title (wikiBits sets its own) and put it back on the
+    // way out.
+    let _ = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste, Print(SAVE_TITLE));
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
+        let _ = execute!(
+            stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            Print(RESTORE_TITLE)
+        );
         hook(info);
     }));
 
     let result = run(&mut terminal, wiki, picker, cli.page);
 
-    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
+    let _ = execute!(
+        stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        Print(RESTORE_TITLE)
+    );
     ratatui::restore();
     result
 }
@@ -207,10 +221,21 @@ fn run(
         app.status = "File watching unavailable; press r to reload".into();
     }
 
+    let wiki_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut shown_title = String::new();
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
         if app.should_quit {
             break;
+        }
+        let page = app.current.as_deref().map(|id| app.wiki.title(id));
+        let title = window_title(&wiki_name, page.as_deref());
+        if title != shown_title {
+            let _ = execute!(stdout(), SetTitle(&title));
+            shown_title = title;
         }
         let had_overlay = app.popup.is_some() || app.show_help || app.search.is_some();
         // Handle everything that is already waiting before drawing again, so a burst of
@@ -252,8 +277,70 @@ fn run(
     Ok(())
 }
 
+/// Push the terminal's window title on its title stack, and pop it back (xterm's XTWINOPS
+/// 22 and 23; a terminal without them ignores both).
+const SAVE_TITLE: &str = "\x1b[22;0t";
+const RESTORE_TITLE: &str = "\x1b[23;0t";
+
+/// Longest window title wikiBits writes with the wiki's name in it. The terminal does not
+/// say how much room the title has (a tab in a window group, a title bar), so this is a
+/// guess at what usually fits; whatever shows the title clips it at the end if it is longer.
+const TITLE_WIDTH: usize = 64;
+
+/// The window title: `wiki-name: Page title`. The page is what tells two windows apart, so
+/// it is kept whole and the wiki's name gives way: shortened with `…` when the two are too
+/// long together, left out when fewer than four of its characters would be left.
+fn window_title(wiki: &str, page: Option<&str>) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let clean = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
+    let wiki = clean(wiki);
+    let Some(page) = page.map(clean).filter(|p| !p.is_empty()) else {
+        return if wiki.is_empty() { "wikiBits".into() } else { wiki };
+    };
+    // Room left for the name once the page and the ": " between them are in.
+    let room = TITLE_WIDTH.saturating_sub(page.width() + 2);
+    if wiki.is_empty() || room < 4 {
+        return page;
+    }
+    if wiki.width() <= room {
+        return format!("{wiki}: {page}");
+    }
+    let mut short = String::new();
+    let mut width = 0;
+    for c in wiki.chars() {
+        let w = c.width().unwrap_or(0);
+        if width + w > room - 1 {
+            break;
+        }
+        short.push(c);
+        width += w;
+    }
+    format!("{}…: {page}", short.trim_end())
+}
+
 /// Whether `path` lies in, or is, a hidden file or folder under `root`.
 fn in_hidden(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root)
         .is_ok_and(|rel| rel.iter().any(|c| c.to_string_lossy().starts_with('.')))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_title;
+
+    #[test]
+    fn the_window_title_keeps_the_page_and_shortens_the_wiki_name() {
+        assert_eq!(window_title("Wiki", Some("Backlog")), "Wiki: Backlog");
+        assert_eq!(window_title("Wiki", None), "Wiki");
+        // 42 characters of page leave 20 for the name and its ….
+        let page = "Feature 77176 - Beta Course Catalogue Page";
+        assert_eq!(
+            window_title("nla-wiki-updates-77176", Some(page)),
+            format!("nla-wiki-updates-77…: {page}")
+        );
+        // No room worth using: the page alone, however long.
+        let long = "x".repeat(61);
+        assert_eq!(window_title("Wiki", Some(&long)), long);
+        assert_eq!(window_title("Wi\x1bki", Some("A\u{7}b")), "Wiki: Ab");
+    }
 }
