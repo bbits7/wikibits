@@ -1263,12 +1263,19 @@ impl App {
         }
     }
 
+    /// Open the page under the cursor. A folder unfolds and shows its page; one that is
+    /// already unfolded with its page on show folds again, as does one without a page.
     fn tree_activate(&mut self) {
         match self.tree.get(self.tree_sel).map(|r| &r.kind) {
             Some(TreeKind::Page { id }) => {
                 let id = id.clone();
                 self.open(&id, true);
             }
+            Some(TreeKind::Folder {
+                index: Some(id),
+                expanded: true,
+                ..
+            }) if self.current.as_deref() == Some(id.as_str()) => self.tree_toggle(),
             Some(TreeKind::Folder {
                 index: Some(id),
                 path,
