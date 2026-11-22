@@ -867,6 +867,14 @@ const diaBits = (() => {
   // Whether gap g lies left of shape n.
   const gapLeftOf = (d, n, g) => g <= d.span[n][0];
 
+  // The channel lines that pass under an elbow into the left (or right) side of shape `n`,
+  // the one in the channel nearest the shape first.
+  function passingUnder(d, n, left) {
+    const routes = d.routes.filter((r) => r.lowerUnder && vertical(d, r.edge)[1] === n && gapLeftOf(d, n, r.gap) === left);
+    const far = (r) => Math.abs(channelX(d, r) - center(d.nodes[n]));
+    return routes.sort((p, q) => far(p) - far(q) || p.edge - q.edge);
+  }
+
   // Regions between rows, plus one under the last row when a line loops under it.
   function regionCount(d) {
     const last = d.rows.length - 1;
@@ -1599,22 +1607,26 @@ const diaBits = (() => {
   }
 
   // An edge that skips rows drawn as an elbow: straight down the upper shape's empty column,
-  // then along the lower shape's row into its side. Its label sits beside the line on the
+  // then along the lower shape's row into its side: the middle, or the top corner when two or
+  // more channel lines pass under it into that side. Its label sits beside the line on the
   // entry row of the region below the upper shape, where a direct edge's would.
   function drawElbow(g, d, e) {
     const [u, l, au, al] = vertical(d, e);
     const upper = d.nodes[u], lower = d.nodes[l];
     const x = center(upper);
     const top = upper.y + upper.h;
-    const y = middle(lower);
+    const left = x < center(lower);
+    const y = passingUnder(d, l, left).length > 1 ? lower.y : middle(lower);
     for (let row = top; row < y; row++) g.put(x, row, "│");
     if (au) g.put(x, top, "▲");
-    const left = x < center(lower);
-    const edge = left ? lower.x : lower.x + lower.w - 1;
+    // A diamond's top row is a cell narrower on each side than its label rows.
+    const inset = lower.shape === "diamond" && isRim(lower, y) ? 1 : 0;
+    const edge = left ? lower.x + inset : lower.x + lower.w - 1 - inset;
     if (left) for (let col = x + 1; col < edge; col++) g.put(col, y, "─");
     else for (let col = edge + 1; col < x; col++) g.put(col, y, "─");
     g.put(x, y, left ? "└" : "┘");
     if (al) g.put(left ? edge - 1 : edge + 1, y, left ? "▶" : "◀");
+    else if (y !== middle(lower) && lower.shape !== "diamond") g.set(edge, y, "┬");
     if (d.edges[e].label != null) {
       const plan = regionPlan(d, upper.row);
       const row = plan.levels > 0 || plan.height > 2 ? top + plan.height - 2 : top;
@@ -1630,7 +1642,9 @@ const diaBits = (() => {
     // when the channel runs between their columns.
     const upperLeft = gapLeftOf(d, u, route.gap), lowerLeft = gapLeftOf(d, l, route.gap);
     const uy = route.upperCorner ? upper.y + upper.h - 1 : middle(upper);
-    const ly = route.lowerUnder ? lower.y + lower.h - 1 : route.lowerCorner ? lower.y : middle(lower);
+    const under = passingUnder(d, l, lowerLeft);
+    const ly = route.lowerUnder && under.length > 1 && under[0].edge === route.edge ? middle(lower)
+      : route.lowerUnder ? lower.y + lower.h - 1 : route.lowerCorner ? lower.y : middle(lower);
     // The cell of the shape's outline the arm meets on row y: a diamond's top and bottom
     // rows are a cell narrower on each side than its label rows.
     const boundary = (n, left, y) => {

@@ -185,9 +185,11 @@ struct Route {
     /// because another line's arrow head arrives at that side of the shape.
     upper_corner: bool,
     lower_corner: bool,
-    /// The lower end attaches at the bottom corner of the lower shape instead: an elbow
-    /// comes down between the shape and the channel into the middle of that side, and the
-    /// arm passes under its corner where an arm to the top corner would cross it.
+    /// The lower end attaches under an elbow instead: the elbow comes down between the lower
+    /// shape and the channel into that side, and an arm to the top corner would cross it.
+    /// One such line takes the bottom corner, under the elbow in the middle. With more, each
+    /// gets a place of its own: the elbow moves up to the top corner, the line in the
+    /// nearest channel takes the middle and the rest the bottom corner (see `passing_under`).
     lower_under: bool,
 }
 
@@ -854,6 +856,22 @@ fn channel_x(d: &Diagram, route: &Route) -> usize {
 /// Whether gap `g` lies left of shape `n`.
 fn gap_left_of(d: &Diagram, n: usize, g: usize) -> bool {
     g <= d.span[n].0
+}
+
+/// The channel lines that pass under an elbow into the left (or right) side of shape `n`,
+/// the one in the channel nearest the shape first.
+fn passing_under(d: &Diagram, n: usize, left: bool) -> Vec<&Route> {
+    let mut routes: Vec<&Route> = d
+        .routes
+        .iter()
+        .filter(|r| {
+            r.lower_under
+                && d.edges[r.edge].vertical(&d.nodes).1 == n
+                && gap_left_of(d, n, r.gap) == left
+        })
+        .collect();
+    routes.sort_by_key(|r| (channel_x(d, r).abs_diff(d.nodes[n].center()), r.edge));
+    routes
 }
 
 /// Regions between rows, plus one under the last row when a line loops under it.
@@ -1648,22 +1666,33 @@ fn draw_through(g: &mut Grid, d: &Diagram, e: usize) {
 }
 
 /// An edge that skips rows drawn as an elbow: straight down the upper shape's empty column,
-/// then along the lower shape's row into its side. Its label sits beside the line on the
+/// then along the lower shape's row into its side: the middle, or the top corner when two or
+/// more channel lines pass under it into that side. Its label sits beside the line on the
 /// entry row of the region below the upper shape, where a direct edge's would.
 fn draw_elbow(g: &mut Grid, d: &Diagram, e: usize) {
     let (u, l, au, al) = d.edges[e].vertical(&d.nodes);
     let (upper, lower) = (&d.nodes[u], &d.nodes[l]);
     let x = upper.center();
     let top = upper.y + upper.h;
-    let y = lower.middle();
+    let left = x < lower.center();
+    let y = if passing_under(d, l, left).len() > 1 {
+        lower.y
+    } else {
+        lower.middle()
+    };
     for row in top..y {
         g.put(x, row, '│');
     }
     if au {
         g.put(x, top, '▲');
     }
-    let left = x < lower.center();
-    let edge = if left { lower.x } else { lower.x + lower.w - 1 };
+    // A diamond's top row is a cell narrower on each side than its label rows.
+    let inset = usize::from(lower.shape == Shape::Diamond && lower.is_rim(y));
+    let edge = if left {
+        lower.x + inset
+    } else {
+        lower.x + lower.w - 1 - inset
+    };
     let xs = if left { x + 1..edge } else { edge + 1..x };
     for col in xs {
         g.put(col, y, '─');
@@ -1675,6 +1704,8 @@ fn draw_elbow(g: &mut Grid, d: &Diagram, e: usize) {
             y,
             if left { '▶' } else { '◀' },
         );
+    } else if y != lower.middle() && lower.shape != Shape::Diamond {
+        g.set(edge, y, '┬');
     }
     if let Some(label) = &d.edges[e].label {
         let plan = region_plan(d, upper.row);
@@ -1699,7 +1730,10 @@ fn draw_side(g: &mut Grid, d: &Diagram, route: &Route, col: usize) {
     } else {
         upper.middle()
     };
-    let ly = if route.lower_under {
+    let under = passing_under(d, l, lower_left);
+    let ly = if route.lower_under && under.len() > 1 && under[0].edge == route.edge {
+        lower.middle()
+    } else if route.lower_under {
         lower.y + lower.h - 1
     } else if route.lower_corner {
         lower.y
@@ -2373,6 +2407,17 @@ mod tests {
         println!("{text}");
         assert!(!text.contains('┼'), "no line crosses another");
         assert!(text.contains("│ E │◀─────┘    │\n└───┘◀──────────┘"));
+    }
+
+    #[test]
+    fn three_lines_into_one_side_each_get_a_place() {
+        // An elbow from F and channel lines from D and B, all into the right side of H: the
+        // elbow takes the top corner, the nearer channel the middle, the outer the bottom.
+        let source = "a[A], b[B]\nc[C], d[D]\ne[E], f[F]\ng[G],\nh[H],\nb --> h\nd --> h\nf --> h";
+        let text = joined(&render(source).unwrap());
+        println!("{text}");
+        assert!(!text.contains('┼'), "no line crosses another");
+        assert!(text.contains("┌───┐◀─────┘    │  │\n│ H │◀──────────┘  │\n└───┘◀─────────────┘"));
     }
 
     #[test]
