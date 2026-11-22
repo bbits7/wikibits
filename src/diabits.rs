@@ -185,6 +185,10 @@ struct Route {
     /// because another line's arrow head arrives at that side of the shape.
     upper_corner: bool,
     lower_corner: bool,
+    /// The lower end attaches at the bottom corner of the lower shape instead: an elbow
+    /// comes down between the shape and the channel into the middle of that side, and the
+    /// arm passes under its corner where an arm to the top corner would cross it.
+    lower_under: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -294,8 +298,7 @@ fn parse(source: &str) -> Result<Diagram, String> {
                 // `id`, `id(side)` or `id(side:anchor)`.
                 type Place = Option<(Side, Option<usize>)>;
                 let lookup = |token: &str| -> Result<(usize, Place), String> {
-                    let (id, side) = match token.strip_suffix(')').and_then(|t| t.split_once('('))
-                    {
+                    let (id, side) = match token.strip_suffix(')').and_then(|t| t.split_once('(')) {
                         Some((id, place)) => {
                             let (name, anchor) = match place.split_once(':') {
                                 Some((name, anchor)) => (name, Some(anchor)),
@@ -477,11 +480,12 @@ fn shape_width(shape: Shape, label: &str) -> usize {
 fn wants_channel(d: &Diagram, e: usize) -> bool {
     let (u, l, au, _) = d.edges[e].vertical(&d.nodes);
     let (ru, rl) = (d.nodes[u].row, d.nodes[l].row);
-    if ru == rl {
+    // A line drawn straight through or as an elbow is drawn that way whichever way it
+    // points: it must not get a channel as well.
+    if ru == rl || d.through[e] || d.elbow[e] {
         return false;
     }
-    (rl > ru + 1 && !d.through[e] && !d.elbow[e])
-        || (au && d.nodes[u].center() != d.nodes[l].center())
+    rl > ru + 1 || (au && d.nodes[u].center() != d.nodes[l].center())
 }
 
 /// The rows of the two ends of an edge, top one first.
@@ -795,7 +799,11 @@ fn pinned_room(d: &Diagram) -> (Vec<usize>, Vec<usize>) {
             if pins == 0 {
                 return 0;
             }
-            let label = if gap_label[g] > 0 { gap_label[g] + 2 } else { 0 };
+            let label = if gap_label[g] > 0 {
+                gap_label[g] + 2
+            } else {
+                0
+            };
             if d.gaps[g].channels > 0 {
                 2 * pins + label
             } else {
@@ -1032,6 +1040,7 @@ fn channel_plan(d: &mut Diagram) {
             channel,
             upper_corner: false,
             lower_corner: false,
+            lower_under: false,
         });
     }
     // Whether some other line arrives at that side of shape `n` with an arrow head.
@@ -1066,9 +1075,25 @@ fn channel_plan(d: &mut Diagram) {
                 && (d.nodes[fu].center() < d.nodes[n].center()) == gap_left_of(d, n, g)
         })
     };
+    // Whether such an elbow comes down a column between shape `n` and gap `g`.
+    let elbow_inside = |n: usize, g: usize| {
+        (0..d.edges.len()).any(|f| {
+            let (fu, fl, _, _) = d.edges[f].vertical(&d.nodes);
+            let left = gap_left_of(d, n, g);
+            d.elbow[f]
+                && fl == n
+                && (d.nodes[fu].center() < d.nodes[n].center()) == left
+                && if left {
+                    g <= d.span[fu].0
+                } else {
+                    d.span[fu].1 <= g
+                }
+        })
+    };
     for i in 0..routes.len() {
         let (u, l, au, al) = d.edges[routes[i].edge].vertical(&d.nodes);
         let g = routes[i].gap;
+        routes[i].lower_under = elbow_inside(l, g);
         routes[i].upper_corner =
             row_line_at(u, g) || elbow_at(u, g) || (!au && headed_at(&routes, i, u));
         routes[i].lower_corner =
@@ -1674,7 +1699,9 @@ fn draw_side(g: &mut Grid, d: &Diagram, route: &Route, col: usize) {
     } else {
         upper.middle()
     };
-    let ly = if route.lower_corner {
+    let ly = if route.lower_under {
+        lower.y + lower.h - 1
+    } else if route.lower_corner {
         lower.y
     } else {
         lower.middle()
@@ -1706,7 +1733,14 @@ fn draw_side(g: &mut Grid, d: &Diagram, route: &Route, col: usize) {
         }
     };
     arm(g, upper, upper_left, uy, au, '┴');
-    arm(g, lower, lower_left, ly, al, '┬');
+    arm(
+        g,
+        lower,
+        lower_left,
+        ly,
+        al,
+        if ly == lower.y { '┬' } else { '┴' },
+    );
     for y in uy + 1..ly {
         g.put(col, y, '│');
     }
@@ -1783,9 +1817,8 @@ fn shape_cells(d: &Diagram, w: usize, h: usize) -> (Vec<bool>, Vec<bool>) {
             for x in n.x.saturating_sub(1)..(n.x + n.w + 1).min(w) {
                 let inside = (n.y..n.y + n.h).contains(&y) && (n.x..n.x + n.w).contains(&x);
                 // The cells at a diamond's corners are empty: a line can end in one.
-                let corner = n.shape == Shape::Diamond
-                    && n.is_rim(y)
-                    && (x == n.x || x + 1 == n.x + n.w);
+                let corner =
+                    n.shape == Shape::Diamond && n.is_rim(y) && (x == n.x || x + 1 == n.x + n.w);
                 if inside && !corner {
                     solid[y * w + x] = true;
                 } else {
@@ -1817,7 +1850,9 @@ struct Pinned {
 /// other: short, with few corners, crossing other lines only straight on and only when
 /// going round costs more, never through a shape or a label. An end without a chosen side
 /// takes whichever side makes the path cheapest; a chosen place that is taken gives way to
-/// the next anchor on that side. The line leaves and enters a shape straight on.
+/// the next anchor on that side. A side chosen without an anchor, whose middle is taken,
+/// takes the outer anchor whose path crosses the fewest lines, so the line goes round
+/// outside the one that holds the middle. The line leaves and enters a shape straight on.
 ///
 /// Two lines told to use the same anchor of a shape share it: the later one runs into the
 /// last straight stretch of the earlier one, the part that enters the shape, and they reach
@@ -1861,35 +1896,48 @@ fn draw_pinned(g: &mut Grid, d: &Diagram, edge: &Edge, drawn: &mut Pinned) -> Re
     }
     let [(ai, a_side, a_head), (bi, b_side, b_head)] = ends;
     let (a, b) = (&d.nodes[ai], &d.nodes[bi]);
-    // Where the line may join a shape: the first free anchor on its chosen side, or the
-    // middle of every side that is free. Each is a cell and the direction out of the shape.
+    // Where the line may join a shape, as a list of choices; each choice is a set of places
+    // (a cell and the direction out of the shape) the path may use any one of. Without a
+    // chosen side: the middle of every side that is free. With a side and an anchor: the
+    // first free anchor on that side. With a side alone: its middle, or when that is taken
+    // each free outer anchor as a choice of its own, the one nearer the other shape first.
     let joins = |g: &Grid,
                  n: &Node,
                  other: &Node,
                  side: Option<(Side, Option<usize>)>|
-     -> Vec<(usize, usize)> {
-        let sides: &[Side] = match &side {
-            Some((side, _)) => std::slice::from_ref(side),
-            None => &SIDES,
+     -> Vec<Vec<(usize, usize)>> {
+        let free = |s: Side, anchor: Option<usize>| -> Vec<(usize, usize)> {
+            attach_points(n, s, other, anchor)
+                .into_iter()
+                .filter(|&(x, y)| empty(g, &drawn.text, x, y))
+                .map(|(x, y)| (y as usize * w + x as usize, s.out()))
+                .collect()
         };
-        sides
-            .iter()
-            .filter_map(|&s| {
-                let points = attach_points(n, s, other, side.and_then(|(_, anchor)| anchor));
-                let take = if side.is_some() { points.len() } else { 1 };
-                points
-                    .into_iter()
-                    .take(take)
-                    .find(|&(x, y)| empty(g, &drawn.text, x, y))
-                    .map(|(x, y)| (y as usize * w + x as usize, s.out()))
-            })
-            .collect()
+        match side {
+            None => {
+                let middles = SIDES.iter().filter_map(|&s| {
+                    let (x, y) = attach_points(n, s, other, None)[0];
+                    empty(g, &drawn.text, x, y).then(|| (y as usize * w + x as usize, s.out()))
+                });
+                vec![middles.collect()]
+            }
+            Some((s, None)) => {
+                let (x, y) = attach_points(n, s, other, None)[0];
+                let places = free(s, None);
+                if empty(g, &drawn.text, x, y) {
+                    vec![places[..1].to_vec()]
+                } else {
+                    places.into_iter().map(|place| vec![place]).collect()
+                }
+            }
+            Some((s, anchor)) => vec![free(s, anchor).into_iter().take(1).collect()],
+        }
     };
-    let starts = joins(g, a, b, a_side);
-    // Dijkstra over (cell, direction of travel). The line arrives at its last cell
-    // travelling into the shape, or anywhere on the line it joins.
-    let mut goal = vec![false; w * h * 4];
+    let start_choices = joins(g, a, b, a_side);
+    // The line arrives at its last cell travelling into the shape, or anywhere on the line
+    // it joins.
     let mut joining = vec![false; w * h];
+    let mut goal_choices = vec![Vec::new()];
     match join {
         Some((path, at_start)) => {
             // The straight stretch of that line next to the shape, up to its first corner.
@@ -1899,20 +1947,20 @@ fn draw_pinned(g: &mut Grid, d: &Diagram, edge: &Edge, drawn: &mut Pinned) -> Re
             }
             let level = cells.iter().all(|c| c.1 == cells[0].1)
                 || cells.get(1).is_some_and(|c| c.1 == cells[0].1);
-            let stretch = cells
-                .iter()
-                .take_while(|c| if level { c.1 == cells[0].1 } else { c.0 == cells[0].0 });
+            let stretch = cells.iter().take_while(|c| {
+                if level {
+                    c.1 == cells[0].1
+                } else {
+                    c.0 == cells[0].0
+                }
+            });
             for &(x, y) in stretch {
                 if arms(g.cells[y][x]).is_some_and(|a| a != 15) {
                     joining[y * w + x] = true;
                 }
             }
         }
-        None => {
-            for (cell, out) in joins(g, b, a, b_side) {
-                goal[cell * 4 + (out ^ 1)] = true;
-            }
-        }
+        None => goal_choices = joins(g, b, a, b_side),
     }
     let no_room = || {
         format!(
@@ -1920,82 +1968,112 @@ fn draw_pinned(g: &mut Grid, d: &Diagram, edge: &Edge, drawn: &mut Pinned) -> Re
             edge.text
         )
     };
-    let mut is_start = vec![false; w * h];
-    let mut dist = vec![u32::MAX; w * h * 4];
-    let mut prev = vec![usize::MAX; w * h * 4];
-    let mut heap = std::collections::BinaryHeap::new();
-    for &(cell, out) in &starts {
-        is_start[cell] = true;
-        dist[cell * 4 + out] = 0;
-        heap.push(std::cmp::Reverse((0u32, cell * 4 + out)));
-    }
     let upright = |c: char| arms(c).is_some_and(|a| a & 3 != 0);
-    let mut found = None;
-    while let Some(std::cmp::Reverse((cost, state))) = heap.pop() {
-        if cost > dist[state] {
-            continue;
-        }
-        let (cell, dir) = (state / 4, state % 4);
-        if goal[state] || joining[cell] {
-            found = Some(state);
-            break;
-        }
-        let (x, y) = (cell % w, cell / w);
-        let crossing = g.cells[y][x] != ' ';
-        for (next, step) in STEPS.iter().enumerate() {
-            // No turning back, no corner on another line, and straight out of a shape.
-            if next == dir ^ 1 || (next != dir && (crossing || is_start[cell])) {
-                continue;
+    // Dijkstra over (cell, direction of travel) from any of `starts` to any of `goals` (or
+    // to the line it joins): what the path costs and the states along it.
+    let search =
+        |starts: &[(usize, usize)], goals: &[(usize, usize)]| -> Option<(u32, Vec<usize>)> {
+            let g = &*g;
+            let mut goal = vec![false; w * h * 4];
+            for &(cell, out) in goals {
+                goal[cell * 4 + (out ^ 1)] = true;
             }
-            let (nx, ny) = (x as isize + step.0, y as isize + step.1);
-            if nx < 0 || ny < 0 || nx as usize >= w || ny as usize >= h {
-                continue;
+            let mut is_start = vec![false; w * h];
+            let mut dist = vec![u32::MAX; w * h * 4];
+            let mut prev = vec![usize::MAX; w * h * 4];
+            let mut heap = std::collections::BinaryHeap::new();
+            for &(cell, out) in starts {
+                is_start[cell] = true;
+                dist[cell * 4 + out] = 0;
+                heap.push(std::cmp::Reverse((0u32, cell * 4 + out)));
             }
-            let (nx, ny) = (nx as usize, ny as usize);
-            let to = ny * w + nx;
-            if solid[to] || drawn.text.contains(&(nx, ny)) {
-                continue;
+            let mut found = None;
+            while let Some(std::cmp::Reverse((cost, state))) = heap.pop() {
+                if cost > dist[state] {
+                    continue;
+                }
+                let (cell, dir) = (state / 4, state % 4);
+                if goal[state] || joining[cell] {
+                    found = Some(state);
+                    break;
+                }
+                let (x, y) = (cell % w, cell / w);
+                let crossing = g.cells[y][x] != ' ';
+                for (next, step) in STEPS.iter().enumerate() {
+                    // No turning back, no corner on another line, and straight out of a shape.
+                    if next == dir ^ 1 || (next != dir && (crossing || is_start[cell])) {
+                        continue;
+                    }
+                    let (nx, ny) = (x as isize + step.0, y as isize + step.1);
+                    if nx < 0 || ny < 0 || nx as usize >= w || ny as usize >= h {
+                        continue;
+                    }
+                    let (nx, ny) = (nx as usize, ny as usize);
+                    let to = ny * w + nx;
+                    if solid[to] || drawn.text.contains(&(nx, ny)) {
+                        continue;
+                    }
+                    let there = g.cells[ny][nx];
+                    let mut step = match there {
+                        _ if joining[to] => 1,
+                        ' ' => 1,
+                        '│' if next >= 2 => 1 + CROSS_COST,
+                        '─' if next < 2 => 1 + CROSS_COST,
+                        _ => continue,
+                    };
+                    if near[to] {
+                        step += NEAR_COST;
+                    }
+                    if next < 2 && drawn.band.contains(&(nx, ny)) {
+                        step += BAND_COST;
+                    }
+                    if next < 2
+                        && !joining[to]
+                        && ((nx > 0 && upright(g.cells[ny][nx - 1]))
+                            || (nx + 1 < w && upright(g.cells[ny][nx + 1])))
+                    {
+                        step += BESIDE_COST;
+                    }
+                    if next != dir {
+                        step += TURN_COST;
+                    }
+                    let state = to * 4 + next;
+                    if cost + step < dist[state] {
+                        dist[state] = cost + step;
+                        prev[state] = cell * 4 + dir;
+                        heap.push(std::cmp::Reverse((cost + step, state)));
+                    }
+                }
             }
-            let there = g.cells[ny][nx];
-            let mut step = match there {
-                _ if joining[to] => 1,
-                ' ' => 1,
-                '│' if next >= 2 => 1 + CROSS_COST,
-                '─' if next < 2 => 1 + CROSS_COST,
-                _ => continue,
+            let last = found?;
+            let mut states = vec![last];
+            while prev[states[states.len() - 1]] != usize::MAX {
+                states.push(prev[states[states.len() - 1]]);
+            }
+            states.reverse();
+            Some((dist[last], states))
+        };
+    // Of the choices of anchor, the path that crosses the fewest lines, then the cheapest:
+    // a line that would cross the one holding the middle goes round outside it instead.
+    let mut best: Option<(usize, u32, Vec<usize>)> = None;
+    for starts in &start_choices {
+        for goals in &goal_choices {
+            let Some((cost, states)) = search(starts, goals) else {
+                continue;
             };
-            if near[to] {
-                step += NEAR_COST;
-            }
-            if next < 2 && drawn.band.contains(&(nx, ny)) {
-                step += BAND_COST;
-            }
-            if next < 2
-                && !joining[to]
-                && ((nx > 0 && upright(g.cells[ny][nx - 1]))
-                    || (nx + 1 < w && upright(g.cells[ny][nx + 1])))
-            {
-                step += BESIDE_COST;
-            }
-            if next != dir {
-                step += TURN_COST;
-            }
-            let state = to * 4 + next;
-            if cost + step < dist[state] {
-                dist[state] = cost + step;
-                prev[state] = cell * 4 + dir;
-                heap.push(std::cmp::Reverse((cost + step, state)));
+            let crossings = states
+                .iter()
+                .filter(|&&s| !joining[s / 4] && g.cells[s / 4 / w][s / 4 % w] != ' ')
+                .count();
+            if best.as_ref().is_none_or(|b| (crossings, cost) < (b.0, b.1)) {
+                best = Some((crossings, cost, states));
             }
         }
     }
-    let Some(last) = found else {
+    let Some((_, _, states)) = best else {
         return Err(no_room());
     };
-    let mut states = vec![last];
-    while prev[states[states.len() - 1]] != usize::MAX {
-        states.push(prev[states[states.len() - 1]]);
-    }
-    states.reverse();
+    let last = states[states.len() - 1];
     let path: Vec<(usize, usize)> = states.iter().map(|s| (s / 4 % w, s / 4 / w)).collect();
     // The direction out of each shape at its end of the path.
     let (out_a, out_b) = (states[0] % 4, (last % 4) ^ 1);
@@ -2258,6 +2336,46 @@ mod tests {
     }
 
     #[test]
+    fn an_elbow_pointing_back_up_is_drawn_once() {
+        // `c --> a` points up and skips a row: an elbow, and not a channel as well.
+        let out = render("a[A],\n, b[B]\n, c[C]\nc --> a").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert_eq!(text.matches('▲').count(), 1, "one arrow head into A");
+        assert!(!text.contains('◀'), "no second line into its side");
+        assert!(out.iter().all(|l| l.width() <= 14), "no channel beside it");
+    }
+
+    #[test]
+    fn a_side_whose_middle_is_taken_gives_the_anchor_that_crosses_nothing() {
+        // `b(L) --> c` is shorter, drawn first, and takes the middle of the top of C. The
+        // line from A names the top only: it takes the left anchor and runs outside, where
+        // the right one, nearer A, would cross the line from B.
+        let out = render(",a[A]\n,b[B]\nc[A wide box here],\nb(L) --> c\na(L) --> c(T)").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(!text.contains('┼'), "no line crosses another");
+        assert!(
+            text.contains("    ▼    ▼\n┌─────────────────┐"),
+            "left and middle anchors"
+        );
+        // Told to use the right anchor, it does, crossing or not.
+        let out = render(",a[A]\n,b[B]\nc[A wide box here],\nb(L) --> c\na(L) --> c(T:R)").unwrap();
+        assert!(joined(&out).contains('┼'));
+    }
+
+    #[test]
+    fn a_channel_passes_under_an_elbow_into_the_same_side() {
+        // `c --> e` is an elbow into the middle of E's right side; `b --> e` comes down a
+        // channel further out and enters at E's bottom corner, under the elbow's corner.
+        let out = render("a[A], b[B]\n, c[C]\nd[D],\ne[E],\nb --> e\nc --> e").unwrap();
+        let text = joined(&out);
+        println!("{text}");
+        assert!(!text.contains('┼'), "no line crosses another");
+        assert!(text.contains("│ E │◀─────┘    │\n└───┘◀──────────┘"));
+    }
+
+    #[test]
     fn lines_with_sides_nest_and_share_an_anchor() {
         // Written longest first, drawn shortest first: none crosses another. Ids, sides and
         // anchors match whatever their case. Two lines into the same anchor join on the
@@ -2288,19 +2406,27 @@ mod tests {
         ];
         assert_eq!(text, want.join("\n"));
         assert!(!text.contains('┼'), "no line crosses another");
-        assert!(render("a[A]\nA[Again]").unwrap_err().contains("defined twice"));
+        assert!(
+            render("a[A]\nA[Again]")
+                .unwrap_err()
+                .contains("defined twice")
+        );
     }
 
     #[test]
     fn a_line_takes_the_side_it_is_told() {
         // Up the right-hand side instead of the default channel.
-        let out = render("a[Alpha]\nb[Beta]\nc[Gamma]\na --> b --> c\nc(R) --> a(r) | again").unwrap();
+        let out =
+            render("a[Alpha]\nb[Beta]\nc[Gamma]\na --> b --> c\nc(R) --> a(r) | again").unwrap();
         assert_eq!(
             joined(&out),
             "┌───────┐\n│ Alpha │◀┐\n└───────┘ │\n    │     │\n    ▼     │\n┌──────┐  │\n│ Beta │  │ again\n└──────┘  │\n    │     │\n    ▼     │\n┌───────┐ │\n│ Gamma │─┘\n└───────┘"
         );
         // Over and under a row, with room made above and below it.
-        let out = render("a[Alpha], b[Beta], c[Gamma]\na --> b --> c\na(T) --> c(T) | over\nc(B) --> a(B)").unwrap();
+        let out = render(
+            "a[Alpha], b[Beta], c[Gamma]\na --> b --> c\na(T) --> c(T) | over\nc(B) --> a(B)",
+        )
+        .unwrap();
         assert_eq!(
             joined(&out),
             "               over\n    ┌────────────────────────┐\n    │                        ▼\n┌───────┐    ┌──────┐    ┌───────┐\n│ Alpha │───▶│ Beta │───▶│ Gamma │\n└───────┘    └──────┘    └───────┘\n    ▲                        │\n    └────────────────────────┘"

@@ -182,7 +182,8 @@ line crosses another only when going round would take more corners, and none run
 shape or a label. The diagram grows to give them room. Two lines told to use the same anchor
 share it: the second runs straight into the stretch of the first that enters the shape, and
 they reach it together (`outer left` and `middle left` above, each with two corners). An anchor that an ordinary line already uses gives way to the next
-one on that side. Ids, sides and anchors are matched whatever their case: `A(l:t)` is
+one on that side; when only the side is named (`b(T)`) and its middle is taken, the line
+takes whichever outer anchor lets it go round the line already there instead of crossing it. Ids, sides and anchors are matched whatever their case: `A(l:t)` is
 `a(L:T)`.
 
 `diaType: tree` draws a tree instead: one shape per line, with leading dots saying how deep
